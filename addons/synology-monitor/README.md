@@ -191,3 +191,4 @@ Optional for NVMe checks:
 - HTTPS push uses certificate verification.
 - A basic SPK skeleton is available in `addons/synology-monitor/community-package/`.
 - In the SPK skeleton, setup UI is auto-started after package install on port `8787`.
+- Internal security analysis and hardening documents are maintained in the private `Uptime.Kuma.Monitor.Tools.Dev` repository.
