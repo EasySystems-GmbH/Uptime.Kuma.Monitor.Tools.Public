@@ -54,6 +54,7 @@ keys/
 
 addons/synology-monitor/community-package/.build/
 addons/synology-monitor/community-package/dist/
+addons/unix-monitor/var/
 
 # Keep internal security docs out of Public repo
 addons/synology-monitor/security-docs/
