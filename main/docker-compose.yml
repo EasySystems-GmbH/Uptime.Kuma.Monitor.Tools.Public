@@ -1,0 +1,82 @@
+# =============================================================================
+# Kuma Management Console - Docker Compose
+# For local development and Komodo deployment
+# =============================================================================
+
+services:
+  kuma-console:
+    image: ${KUMA_CONSOLE_IMAGE:-ghcr.io/easystems-gmbh/kuma-management-console:latest}
+    container_name: kuma-management-console
+    restart: unless-stopped
+    
+    # Port mapping (use reverse proxy in production)
+    # Format: "HOST_PORT:CONTAINER_PORT"
+    ports:
+      - "5080:5000"
+    
+    # Environment variables
+    environment:
+      # REQUIRED: Set a secure secret key (generate with: python -c "import secrets; print(secrets.token_hex(32))")
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      
+      # Database location (SQLite file inside container)
+      - DATABASE_URL=sqlite:////app/data/users.db
+      
+      # Session settings
+      - SESSION_LIFETIME=${SESSION_LIFETIME:-1800}
+      # Set to 'true' when behind HTTPS proxy
+      - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-false}
+      # Set to 'None' for cross-origin proxy (requires SESSION_COOKIE_SECURE=true)
+      - SESSION_COOKIE_SAMESITE=${SESSION_COOKIE_SAMESITE:-Lax}
+      # Trust proxy headers (X-Forwarded-*)
+      - TRUST_PROXY=${TRUST_PROXY:-true}
+      
+      # Security settings
+      - MAX_LOGIN_ATTEMPTS=${MAX_LOGIN_ATTEMPTS:-5}
+      - LOCKOUT_DURATION=${LOCKOUT_DURATION:-15}
+      - REQUIRE_2FA=${REQUIRE_2FA:-false}
+      - ALLOWED_IPS=${ALLOWED_IPS:-}
+      
+      # Development: Allow localhost connections to Kuma
+      - ALLOW_LOCALHOST=${ALLOW_LOCALHOST:-true}
+      
+      # Relaxed security for reverse proxy setups (set to 'true' if behind nginx/traefik)
+      - RELAXED_SECURITY=${RELAXED_SECURITY:-false}
+      
+      # UNSAFE_MODE: Disable ALL security (for external proxy servers)
+      # This disables: security headers, CSRF, cookie restrictions, IP filtering
+      - UNSAFE_MODE=${UNSAFE_MODE:-false}
+      
+      # Timezone
+      - TZ=${TZ:-UTC}
+    
+    # Persistent storage for user database
+    volumes:
+      - kuma_console_data:/app/data
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/auth/login')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+# Named volume for persistent data
+volumes:
+  kuma_console_data:
+    driver: local
