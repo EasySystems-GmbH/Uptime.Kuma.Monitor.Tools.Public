@@ -28,7 +28,6 @@ import html
 import json
 import os
 import base64
-import cgi
 import hashlib
 import hmac
 import re
@@ -40,12 +39,17 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from io import BytesIO
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
+try:
+    import cgi  # type: ignore[import-not-found]
+except Exception:
+    cgi = None
 try:
     import pyotp  # type: ignore[import-not-found]
 except Exception:
@@ -86,7 +90,10 @@ CHANGES_NOTICE = "  Changes are not saved until you confirm (Save/Apply)."
 ALLOWED_SCHEMES = ("https", "http")
 KUMA_PUSH_PATH_PATTERN = re.compile(r"^/api/push/[A-Za-z0-9_-]+$")
 UI_LOG_MAX_LINES = 200
+UI_LOG_DISPLAY_LINES = 100
+_UI_LOG_STATS_CACHE: Dict[str, Any] = {"key": None, "value": (0, 0)}
 UI_LOG_MSG_MAX_CHARS = 6000
+LOG_LINE_TS_PREFIX = re.compile(r"^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|")
 NAS_VOLUME_PATTERN = re.compile(r"^/volume[0-9]+$")
 SMART_CACHE_MAX_AGE_SEC = 20 * 60
 BACKUP_CACHE_MAX_AGE_SEC = 20 * 60
@@ -680,20 +687,218 @@ def append_ui_log(message: str) -> None:
         pass
 
 
-def read_ui_log(max_lines: int = UI_LOG_MAX_LINES, log_filter: str = "all") -> str:
+def _parse_log_line_datetime(line: str) -> Optional[datetime]:
+    m = LOG_LINE_TS_PREFIX.match(line or "")
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _normalize_log_date(value: str) -> str:
+    v = (value or "all").strip().lower()
+    if v in ("all", "today", "yesterday"):
+        return v
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+            return v
+        except ValueError:
+            return "all"
+    return "all"
+
+
+def _normalize_log_time_scope(value: str) -> str:
+    v = (value or "all").strip().lower()
+    if v in ("all", "15m", "1h", "6h", "24h"):
+        return v
+    return "all"
+
+
+def _normalize_log_time_hhmm(value: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return ""
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", v)
+    if not m:
+        return ""
+    hh, mm = m.group(1), m.group(2)
+    try:
+        hhi = int(hh)
+        mmi = int(mm)
+    except ValueError:
+        return ""
+    if hhi < 0 or hhi > 23 or mmi < 0 or mmi > 59:
+        return ""
+    return f"{hhi:02d}:{mmi:02d}"
+
+
+def _filter_log_lines(
+    lines: List[str],
+    log_filter: str,
+    log_date: str,
+    log_time_scope: str,
+    log_time_from: str = "",
+    log_time_to: str = "",
+    log_word: str = "",
+) -> List[str]:
+    filt = (log_filter or "all").strip().lower()
+    ld = _normalize_log_date(log_date)
+    now = datetime.now()
+    target_day = None
+    if ld == "today":
+        target_day = now.date()
+    elif ld == "yesterday":
+        target_day = (now - timedelta(days=1)).date()
+    elif ld not in ("all", ""):
+        try:
+            target_day = datetime.strptime(ld, "%Y-%m-%d").date()
+        except ValueError:
+            target_day = None
+    lt = _normalize_log_time_scope(log_time_scope)
+    cutoff = None
+    if lt != "all":
+        age_sec = {"15m": 15 * 60, "1h": 60 * 60, "6h": 6 * 60 * 60, "24h": 24 * 60 * 60}[lt]
+        cutoff = now - timedelta(seconds=age_sec)
+    tf = _normalize_log_time_hhmm(log_time_from)
+    tt = _normalize_log_time_hhmm(log_time_to)
+    word = (log_word or "").strip().lower()
+    needs_ts = bool(target_day or cutoff or tf or tt)
+
+    def _to_min(hhmm: str) -> int:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+
+    tfm = _to_min(tf) if tf else None
+    ttm = _to_min(tt) if tt else None
+    out: List[str] = []
+    for ln in lines:
+        low = (ln or "").lower()
+        if word and word not in low:
+            continue
+        if filt in ("smart", "storage", "ping", "port", "dns", "backup") and filt not in low:
+            continue
+        ts = _parse_log_line_datetime(ln) if needs_ts else None
+        if needs_ts and ts is None:
+            continue
+        if target_day is not None and ts is not None and ts.date() != target_day:
+            continue
+        if cutoff is not None and ts is not None and ts < cutoff:
+            continue
+        if (tfm is not None or ttm is not None) and ts is not None:
+            cur = ts.hour * 60 + ts.minute
+            if tfm is not None and ttm is not None:
+                ok = (tfm <= cur <= ttm) if tfm <= ttm else (cur >= tfm or cur <= ttm)
+            elif tfm is not None:
+                ok = cur >= tfm
+            else:
+                ok = cur <= int(ttm or 0)
+            if not ok:
+                continue
+        out.append(ln)
+    return out
+
+
+def get_ui_log_stats() -> Tuple[int, int]:
+    path = get_ui_log_path()
+    if not path.exists():
+        return 0, 0
+    try:
+        st = path.stat()
+        sz = int(st.st_size)
+        key = (int(st.st_mtime_ns), sz)
+        cached_key = _UI_LOG_STATS_CACHE.get("key")
+        cached_value = _UI_LOG_STATS_CACHE.get("value")
+        if cached_key == key and isinstance(cached_value, tuple) and len(cached_value) == 2:
+            return int(cached_value[0]), int(cached_value[1])
+        n = 0
+        had_data = False
+        last_byte = b""
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                had_data = True
+                n += chunk.count(b"\n")
+                last_byte = chunk[-1:]
+        if had_data and last_byte != b"\n":
+            n += 1
+        out = (sz, n)
+        _UI_LOG_STATS_CACHE["key"] = key
+        _UI_LOG_STATS_CACHE["value"] = out
+        return out
+    except OSError:
+        return 0, 0
+
+
+def _fmt_ui_log_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KiB"
+    return f"{num_bytes / (1024 * 1024):.1f} MiB"
+
+
+def read_ui_log(
+    max_lines: int = UI_LOG_DISPLAY_LINES,
+    log_filter: str = "all",
+    log_date: str = "all",
+    log_time_scope: str = "all",
+    log_time_from: str = "",
+    log_time_to: str = "",
+    log_word: str = "",
+) -> str:
     path = get_ui_log_path()
     if not path.exists():
         return "No log entries yet."
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        filt = (log_filter or "all").strip().lower()
-        if filt in ("smart", "storage", "ping", "port", "dns", "backup"):
-            lines = [ln for ln in lines if filt in ln.lower()]
-        tail = lines[-max_lines:]
-        return "".join(tail).strip() or "No log entries yet."
+            all_lines = f.readlines()
+        lines = _filter_log_lines(all_lines, log_filter, log_date, log_time_scope, log_time_from, log_time_to, log_word)
+        tail = lines[-max_lines:] if max_lines > 0 else lines
+        text = "".join(tail).strip()
+        if text:
+            return text
+        has_any_logs = bool(all_lines)
+        has_active_filter = (
+            (log_filter or "all").strip().lower() != "all"
+            or _normalize_log_date(log_date) != "all"
+            or _normalize_log_time_scope(log_time_scope) != "all"
+            or bool(_normalize_log_time_hhmm(log_time_from))
+            or bool(_normalize_log_time_hhmm(log_time_to))
+            or bool((log_word or "").strip())
+        )
+        if has_any_logs and has_active_filter:
+            return "No data in the selected period."
+        return "No log entries yet."
     except OSError as e:
         return f"Failed to read log: {type(e).__name__}: {e}"
+
+
+def apply_log_filters_to_text(
+    text: str,
+    log_filter: str = "all",
+    log_date: str = "all",
+    log_time_scope: str = "all",
+    log_time_from: str = "",
+    log_time_to: str = "",
+    log_word: str = "",
+    max_lines: int = UI_LOG_DISPLAY_LINES,
+) -> str:
+    if not (text or "").strip():
+        return text
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    lines = _filter_log_lines(lines, log_filter, log_date, log_time_scope, log_time_from, log_time_to, log_word)
+    tail = lines[-max_lines:] if max_lines > 0 else lines
+    out = "".join(tail).strip()
+    if out:
+        return out
+    return "No data in the selected period."
 
 
 def clear_ui_log() -> None:
@@ -1501,6 +1706,11 @@ def _fetch_agent_diag(
     peer_id: str,
     view: str,
     log_filter: str = "all",
+    log_date: str = "all",
+    log_time_scope: str = "all",
+    log_time_from: str = "",
+    log_time_to: str = "",
+    log_word: str = "",
     resolve_timeout: int = 15,
     fetch_timeout: int = 25,
 ) -> str:
@@ -1524,7 +1734,12 @@ def _fetch_agent_diag(
     if not p_url:
         return f"Cannot reach agent '{p_name}' at {p_url_raw}."
     try:
-        qs = f"?view={quote(view)}&log_filter={quote(log_filter)}"
+        qs = (
+            f"?view={quote(view)}&log_filter={quote(log_filter)}"
+            f"&log_date={quote(log_date)}&log_time_scope={quote(log_time_scope)}"
+            f"&log_time_from={quote(log_time_from)}&log_time_to={quote(log_time_to)}"
+            f"&log_word={quote(log_word)}"
+        )
         status, body = _peer_http_request(p_url, token, "GET", f"/api/peer/diag{qs}", timeout=fetch_timeout)
         if status < 300:
             text = body
@@ -1538,6 +1753,39 @@ def _fetch_agent_diag(
         return f"Agent returned HTTP {status}: {body[:500]}"
     except Exception as e:
         return f"Failed to fetch from agent: {type(e).__name__}: {e}"
+
+
+def _clear_agent_logs(cfg: Dict[str, Any], peer_id: str, timeout: int = 12) -> str:
+    token = str(cfg.get("peering_token", "") or "").strip()
+    if not token:
+        return "No peering token configured."
+    peers = cfg.get("peers", [])
+    target = None
+    for p in (peers if isinstance(peers, list) else []):
+        if str(p.get("instance_id", "")) == peer_id:
+            target = p
+            break
+    if not target:
+        return f"Agent '{peer_id}' not found in peers."
+    p_name = str(target.get("instance_name", "") or peer_id[:8])
+    p_url_raw = str(target.get("url", "") or "").strip().rstrip("/")
+    if not p_url_raw:
+        return f"No URL configured for agent '{p_name}'."
+    p_url = _resolve_peer_url_from_stored(p_url_raw, token, timeout=8)
+    if not p_url:
+        return f"Cannot reach agent '{p_name}' at {p_url_raw}."
+    try:
+        status, body = _peer_http_request(p_url, token, "POST", "/api/peer/clear-logs", payload={}, timeout=timeout)
+        if status < 300:
+            try:
+                data = json.loads(body)
+                msg = str(data.get("message", "Remote logs cleared"))
+            except Exception:
+                msg = "Remote logs cleared"
+            return f"{p_name}: {msg}"
+        return f"{p_name}: HTTP {status} - {body[:300]}"
+    except Exception as e:
+        return f"{p_name}: {type(e).__name__}: {e}"
 
 
 def _infer_peer_source_platform_for_update(cfg: Dict[str, Any], peer_id: str) -> str:
@@ -1593,6 +1841,41 @@ def _peer_update_capability(cfg: Dict[str, Any], peer_id: str) -> Tuple[bool, st
     if _is_unknown_update_override_enabled(cfg, peer_id):
         return True, "unknown", ""
     return False, "unknown", "Unknown platform; update blocked by default."
+
+
+def _peer_agent_platform_display(cfg: Dict[str, Any], peer_id: str) -> Tuple[str, str]:
+    snap = _load_peer_snapshot(peer_id) or {}
+    plat = str(snap.get("platform", "") or "").strip()
+    fam = str(snap.get("platform_family", "") or "").strip()
+    for p in (cfg.get("peers", []) or []):
+        if str(p.get("instance_id", "")) != peer_id:
+            continue
+        if not plat:
+            plat = str(p.get("platform", "") or "").strip()
+        if not fam:
+            fam = str(p.get("platform_family", "") or "").strip()
+        break
+    return plat, fam
+
+
+def _peer_update_options_hint_inner_html(cfg: Dict[str, Any], peer_id: str) -> str:
+    plat, fam = _peer_agent_platform_display(cfg, peer_id)
+    explain = (
+        "Remote updates are only offered when this master recognizes the agent as a supported Unix install. "
+        "If the agent does not advertise a known platform, updates stay disabled until you allow them here."
+    )
+    det_parts = []
+    if plat:
+        det_parts.append(f"OS: {plat}")
+    if fam:
+        det_parts.append(f"family: {fam}")
+    det = " · ".join(det_parts) if det_parts else "Not reported yet (wait for the next agent sync)."
+    return (
+        f"<div class='peer-update-options-hint'>"
+        f"<p class='muted' style='font-size:11px;line-height:1.4;margin:0 0 8px 0;'>{html.escape(explain)}</p>"
+        f"<p style='font-size:11px;line-height:1.4;margin:0 0 10px 0;color:#c8dbf8;'>{html.escape(det)}</p>"
+        f"</div>"
+    )
 
 
 def _trigger_agent_update(cfg: Dict[str, Any], peer_id: str) -> Tuple[Optional[str], Optional[str]]:
@@ -2297,7 +2580,17 @@ def _build_system_diag_text() -> str:
     )
 
 
-def _build_diag_text(cfg: Dict[str, Any], history: List[Dict[str, Any]], diag_view: str, log_filter: str) -> str:
+def _build_diag_text(
+    cfg: Dict[str, Any],
+    history: List[Dict[str, Any]],
+    diag_view: str,
+    log_filter: str,
+    log_date: str = "all",
+    log_time_scope: str = "all",
+    log_time_from: str = "",
+    log_time_to: str = "",
+    log_word: str = "",
+) -> str:
     view = (diag_view or "logs").strip().lower()
     if view == "task":
         return _build_task_diag_text(cfg)
@@ -2330,7 +2623,14 @@ def _build_diag_text(cfg: Dict[str, Any], history: List[Dict[str, Any]], diag_vi
         return json.dumps(details, indent=2)
     if view == "system":
         return _build_system_diag_text()
-    return read_ui_log(log_filter=log_filter)
+    return read_ui_log(
+        log_filter=log_filter,
+        log_date=log_date,
+        log_time_scope=log_time_scope,
+        log_time_from=log_time_from,
+        log_time_to=log_time_to,
+        log_word=log_word,
+    )
 
 
 def _build_live_snapshot() -> Dict[str, Any]:
@@ -2449,6 +2749,8 @@ def _build_live_snapshot() -> Dict[str, Any]:
                 "update_supported": update_supported,
                 "update_block_reason": update_block_reason,
                 "unknown_update_allowed": _is_unknown_update_override_enabled(cfg, peer_id),
+                "agent_platform": str(snap.get("platform", "") or ""),
+                "agent_platform_family": str(snap.get("platform_family", "") or ""),
             })
             peer_history = snap.get("history", [])
             peer_state = snap.get("state", {})
@@ -3400,7 +3702,8 @@ def _collect_backup_status() -> Dict[str, Any]:
             if last_bkp_time:
                 status = "success"
             else:
-                status = "warning"
+                # A configured backup task with no prior run is pending, not degraded.
+                status = "pending"
         task_entry: Dict[str, Any] = {
             "name": name,
             "source": "api",
@@ -3508,30 +3811,51 @@ def _probe_backup() -> Tuple[str, List[str], float]:
 
         tasks = cache.get("tasks", [])
         if tasks:
+            count_failed = sum(1 for t in tasks if t.get("status") == "failed")
+            count_pending = sum(1 for t in tasks if t.get("status") == "pending")
+            count_running = sum(1 for t in tasks if t.get("status") == "running")
+            lines.append(
+                f"Task summary: total={len(tasks)} | failed={count_failed} | pending={count_pending} | running={count_running}"
+            )
+        if tasks:
             for t in tasks:
                 name = t.get("name", "?")
                 st = t.get("status", "unknown")
-                icon = {"success": "OK", "failed": "FAIL", "running": "RUN", "partial": "PARTIAL", "cancelled": "CANCEL", "warning": "WARN"}.get(st, "?")
+                icon = {
+                    "success": "OK",
+                    "failed": "FAIL",
+                    "running": "RUN",
+                    "partial": "PARTIAL",
+                    "cancelled": "CANCEL",
+                    "warning": "WARN",
+                    "pending": "PENDING",
+                }.get(st, "?")
                 detail_parts = []
-                state_val = t.get("state", "")
-                if state_val and state_val not in ("none", ""):
-                    detail_parts.append(f"state={state_val}")
-                lr = t.get("last_result", "")
-                if lr and lr not in ("none", ""):
-                    detail_parts.append(f"result={lr}")
-                le = t.get("last_error", "")
-                if le and le not in ("none", "", "0"):
-                    detail_parts.append(f"error={le}")
                 lbt = t.get("last_bkp_time", 0)
-                if lbt:
-                    detail_parts.append(f"last={time.strftime('%m/%d %H:%M', time.localtime(int(lbt)))}")
                 nbt = t.get("next_bkp_time", 0)
-                if nbt:
-                    detail_parts.append(f"next={time.strftime('%m/%d %H:%M', time.localtime(int(nbt)))}")
+                le = t.get("last_error", "")
+                state_val = t.get("state", "")
+                if st == "failed":
+                    if le and le not in ("none", "", "0"):
+                        detail_parts.append(f"error={le}")
+                    elif state_val and state_val not in ("none", ""):
+                        detail_parts.append(f"state={state_val}")
+                elif st == "pending":
+                    if nbt:
+                        detail_parts.append(f"next={time.strftime('%m/%d %H:%M', time.localtime(int(nbt)))}")
+                    else:
+                        detail_parts.append("awaiting first run")
+                else:
+                    if lbt:
+                        detail_parts.append(f"last={time.strftime('%m/%d %H:%M', time.localtime(int(lbt)))}")
+                    if nbt:
+                        detail_parts.append(f"next={time.strftime('%m/%d %H:%M', time.localtime(int(nbt)))}")
                 detail = f" ({', '.join(detail_parts)})" if detail_parts else ""
                 lines.append(f"[{icon}] {name}{detail}")
         else:
-            lines.append("No backup tasks found")
+            lines.append("No backup tasks discovered via Hyper Backup API/logs")
+            if packages:
+                lines.append("Check helper permissions or whether tasks are visible to this DSM account")
 
         overall = str(cache.get("overall", "unknown"))
         status = {"up": "up", "down": "down", "warning": "warning"}.get(overall, "warning")
@@ -3743,6 +4067,9 @@ def check_host_with_monitor(mode: str, devices: List[str], monitor: Dict[str, An
         max_latency = max(max_latency, b_lat)
         if _severity(b_status) > _severity(worst):
             worst = b_status
+        if len(b_lines) > 8:
+            hidden = len(b_lines) - 8
+            b_lines = b_lines[:8] + [f"... and {hidden} more line(s)"]
         sections.append("Backup:\n" + "\n".join(f"  - {x}" for x in b_lines))
 
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -4171,33 +4498,34 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
             pbtn = "padding:6px 12px;font-size:12px;border-radius:8px;font-weight:600;white-space:nowrap;cursor:pointer;line-height:1.2;border:1px solid #36517a;background:transparent;color:#c8dbf8;"
             update_supported, source_platform, update_block_reason = _peer_update_capability(cfg, pid)
             unknown_update_allowed = _is_unknown_update_override_enabled(cfg, pid)
-            split_left_style = (pbtn + "border-radius:8px 0 0 8px;") if source_platform == "unknown" else pbtn
             update_btn = (
-                f"<button type='button' class='agent-update-btn' data-peer-id='{html.escape(pid)}' data-peer-name='{html.escape(pname)}' style='{split_left_style}'>Update</button>"
+                f"<button type='button' class='agent-update-btn' data-peer-id='{html.escape(pid)}' data-peer-name='{html.escape(pname)}' style='{pbtn}'>Update</button>"
                 if update_supported
-                else f"<button type='button' disabled title='{html.escape(update_block_reason)}' style='{split_left_style}opacity:.55;cursor:not-allowed;'>Update</button>"
+                else f"<button type='button' class='agent-update-btn' disabled title='{html.escape(update_block_reason)}' style='{pbtn}opacity:.55;cursor:not-allowed;'>Update</button>"
             )
-            unknown_update_toggle = ""
             if source_platform == "unknown":
                 toggle_value = "0" if unknown_update_allowed else "1"
                 toggle_label = "Block unknown updates" if unknown_update_allowed else "Allow unknown updates"
-                unknown_update_toggle = (
-                    f"<details style='display:inline-block;position:relative;'>"
-                    f"<summary title='Unknown platform options' style='{pbtn}padding:6px 8px;border-left:none;border-radius:0 8px 8px 0;cursor:pointer;'>⚠</summary>"
-                    f"<div style='position:absolute;right:0;top:calc(100% + 4px);z-index:9;background:#0f1726;border:1px solid #36517a;border-radius:8px;padding:8px;min-width:190px;'>"
+                hint_inner = _peer_update_options_hint_inner_html(cfg, pid)
+                update_options_cell = (
+                    f"<details class='peer-update-policy-menu'>"
+                    f"<summary class='peer-update-policy-summary' title='{html.escape('Unclear platform: open for details and to allow or block remote updates.')}' style='{pbtn}'>update-options</summary>"
+                    f"<div class='peer-update-policy-panel'>{hint_inner}"
                     f"<form method='post' action='/peer/update-unknown-policy' style='margin:0;'>"
                     f"<input type='hidden' name='peer_id' value='{html.escape(pid)}'>"
                     f"<input type='hidden' name='allow_unknown_update' value='{toggle_value}'>"
-                    f"<button type='submit' style='{pbtn}width:100%;text-align:left;display:block;'>{toggle_label}</button>"
+                    f"<button type='submit' class='peer-update-policy-submit' style='{pbtn}width:100%;text-align:left;display:block;'>{toggle_label}</button>"
                     f"</form>"
                     f"</div>"
                     f"</details>"
                 )
-            open_btn = (
+            else:
+                update_options_cell = "<span class=\"peer-action-placeholder peer-action-col-update-options\" aria-hidden=\"true\"></span>"
+            open_cell = (
                 f"<a href='{html.escape(p_open_url)}' target='_blank' rel='noopener noreferrer' "
                 f"style='{pbtn}text-decoration:none;display:inline-block;text-align:center;'>"
                 f"Open</a>"
-            ) if p_open_url else ""
+            ) if p_open_url else "<span class=\"peer-action-placeholder peer-action-col-open\" aria-hidden=\"true\"></span>"
             version_badge = f"<span class='badge muted-badge' data-role='peer-version'>v{html.escape(p_version)}</span>" if p_version else ""
             synced_badge = f"<span class='badge muted-badge' data-role='peer-synced'>Synced: {html.escape(seen_short)}</span>"
             peer_rows += (
@@ -4214,8 +4542,8 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
                 f"<span class='muted' style='font-size:11px;'>Last seen: {html.escape(seen_short)} ({lat_txt})</span>"
                 f"<span class='muted' style='font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{html.escape(p_url or 'no URL')}</span>"
                 f"</div>"
-                f"<div style='display:flex;align-items:center;gap:6px;margin-top:8px;'>"
-                f"<form method='post' action='/peer/update-peer-url' style='margin:0;display:flex;gap:4px;flex:1;'>"
+                f"<div class='peer-actions-row'>"
+                f"<form method='post' action='/peer/update-peer-url' style='margin:0;display:flex;gap:4px;align-items:center;min-width:0;'>"
                 f"<input type='hidden' name='peer_id' value='{html.escape(pid)}'>"
                 f"<input name='peer_url' value='{html.escape(_peer_url_for_input_display(p_url))}' placeholder='agent-nas or 192.168.31.10' style='flex:1;padding:4px 6px;font-size:11px;'>"
                 f"<button type='submit' style='{pbtn}'>Set URL</button>"
@@ -4225,8 +4553,8 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
                 f"<button type='submit' style='{pbtn}'>Sync</button>"
                 f"</form>"
                 f"{update_btn}"
-                f"{unknown_update_toggle}"
-                f"{open_btn}"
+                f"{update_options_cell}"
+                f"{open_cell}"
                 f"<form method='post' action='/peer/remove' style='margin:0;'>"
                 f"<input type='hidden' name='peer_id' value='{html.escape(pid)}'>"
                 f"<button type='submit' onclick=\"return confirm('Remove this agent?')\" "
@@ -4444,7 +4772,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
         token_section = ""  # standalone: no peering token
 
     return f"""
-      <div class="card">
+      <div class="card" id="peering-card">
         <h3>Multi-Instance Peering</h3>
         <div class="muted">Connect multiple instances for cross-network monitoring. Agents push results to a master dashboard.</div>
         <div class="muted" style="margin-top:6px;">Instance ID: <code>{html.escape(instance_id)}</code></div>
@@ -4470,6 +4798,11 @@ def _render_setup_html(
     elevated_check_message: str = "",
     elevated_check_output: str = "",
     log_filter: str = "all",
+    log_date: str = "all",
+    log_time_scope: str = "all",
+    log_time_from: str = "",
+    log_time_to: str = "",
+    log_word: str = "",
     edit_target: str = "",
     create_mode: bool = False,
     diag_view: str = "logs",
@@ -4487,6 +4820,7 @@ def _render_setup_html(
     highlight_channel: str = "",
     log_source: str = "local",
     diagnose_agent: bool = False,
+    server_panel: str = "",
 ) -> str:
     cfg = load_config()
     browser_instance_name = str(cfg.get("instance_name", "") or "").strip()
@@ -4552,6 +4886,11 @@ def _render_setup_html(
         source_label = "local"
     selected_snapshot = snapshot_by_id.get(source_label) if source_label != "local" else None
     source_is_remote = selected_snapshot is not None
+    log_date_norm = _normalize_log_date(log_date)
+    log_time_norm = _normalize_log_time_scope(log_time_scope)
+    log_time_from_norm = _normalize_log_time_hhmm(log_time_from)
+    log_time_to_norm = _normalize_log_time_hhmm(log_time_to)
+    log_word_norm = (log_word or "").strip()[:80]
 
     agent_log_async = False
     if source_is_remote and diag_view in ("logs", "config", "history", "cache", "system"):
@@ -4561,7 +4900,17 @@ def _render_setup_html(
             log_text = "Loading agent logs..."
             agent_log_async = True
     else:
-        log_text = _build_diag_text(cfg, history, diag_view=diag_view, log_filter=log_filter)
+        log_text = _build_diag_text(
+            cfg,
+            history,
+            diag_view=diag_view,
+            log_filter=log_filter,
+            log_date=log_date_norm,
+            log_time_scope=log_time_norm,
+            log_time_from=log_time_from_norm,
+            log_time_to=log_time_to_norm,
+            log_word=log_word_norm,
+        )
     automation_status = _scheduler_status_text(cfg)
     auth_state = _load_auth_state()
     recovery_unused = _count_unused_recovery(auth_state)
@@ -4656,7 +5005,7 @@ def _render_setup_html(
         channel_cards.append(
             f"<div class='overview-card {'hl-channel' if is_hl else ''}' data-channel='{channel}'>"
             f"<h4>{channel.capitalize()} Monitoring</h4>"
-            f"<a class='gauge-link' href='/?view=overview&diag_view=logs&log_filter={channel}&highlight={channel}&log_source={html.escape(source_label)}'>"
+            f"<a class='gauge-link' href='/?view=overview&diag_view=logs&log_filter={channel}&highlight={channel}&log_source={html.escape(source_label)}&log_date={html.escape(log_date_norm)}&log_time_scope={html.escape(log_time_norm)}'>"
             f"<div class='gauge {status_class(st)}' data-role='gauge' style='--pct:{pct}'>"
             f"<div class='gauge-center'><div class='gauge-value' data-role='gauge-value'>{status_label(st)}</div><div class='gauge-sub' data-role='gauge-sub'>{pct}%</div></div>"
             "</div>"
@@ -4671,6 +5020,7 @@ def _render_setup_html(
     # Current Server info for overview (follows selected source)
     local_source_name = browser_instance_name or "synology-agent"
     selected_source_name = local_source_name
+    selected_source_platform = "synology"
     viewed_spk_version = VERSION
     request_interface = _request_interface_host()
     server_ip = request_interface or _detect_primary_server_ip()
@@ -4679,8 +5029,16 @@ def _render_setup_html(
     last_login_at_ts = int(auth_state.get("last_login_at", 0) or 0)
     last_login_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_login_at_ts)) if last_login_at_ts else "n/a"
     if source_is_remote and selected_snapshot:
+        selected_source_platform = "unknown"
         selected_source_name = str(selected_snapshot.get("instance_name", "") or source_label[:8] or "remote")
         viewed_spk_version = str(selected_snapshot.get("version", "") or "").strip() or viewed_spk_version
+        snap_platform = str(selected_snapshot.get("source_platform", "") or "").strip().lower()
+        if snap_platform in ("synology", "unix"):
+            selected_source_platform = snap_platform
+        else:
+            inferred_platform = _infer_peer_source_platform_for_update(cfg, source_label)
+            if inferred_platform in ("synology", "unix"):
+                selected_source_platform = inferred_platform
         peer_entry = next((p for p in (cfg.get("peers", []) or []) if str(p.get("instance_id", "") or "").strip() == source_label), None)
         peer_host, _peer_port = _parse_peer_host_port(str(peer_entry.get("url", "") or ""), PEER_DEFAULT_PORT) if isinstance(peer_entry, dict) else ("", PEER_DEFAULT_PORT)
         server_ip = peer_host or "remote"
@@ -4710,7 +5068,15 @@ def _render_setup_html(
         else ("" if peer_role == "agent" else f"Viewing local source: {selected_source_name}.")
     )
     repo_url = f"https://github.com/{GITHUB_REPO}"
-    update_hint = "This checker tracks Synology package (SPK) versions. Reinstall via Package Center, script, or download SPK from GitHub releases."
+    package_word = "SPK" if selected_source_platform == "synology" else "addon"
+    package_word_cap = "SPK" if selected_source_platform == "synology" else "Addon"
+    package_label = "Synology SPK Version" if selected_source_platform == "synology" else "Unix Addon Version"
+    package_title = "Synology SPK update" if selected_source_platform == "synology" else "Unix addon update"
+    update_hint = (
+        "This checker tracks Synology package (SPK) versions. Reinstall via Package Center, script, or download SPK from GitHub releases."
+        if selected_source_platform == "synology"
+        else "This checker tracks Unix addon versions. Reinstall via script or download release assets from GitHub."
+    )
     update_from_main = bool(cfg.get("update_from_main", False))
     selected_channel = "main" if update_from_main else "latest"
     selected_channel_label = "main branch" if update_from_main else "latest release"
@@ -4753,18 +5119,18 @@ def _render_setup_html(
     if update_check_error:
         package_panel_lines.append(f"Check error: {update_check_error}")
     if update_available and latest_version:
-        package_panel_lines.append(f"SPK update available: {latest_version} (current SPK: {viewed_spk_version})")
+        package_panel_lines.append(f"{package_word_cap} update available: {latest_version} (current {package_word}: {viewed_spk_version})")
         if update_download_url:
             package_panel_lines.append(f"Download: {update_download_url}")
     elif latest_version and not update_available:
-        package_panel_lines.append(f"SPK up to date ({viewed_spk_version})")
+        package_panel_lines.append(f"{package_word_cap} up to date ({viewed_spk_version})")
     if not package_panel_lines:
         if update_check_stale or not channel_matches_cache:
             package_panel_lines.append("Checking selected source for updates...")
         else:
             package_panel_lines.append("Update status unknown. Use Recheck for updates.")
     package_panel_lines.append(
-        f"Selected source: {selected_channel_label} | Current SPK ({selected_source_name}): {viewed_spk_version} | Public SPK ({selected_channel}): {latest_version or 'unknown'}"
+        f"Selected source: {selected_channel_label} | Current {package_word_cap} ({selected_source_name}): {viewed_spk_version} | Public {package_word_cap} ({selected_channel}): {latest_version or 'unknown'}"
     )
     package_panel_lines.append("")
     package_panel_lines.append(update_hint)
@@ -4773,29 +5139,32 @@ def _render_setup_html(
     if update_available and update_download_url and latest_version:
         update_ready_banner = (
             "<div class='update-ready-banner'>"
-            "<span>New SPK version available (v" + html.escape(latest_version) + "). </span>"
-            "<a class='btn-inline' href='" + html.escape(update_download_url) + "' target='_blank' rel='noopener noreferrer'>Download SPK</a>"
+            "<span>New " + package_word + " version available (v" + html.escape(latest_version) + "). </span>"
+            "<a class='btn-inline' href='" + html.escape(update_download_url) + "' target='_blank' rel='noopener noreferrer'>Download " + package_word_cap + "</a>"
             "</div>"
         )
     package_download_btn = ""
     if update_available and update_download_url:
-        package_download_btn = f"<div class='button-row'><a class='btn-inline' href='{html.escape(update_download_url)}' target='_blank' rel='noopener noreferrer'>Download SPK ({html.escape(latest_version)})</a></div>"
+        package_download_btn = f"<div class='button-row'><a class='btn-inline' href='{html.escape(update_download_url)}' target='_blank' rel='noopener noreferrer'>Download {package_word_cap} ({html.escape(latest_version)})</a></div>"
+    server_panel = str(server_panel or "").strip().lower()
+    if server_panel not in {"name", "ip", "time", "package", "login", "login-time"}:
+        server_panel = ""
     server_info_card_html = (
         "<div class='server-info-grid'>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(selected_source_name)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(server_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(now_text)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Synology SPK Version</span><strong>{html.escape(viewed_spk_version)}{package_badge}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>{html.escape(package_label)}</span><strong>{html.escape(viewed_spk_version)}{package_badge}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(last_login_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(last_login_at_text)}</strong></button>"
         "</div>"
         "<div class='server-action-panels'>"
-        f"<div class='card server-action-panel' data-server-panel='name'><h4>Change server name</h4><form method='post' action='/settings/save-instance-name'><label>Instance Name</label><input name='instance_name' value='{html.escape(str(cfg.get('instance_name', '') or ''))}' placeholder='e.g. GSIARR01-AGENT'><div class='button-row'><button type='submit'>Save name</button></div></form></div>"
-        f"<div class='card server-action-panel' data-server-panel='ip'><h4>System IP addresses</h4><pre>{html.escape(ip_list_text)}</pre></div>"
-        f"<div class='card server-action-panel' data-server-panel='time'><h4>Time</h4><pre>Current time: {html.escape(now_text)}\n(System time on this NAS)</pre></div>"
-        f"<div class='card server-action-panel' data-server-panel='package'><h4>Synology SPK update</h4>{update_ready_banner}{package_source_controls}<div class='button-row'><a class='btn-inline' href='{html.escape(repo_url)}' target='_blank' rel='noopener noreferrer'>Open GitHub repository</a> <form method='post' action='/settings/recheck-updates' style='display:inline;'><button type='submit' class='btn-inline btn-inline-muted'>Recheck for updates</button></form></div>{package_download_btn}{package_panel_html}<pre>{html.escape(update_curl_cmd)}</pre></div>"
-        f"<div class='card server-action-panel' data-server-panel='login'><h4>Recent login events (IP + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
-        f"<div class='card server-action-panel' data-server-panel='login-time'><h4>Recent login events (time + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
+        f"<div class='card server-action-panel{' open' if server_panel == 'name' else ''}' data-server-panel='name'><h4>Change server name</h4><form method='post' action='/settings/save-instance-name'><label>Instance Name</label><input name='instance_name' value='{html.escape(str(cfg.get('instance_name', '') or ''))}' placeholder='e.g. GSIARR01-AGENT'><div class='button-row'><button type='submit'>Save name</button></div></form></div>"
+        f"<div class='card server-action-panel{' open' if server_panel == 'ip' else ''}' data-server-panel='ip'><h4>System IP addresses</h4><pre>{html.escape(ip_list_text)}</pre></div>"
+        f"<div class='card server-action-panel{' open' if server_panel == 'time' else ''}' data-server-panel='time'><h4>Time</h4><pre>Current time: {html.escape(now_text)}\n(System time on this NAS)</pre></div>"
+        f"<div class='card server-action-panel{' open' if server_panel == 'package' else ''}' data-server-panel='package'><h4>{html.escape(package_title)}</h4>{update_ready_banner}{package_source_controls}<div class='button-row'><a class='btn-inline' href='{html.escape(repo_url)}' target='_blank' rel='noopener noreferrer'>Open GitHub repository</a> <form method='post' action='/settings/recheck-updates' style='display:inline;'><button type='submit' class='btn-inline btn-inline-muted'>Recheck for updates</button></form></div>{package_download_btn}{package_panel_html}<pre>{html.escape(update_curl_cmd)}</pre></div>"
+        f"<div class='card server-action-panel{' open' if server_panel == 'login' else ''}' data-server-panel='login'><h4>Recent login events (IP + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
+        f"<div class='card server-action-panel{' open' if server_panel == 'login-time' else ''}' data-server-panel='login-time'><h4>Recent login events (time + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
         "</div>"
     )
 
@@ -4887,8 +5256,8 @@ def _render_setup_html(
             + "</div>"
         )
 
-    # Remote / agent monitor cards.
-    remote_cards: List[str] = []
+    # Remote / agent monitor cards (grouped by agent host / origin).
+    remote_by_host: Dict[str, List[str]] = {}
     if peer_role == "master":
         for snap in peer_snapshots:
             snap_name = str(snap.get("instance_name", "") or str(snap.get("instance_id", ""))[:8])
@@ -4920,8 +5289,8 @@ def _render_setup_html(
                 r_kuma = str(master_cfg.get("kuma_url", "") or "")
                 r_token_label = kuma_token_label(r_kuma) if r_kuma else ""
                 r_token_html = f"<div class='monitor-meta token-row'>Token: <code>{html.escape(r_token_label)}</code></div>" if r_token_label else ""
-                remote_cards.append(
-                    f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == pm_mode.lower()) else ''}' data-monitor='{html.escape(pn)}' data-mode='{html.escape(pm_mode.lower())}'>"
+                card_html = (
+                    f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == pm_mode.lower()) else ''}' data-monitor='{html.escape(pn)}' data-mode='{html.escape(pm_mode.lower())}' data-agent-host='{html.escape(snap_name)}'>"
                     + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(pn)}</div>"
                     + f"<span class='badge {status_class(pst)}'>{status_label(pst)}</span></div>"
                     + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(pm_mode)} | Last ping: {html.escape(str(pp))} ms | Last run: {html.escape(pt_text)} | Origin: {html.escape(snap_name)}</div>"
@@ -4932,16 +5301,30 @@ def _render_setup_html(
                     + "</div>"
                     + "</div>"
                 )
+                remote_by_host.setdefault(snap_name, []).append(card_html)
     local_monitors_html = "".join(local_cards) if local_cards else "<p class='muted'>No local monitors configured yet.</p>"
     remote_monitors_html = ""
     if peer_role == "master":
-        remote_grid = "".join(remote_cards) if remote_cards else "<p class='muted'>No agent monitors synced yet. Create a monitor on an agent or wait for the next sync.</p>"
+        remote_total = sum(len(v) for v in remote_by_host.values())
+        if not remote_by_host:
+            remote_grid = "<p class='muted'>No agent monitors synced yet. Create a monitor on an agent or wait for the next sync.</p>"
+        else:
+            host_sections: List[str] = []
+            for host in sorted(remote_by_host.keys(), key=lambda x: str(x).lower()):
+                hcards = remote_by_host[host]
+                host_sections.append(
+                    f"<div class='agent-host-monitor-group' data-agent-host='{html.escape(host)}'>"
+                    f"<h4 class='agent-host-heading'>{html.escape(host)} <span class='badge muted-badge'>{len(hcards)}</span></h4>"
+                    f"<div class='monitor-grid'>{''.join(hcards)}</div>"
+                    f"</div>"
+                )
+            remote_grid = f"<div class='agent-monitors-by-host'>{''.join(host_sections)}</div>"
         remote_monitors_html = (
             f"<div class='card' style='margin-top:12px;'>"
-            f"<h3>Agent Monitors <span class='badge muted-badge'>{len(remote_cards)}</span></h3>"
+            f"<h3>Agent Monitors <span class='badge muted-badge'>{remote_total}</span></h3>"
             f"<div class='muted' style='margin-bottom:8px;'>Monitors running on remote agent instances. Status is updated via peering sync. "
             f"Kuma push is handled by the master.</div>"
-            f"<div class='monitor-grid'>{remote_grid}</div>"
+            f"{remote_grid}"
             f"</div>"
         )
 
@@ -4956,9 +5339,46 @@ def _render_setup_html(
         "paths": "paths",
         "system": "system",
     }.get((diag_view or "logs").lower(), "logs")
+    log_bytes, log_lines_total = get_ui_log_stats()
+    diag_view_labels = {"logs": "Logs", "task": "Task", "cache": "Cache", "config": "Config", "history": "History", "paths": "Paths", "system": "System"}
+    event_labels = {"all": "All events", "smart": "Smart", "storage": "Storage", "ping": "Ping", "port": "Port", "dns": "DNS", "backup": "Backup"}
+    date_labels = {"all": "Any date", "today": "Today", "yesterday": "Yesterday"}
+    time_labels = {"all": "Any time", "15m": "Last 15 minutes", "1h": "Last hour", "6h": "Last 6 hours", "24h": "Last 24 hours"}
+    _dvo = "".join(
+        f"<option value='{html.escape(v)}'{' selected' if diag_label == v else ''}>{html.escape(diag_view_labels[v])}</option>"
+        for v in ("logs", "task", "cache", "config", "history", "paths", "system")
+    )
+    _evo = "".join(
+        f"<option value='{html.escape(v)}'{' selected' if filter_label == v else ''}>{html.escape(event_labels[v])}</option>"
+        for v in ("all", "smart", "storage", "ping", "port", "dns", "backup")
+    )
+    _dto = "".join(
+        f"<option value='{html.escape(v)}'{' selected' if log_date_norm == v else ''}>{html.escape(date_labels.get(v, v))}</option>"
+        for v in ("all", "today", "yesterday")
+    )
+    _tto = "".join(
+        f"<option value='{html.escape(v)}'{' selected' if log_time_norm == v else ''}>{html.escape(time_labels[v])}</option>"
+        for v in ("all", "15m", "1h", "6h", "24h")
+    )
+    _log_pre_attrs = ""
+    if agent_log_async:
+        _log_pre_attrs = (
+            ' data-agent-fetch="1" data-peer-id="' + html.escape(source_label)
+            + '" data-view="' + html.escape(diag_label)
+            + '" data-log-filter="' + html.escape(filter_label)
+            + '" data-log-date="' + html.escape(log_date_norm)
+            + '" data-log-time-scope="' + html.escape(log_time_norm)
+            + '" data-log-time-from="' + html.escape(log_time_from_norm)
+            + '" data-log-time-to="' + html.escape(log_time_to_norm) + '"'
+            + ' data-log-word="' + html.escape(log_word_norm) + '"'
+        )
     source_tabs_html = ""
     if peer_role == "master":
-        q_base = f"view=overview&amp;diag_view={diag_label}&amp;log_filter={filter_label}"
+        q_base = (
+            f"view=overview&amp;diag_view={diag_label}&amp;log_filter={filter_label}"
+            f"&amp;log_date={html.escape(log_date_norm)}&amp;log_time_scope={html.escape(log_time_norm)}"
+            f"&amp;log_word={html.escape(log_word_norm)}"
+        )
         src_chips = [f"<a class='chip {'active' if source_label=='local' else ''}' href='?{q_base}&amp;log_source=local'>Local</a>"]
         for sp in (cfg.get("peers", []) or []):
             sp_id = str(sp.get("instance_id", "") or "").strip()
@@ -5052,13 +5472,27 @@ def _render_setup_html(
     )
     nav_html = (
         "<div class='card'><div class='chip-row nav-tabs'>"
-        + f"<a class='chip {'active' if ui_view=='overview' else ''}' href='/?view=overview&diag_view={diag_label}&log_filter={filter_label}&log_source={html.escape(source_label)}'>Overview</a>"
+        + f"<a class='chip {'active' if ui_view=='overview' else ''}' href='/?view=overview&diag_view={diag_label}&log_filter={filter_label}&log_source={html.escape(source_label)}&log_date={html.escape(log_date_norm)}&log_time_scope={html.escape(log_time_norm)}&log_word={html.escape(log_word_norm)}'>Overview</a>"
         + f"<a class='chip {'active' if ui_view=='setup' else ''}' href='/?view=setup'>Monitor Setup</a>"
         + f"<a class='chip {'active' if ui_view=='settings' else ''}' href='/?view=settings'>Settings</a>"
         + "</div>"
         + (source_tabs_html if ui_view == "overview" else "")
         + "</div>"
     )
+    log_diag_clear_actions_html = ""
+    if diag_label == "logs":
+        log_diag_clear_actions_html = (
+            "<form method='post' action='/clear-logs' style='margin:0;'>"
+            "<button type='submit' onclick=\"return confirm('Clear local logs on this instance?');\" "
+            "style='border-color:#ef4444;color:#ef4444;'>Clear local logs</button></form>"
+        )
+        if source_label != "local":
+            log_diag_clear_actions_html += (
+                "<form method='post' action='/clear-logs-remote' style='margin:0 0 0 8px;'>"
+                "<input type='hidden' name='source' value='" + html.escape(source_label) + "'>"
+                "<button type='submit' onclick=\"return confirm('Clear logs on the selected remote agent?');\" "
+                "style='border-color:#ef4444;color:#ef4444;'>Clear selected agent logs</button></form>"
+            )
     overview_view_html = f"""
       <div class="card">
         <h3>Current Server <span class="badge muted-badge">{html.escape(selected_source_name)}</span></h3>
@@ -5071,26 +5505,11 @@ def _render_setup_html(
       </div>
       <div class="card">
         <h3>Logs & Diagnostics</h3>
-        <div class="chip-row" style="flex-wrap:wrap;">
-          <a class="chip {'active' if diag_label=='logs' else ''}" href="?view=overview&amp;diag_view=logs&amp;log_filter={html.escape(filter_label)}&amp;log_source={html.escape(source_label)}">Logs</a>
-          <a class="chip {'active' if diag_label=='task' else ''}" href="?view=overview&amp;diag_view=task&amp;log_source={html.escape(source_label)}">Task</a>
-          <a class="chip {'active' if diag_label=='cache' else ''}" href="?view=overview&amp;diag_view=cache&amp;log_source={html.escape(source_label)}">Cache</a>
-          <a class="chip {'active' if diag_label=='config' else ''}" href="?view=overview&amp;diag_view=config&amp;log_source={html.escape(source_label)}">Config</a>
-          <a class="chip {'active' if diag_label=='history' else ''}" href="?view=overview&amp;diag_view=history&amp;log_source={html.escape(source_label)}">History</a>
-          <a class="chip {'active' if diag_label=='paths' else ''}" href="?view=overview&amp;diag_view=paths&amp;log_source={html.escape(source_label)}">Paths</a>
-          <a class="chip {'active' if diag_label=='system' else ''}" href="?view=overview&amp;diag_view=system&amp;log_source={html.escape(source_label)}">System</a>
-        </div>
-        {"<div class='chip-row'><a class='chip " + ("active" if filter_label=='all' else "") + "' href='?view=overview&diag_view=logs&log_filter=all&log_source=" + html.escape(source_label) + "'>All</a><a class='chip " + ("active" if filter_label=='smart' else "") + "' href='?view=overview&diag_view=logs&log_filter=smart&log_source=" + html.escape(source_label) + "'>Smart</a><a class='chip " + ("active" if filter_label=='storage' else "") + "' href='?view=overview&diag_view=logs&log_filter=storage&log_source=" + html.escape(source_label) + "'>Storage</a><a class='chip " + ("active" if filter_label=='ping' else "") + "' href='?view=overview&diag_view=logs&log_filter=ping&log_source=" + html.escape(source_label) + "'>Ping</a><a class='chip " + ("active" if filter_label=='port' else "") + "' href='?view=overview&diag_view=logs&log_filter=port&log_source=" + html.escape(source_label) + "'>Port</a><a class='chip " + ("active" if filter_label=='dns' else "") + "' href='?view=overview&diag_view=logs&log_filter=dns&log_source=" + html.escape(source_label) + "'>DNS</a><a class='chip " + ("active" if filter_label=='backup' else "") + "' href='?view=overview&diag_view=logs&log_filter=backup&log_source=" + html.escape(source_label) + "'>Backup</a></div>" if diag_label=='logs' else ""}
-        <pre id="log-diag-pre"{' data-agent-fetch="1" data-peer-id="' + html.escape(source_label) + '" data-view="' + html.escape(diag_label) + '" data-log-filter="' + html.escape(filter_label) + '"' if agent_log_async else ""}>{html.escape(log_text)}</pre>
-        <div class="button-row">
-          <form method="get" action="/"><input type="hidden" name="view" value="overview"><input type="hidden" name="diag_view" value="{html.escape(diag_label)}"><input type="hidden" name="log_filter" value="{html.escape(filter_label)}"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><button type="submit">Refresh</button></form>
-          {("<form method='get' action='/' style='margin-left:auto;'><input type='hidden' name='view' value='overview'><input type='hidden' name='diag_view' value='" + html.escape(diag_label) + "'><input type='hidden' name='log_filter' value='" + html.escape(filter_label) + "'><input type='hidden' name='log_source' value='" + html.escape(source_label) + "'><input type='hidden' name='diagnose' value='1'><button type='submit'>Diagnose connection</button></form>") if source_label != "local" else ""}
-          {"<form method='post' action='/clear-logs'><button type='submit'>Clear logs</button></form>" if diag_label == "logs" else ""}
-          {"<form method='post' action='/clear-task-status'><button type='submit'>Clear task data</button></form>" if diag_label == "task" else ""}
-          {"<form method='post' action='/clear-cache'><button type='submit'>Clear cache</button></form>" if diag_label == "cache" else ""}
-          {"<form method='post' action='/clear-history'><button type='submit'>Clear history</button></form>" if diag_label == "history" else ""}
-          {"<form method='post' action='/clear-system-cache'><button type='submit'>Clear system logs</button></form>" if diag_label == "system" else ""}
-        </div>
+        <div class='log-diag-active-banner'><strong>Viewing:</strong> {html.escape(diag_view_labels.get(diag_label, diag_label))} · {html.escape(event_labels.get(filter_label, filter_label))} · {html.escape(time_labels.get(log_time_norm, log_time_norm))} · date {html.escape(date_labels.get(log_date_norm, log_date_norm))} · exact {html.escape((log_time_from_norm or '--:--') + ' to ' + (log_time_to_norm or '--:--')) if (log_time_from_norm or log_time_to_norm) else 'full day'} · word {html.escape(log_word_norm or '(any)')}</div>
+        {"<div class='log-diag-meta'>UI log file: " + html.escape(_fmt_ui_log_size(log_bytes)) + f" · {log_lines_total:,} lines on disk · rolling window: up to {UI_LOG_DISPLAY_LINES} newest matching lines.</div>" if diag_label == "logs" and source_label == "local" else ("<div class='log-diag-meta'>UI log file: remote agent (" + html.escape(selected_source_name) + ") · size/line count shown on agent UI · rolling window: up to " + str(UI_LOG_DISPLAY_LINES) + " newest matching lines.</div>" if diag_label == "logs" else "")}
+        <form method="get" action="/" class="log-diag-filter-form"><input type="hidden" name="view" value="overview"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><div class="log-diag-filter-grid"><div><label>Diagnostic view</label><select name="diag_view" onchange="this.form.submit()">{_dvo}</select></div><div><label>Event / channel</label><select name="log_filter" onchange="this.form.submit()">{_evo}</select></div><div><label>Time window</label><select name="log_time_scope" onchange="this.form.submit()">{_tto}</select></div></div><details style="margin-top:10px;"><summary style="cursor:pointer;">Advanced filtering</summary><div class="log-diag-filter-grid" style="margin-top:8px;"><div><label>Date (calendar)</label><input type="date" name="log_date" value="{html.escape('' if log_date_norm == 'all' else log_date_norm)}" onchange="this.form.submit()"></div><div><label>Time from</label><input type="time" name="log_time_from" value="{html.escape(log_time_from_norm)}" onchange="this.form.submit()"></div><div><label>Time to</label><input type="time" name="log_time_to" value="{html.escape(log_time_to_norm)}" onchange="this.form.submit()"></div><div><label>Contains word</label><input type="text" name="log_word" value="{html.escape(log_word_norm)}" placeholder="e.g. timeout, failed, dns" onchange="this.form.submit()"></div></div></details><div class='button-row' style='margin-top:8px;'><a class='btn-inline btn-inline-muted' href='/?view=overview&diag_view=logs&log_filter=all&log_date=all&log_time_scope=all&log_time_from=&log_time_to=&log_word=&log_source={html.escape(source_label)}'>Clear filters</a></div></form>
+        <div class="log-diag-toolbar"><div class="log-diag-toolbar-left">{log_diag_clear_actions_html}</div><div class="button-row" style="margin:0;"><form method="get" action="/"><input type="hidden" name="view" value="overview"><input type="hidden" name="diag_view" value="{html.escape(diag_label)}"><input type="hidden" name="log_filter" value="{html.escape(filter_label)}"><input type="hidden" name="log_date" value="{html.escape(log_date_norm)}"><input type="hidden" name="log_time_scope" value="{html.escape(log_time_norm)}"><input type="hidden" name="log_time_from" value="{html.escape(log_time_from_norm)}"><input type="hidden" name="log_time_to" value="{html.escape(log_time_to_norm)}"><input type="hidden" name="log_word" value="{html.escape(log_word_norm)}"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><button type="submit">Refresh</button></form>{("<form method='get' action='/' style='margin-left:auto;'><input type='hidden' name='view' value='overview'><input type='hidden' name='diag_view' value='" + html.escape(diag_label) + "'><input type='hidden' name='log_filter' value='" + html.escape(filter_label) + "'><input type='hidden' name='log_date' value='" + html.escape(log_date_norm) + "'><input type='hidden' name='log_time_scope' value='" + html.escape(log_time_norm) + "'><input type='hidden' name='log_time_from' value='" + html.escape(log_time_from_norm) + "'><input type='hidden' name='log_time_to' value='" + html.escape(log_time_to_norm) + "'><input type='hidden' name='log_word' value='" + html.escape(log_word_norm) + "'><input type='hidden' name='log_source' value='" + html.escape(source_label) + "'><input type='hidden' name='diagnose' value='1'><button type='submit'>Diagnose connection</button></form>") if source_label != "local" else ""}</div></div>
+        <pre id="log-diag-pre"{_log_pre_attrs}>{html.escape(log_text)}</pre>
       </div>
     """
     setup_view_html = f"""
@@ -5212,6 +5631,8 @@ def _render_setup_html(
     .layout {{ display: grid; grid-template-columns: 2.1fr 1fr; gap: 12px; }}
     .main-col, .side-col {{ min-width: 0; }}
     .card {{ background: rgba(18,29,47,0.94); border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin-bottom: 14px; box-shadow: 0 14px 30px rgba(0,0,0,.28); backdrop-filter: blur(4px); }}
+    #peering-card {{ position: relative; z-index: 30; }}
+    #peer-live-panel {{ overflow: visible; position: relative; }}
     h2 {{ margin: 0 0 6px 0; color: #e7f0ff; font-size: 22px; }}
     h3 {{ margin: 0 0 10px 0; color: #c8dbf8; font-size: 18px; }}
     h4 {{ margin: 0 0 8px 0; color: #b8cae3; font-size: 14px; }}
@@ -5257,6 +5678,53 @@ def _render_setup_html(
     .btn-inline:hover {{ background: rgba(54,81,122,.25); }}
     .btn-inline-muted {{ color: #8fa1b8; border-color: #2f425e; }}
     .btn-inline-muted:hover {{ background: rgba(47,66,94,.28); color: #c4d7f1; }}
+    .peer-actions-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto minmax(7.25rem, auto) minmax(3.75rem, auto) auto;
+      gap: 6px;
+      align-items: center;
+      margin-top: 8px;
+      overflow: visible;
+    }}
+    .peer-row {{ overflow: visible; }}
+    .peer-actions-row > form {{ margin: 0; }}
+    .peer-actions-row > button.agent-update-btn {{ justify-self: start; }}
+    .peer-actions-row > .peer-update-policy-menu {{ justify-self: start; align-self: center; }}
+    .peer-actions-row > a {{ justify-self: start; }}
+    .peer-action-placeholder {{
+      display: block;
+      box-sizing: border-box;
+      min-height: 30px;
+      visibility: hidden;
+      pointer-events: none;
+    }}
+    .peer-action-col-update-options {{ width: 7.25rem; }}
+    .peer-action-col-open {{ width: 3.75rem; }}
+    .peer-update-policy-menu {{ display:inline-block; position:relative; vertical-align:middle; margin:0; }}
+    .peer-update-policy-summary {{
+      list-style:none;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      box-sizing:border-box;
+      margin:0;
+    }}
+    .peer-update-policy-summary::marker {{ content:""; }}
+    .peer-update-policy-summary::-webkit-details-marker {{ display:none; }}
+    .peer-update-policy-panel {{
+      position:absolute;
+      right:0;
+      top:calc(100% + 4px);
+      z-index:5000;
+      background:#0f1726;
+      border:1px solid #36517a;
+      border-radius:8px;
+      padding:10px 12px;
+      min-width:240px;
+      max-width:min(320px, 92vw);
+      box-shadow:0 8px 24px rgba(0,0,0,.35);
+    }}
+    .peer-update-policy-submit {{ margin-top: 0; }}
     .autoupdate-row {{ margin-bottom:12px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }}
     .autoupdate-form {{ margin:0; }}
     .autoupdate-btn {{ padding:8px 14px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; border:1px solid #36517a; background:transparent; color:#8fa1b8; transition:all .15s ease; }}
@@ -5280,6 +5748,8 @@ def _render_setup_html(
     .history-dots {{ margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; min-height: 12px; }}
     .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
     .monitor-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }}
+    .agent-monitors-by-host {{ display: flex; flex-direction: column; gap: 18px; }}
+    .agent-host-heading {{ margin: 0 0 8px 0; font-size: 15px; font-weight: 700; color: #b8cae3; }}
     .monitor-card {{ border: 1px solid var(--border); border-radius: 10px; background: var(--card-soft); padding: 12px; display: flex; flex-direction: column; }}
     .monitor-card .button-row {{ margin-top: auto; padding-top: 14px; }}
     .monitor-card .btn-remove {{ background: transparent; border: 1px solid #ef4444; color: #ef4444; }}
@@ -5309,6 +5779,15 @@ def _render_setup_html(
     .chip:hover {{ border-color: #5aa1ff; color: #e6f2ff; }}
     .chip.active {{ background: linear-gradient(180deg, rgba(87,156,255,.35), rgba(47,128,237,.28)); border-color: #67abff; color: #eaf4ff; box-shadow: 0 0 0 1px rgba(103,171,255,.2) inset; }}
     .chip-row {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; margin-bottom: 4px; }}
+    #log-diag-pre {{ max-height: 22rem; overflow: auto; font-size: 11px; line-height: 1.35; }}
+    .log-diag-active-banner {{ margin: 0 0 10px 0; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(76,143,246,0.45); background: rgba(47,128,237,0.12); color: #d2e4ff; font-size: 13px; }}
+    .log-diag-meta {{ margin: 0 0 10px 0; font-size: 12px; color: var(--muted); }}
+    .log-diag-toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 10px; }}
+    .log-diag-toolbar-left {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .log-diag-filter-form {{ margin: 0 0 12px 0; }}
+    .log-diag-filter-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }}
+    .log-diag-filter-grid label {{ margin-top: 0; font-size: 11px; }}
+    .log-diag-filter-grid select {{ margin-top: 2px; }}
     .source-tabs {{ justify-content: center; }}
     .nav-tabs {{ justify-content: center; gap: 12px; }}
     .modal-backdrop {{ position: fixed; inset: 0; background: rgba(5,10,20,.74); display: none; align-items: center; justify-content: center; z-index: 2000; }}
@@ -5356,7 +5835,7 @@ def _render_setup_html(
     }}
   </style>
 </head>
-<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-source="{html.escape(source_label)}" data-form-error="{('1' if error and modal_open else '0')}">
+<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-date="{html.escape(log_date_norm)}" data-log-time-scope="{html.escape(log_time_norm)}" data-log-time-from="{html.escape(log_time_from_norm)}" data-log-time-to="{html.escape(log_time_to_norm)}" data-log-word="{html.escape(log_word_norm)}" data-log-source="{html.escape(source_label)}" data-form-error="{('1' if error and modal_open else '0')}">
   <div class="container">
     <div class="card">
       <div class="brand-head">
@@ -5365,7 +5844,7 @@ def _render_setup_html(
         </div>
         <div class="brand-center">
           <a href="{html.escape(BRAND_URL)}" target="_blank" rel="noopener noreferrer"><img class="brand-logo" src="{html.escape(BRAND_LOGO_URL)}" alt="{html.escape(BRAND_NAME)} logo"></a>
-          <div class="brand-summary">All-in-one Synology monitoring: SMART, storage, backup, ping, port, DNS, secure peering, and instant Uptime Kuma alerts.</div>
+          <div class="brand-summary">EasySystem - Monitoring</div>
         </div>
       </div>
       {status_html}
@@ -5471,11 +5950,21 @@ def _render_setup_html(
         var uiView = bodyMeta ? (bodyMeta.getAttribute("data-ui-view") || "overview") : "overview";
         var diagView = bodyMeta ? (bodyMeta.getAttribute("data-diag-view") || "logs") : "logs";
         var logFilter = bodyMeta ? (bodyMeta.getAttribute("data-log-filter") || "all") : "all";
+        var logDate = bodyMeta ? (bodyMeta.getAttribute("data-log-date") || "all") : "all";
+        var logTimeScope = bodyMeta ? (bodyMeta.getAttribute("data-log-time-scope") || "all") : "all";
+        var logTimeFrom = bodyMeta ? (bodyMeta.getAttribute("data-log-time-from") || "") : "";
+        var logTimeTo = bodyMeta ? (bodyMeta.getAttribute("data-log-time-to") || "") : "";
+        var logWord = bodyMeta ? (bodyMeta.getAttribute("data-log-word") || "") : "";
         var logSource = bodyMeta ? (bodyMeta.getAttribute("data-log-source") || "local") : "local";
         var qs = new URLSearchParams();
         qs.set("view", uiView);
         qs.set("diag_view", diagView);
         qs.set("log_filter", logFilter);
+        qs.set("log_date", logDate);
+        qs.set("log_time_scope", logTimeScope);
+        qs.set("log_time_from", logTimeFrom);
+        qs.set("log_time_to", logTimeTo);
+        qs.set("log_word", logWord);
         qs.set("log_source", logSource);
         qs.set("source", logSource);
         var canonicalPath = "/?" + qs.toString();
@@ -5502,14 +5991,22 @@ def _render_setup_html(
           var peerId = logPre.getAttribute("data-peer-id") || "";
           var view = logPre.getAttribute("data-view") || "logs";
           var lf = logPre.getAttribute("data-log-filter") || "all";
+          var ld = logPre.getAttribute("data-log-date") || "all";
+          var lt = logPre.getAttribute("data-log-time-scope") || "all";
+          var ltf = logPre.getAttribute("data-log-time-from") || "";
+          var ltt = logPre.getAttribute("data-log-time-to") || "";
+          var lw = logPre.getAttribute("data-log-word") || "";
           if (peerId) {{
-            var url = "/api/agent-diag?peer_id=" + encodeURIComponent(peerId) + "&view=" + encodeURIComponent(view) + "&log_filter=" + encodeURIComponent(lf);
+            var url = "/api/agent-diag?peer_id=" + encodeURIComponent(peerId) + "&view=" + encodeURIComponent(view) + "&log_filter=" + encodeURIComponent(lf) + "&log_date=" + encodeURIComponent(ld) + "&log_time_scope=" + encodeURIComponent(lt) + "&log_time_from=" + encodeURIComponent(ltf) + "&log_time_to=" + encodeURIComponent(ltt) + "&log_word=" + encodeURIComponent(lw);
             fetch(url, {{ credentials: "same-origin" }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
               if (data && data.text !== undefined) logPre.textContent = data.text;
+              try {{ logPre.scrollTop = logPre.scrollHeight; }} catch (e) {{}}
             }}).catch(function(err) {{
               logPre.textContent = "Failed to load agent logs: " + (err && err.message ? err.message : String(err));
             }});
           }}
+        }} else if (logPre) {{
+          try {{ logPre.scrollTop = logPre.scrollHeight; }} catch (e) {{}}
         }}
         function ensureUiViewField(form) {{
           if (!form || !form.querySelector) return;
@@ -5526,6 +6023,11 @@ def _render_setup_html(
           ensureHiddenField("ui_view", uiView);
           ensureHiddenField("diag_view", diagView);
           ensureHiddenField("log_filter", logFilter);
+          ensureHiddenField("log_date", logDate);
+          ensureHiddenField("log_time_scope", logTimeScope);
+          ensureHiddenField("log_time_from", logTimeFrom);
+          ensureHiddenField("log_time_to", logTimeTo);
+          ensureHiddenField("log_word", logWord);
           ensureHiddenField("source", logSource);
           ensureHiddenField("log_source", logSource);
         }}
@@ -5587,14 +6089,28 @@ def _render_setup_html(
           if (!form) return;
           var method = (form.getAttribute("method") || "").toLowerCase();
           if (method && method !== "post") return;
+          function ensureSubmitHidden(name, value) {{
+            var input = form.querySelector("input[type='hidden'][name='" + name + "']");
+            if (!input) {{
+              input = document.createElement("input");
+              input.type = "hidden";
+              input.name = name;
+              form.appendChild(input);
+            }}
+            input.value = String(value || "");
+          }}
           var panel = form.closest ? form.closest(".server-action-panel[data-server-panel]") : null;
           if (panel) {{
-            setOpenServerPanelKey(panel.getAttribute("data-server-panel") || "");
+            var panelKey = panel.getAttribute("data-server-panel") || "";
+            setOpenServerPanelKey(panelKey);
+            ensureSubmitHidden("server_panel", panelKey);
             return;
           }}
           var openPanel = document.querySelector(".server-action-panel.open[data-server-panel]");
           if (openPanel) {{
-            setOpenServerPanelKey(openPanel.getAttribute("data-server-panel") || "");
+            var openPanelKey = openPanel.getAttribute("data-server-panel") || "";
+            setOpenServerPanelKey(openPanelKey);
+            ensureSubmitHidden("server_panel", openPanelKey);
           }}
         }}, true);
         document.addEventListener("click", async function(ev) {{
@@ -5903,7 +6419,7 @@ def _render_setup_html(
         if (newContainer && curContainer) {{
           curContainer.innerHTML = newContainer.innerHTML;
           if (newBody) {{
-            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-source", "data-form-error"].forEach(function(attr) {{
+            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-date", "data-log-time-scope", "data-log-time-from", "data-log-time-to", "data-log-word", "data-log-source", "data-form-error"].forEach(function(attr) {{
               var v = newBody.getAttribute(attr);
               if (v !== null) document.body.setAttribute(attr, v);
             }});
@@ -5914,11 +6430,21 @@ def _render_setup_html(
             uiView = (newBody && newBody.getAttribute("data-ui-view")) || uiView || curQs.get("view") || "overview";
             diagView = (newBody && newBody.getAttribute("data-diag-view")) || diagView || curQs.get("diag_view") || "logs";
             logFilter = (newBody && newBody.getAttribute("data-log-filter")) || logFilter || curQs.get("log_filter") || "all";
+            logDate = (newBody && newBody.getAttribute("data-log-date")) || logDate || curQs.get("log_date") || "all";
+            logTimeScope = (newBody && newBody.getAttribute("data-log-time-scope")) || logTimeScope || curQs.get("log_time_scope") || "all";
+            logTimeFrom = (newBody && newBody.getAttribute("data-log-time-from")) || logTimeFrom || curQs.get("log_time_from") || "";
+            logTimeTo = (newBody && newBody.getAttribute("data-log-time-to")) || logTimeTo || curQs.get("log_time_to") || "";
+            logWord = (newBody && newBody.getAttribute("data-log-word")) || logWord || curQs.get("log_word") || "";
             logSource = (newBody && newBody.getAttribute("data-log-source")) || logSource || curQs.get("log_source") || "local";
             var nextQs = new URLSearchParams();
             nextQs.set("view", uiView);
             nextQs.set("diag_view", diagView);
             nextQs.set("log_filter", logFilter);
+            nextQs.set("log_date", logDate);
+            nextQs.set("log_time_scope", logTimeScope);
+            nextQs.set("log_time_from", logTimeFrom);
+            nextQs.set("log_time_to", logTimeTo);
+            nextQs.set("log_word", logWord);
             nextQs.set("log_source", logSource);
             nextQs.set("source", logSource);
             history.replaceState({{}}, "", path + "?" + nextQs.toString());
@@ -6190,26 +6716,38 @@ def _render_setup_html(
               var sourcePlatform = String(p.source_platform || "");
               var unknownUpdateAllowed = !!p.unknown_update_allowed;
               var updateBlockReason = p.update_block_reason || "Unknown platform; update blocked by default.";
-              var splitLeftStyle = sourcePlatform === "unknown" ? (pbs + "border-radius:8px 0 0 8px;") : pbs;
               var updateBtn = updateSupported
-                ? "<button type='button' class='agent-update-btn' data-peer-id='" + escapeHtml(p.instance_id || "") + "' data-peer-name='" + escapeHtml(p.instance_name || p.instance_id || "?") + "' style='" + splitLeftStyle + "'>Update</button>"
-                : "<button type='button' disabled title='" + escapeHtml(updateBlockReason) + "' style='" + splitLeftStyle + "opacity:.55;cursor:not-allowed;'>Update</button>";
-              var unknownToggle = "";
+                ? "<button type='button' class='agent-update-btn' data-peer-id='" + escapeHtml(p.instance_id || "") + "' data-peer-name='" + escapeHtml(p.instance_name || p.instance_id || "?") + "' style='" + pbs + "'>Update</button>"
+                : "<button type='button' class='agent-update-btn' disabled title='" + escapeHtml(updateBlockReason) + "' style='" + pbs + "opacity:.55;cursor:not-allowed;'>Update</button>";
+              var updateOptionsCell = "";
               if (sourcePlatform === "unknown") {{
                 var toggleValue = unknownUpdateAllowed ? "0" : "1";
                 var toggleLabel = unknownUpdateAllowed ? "Block unknown updates" : "Allow unknown updates";
-                unknownToggle = "<details style='display:inline-block;position:relative;'>"
-                  + "<summary title='Unknown platform options' style='" + pbs + "padding:6px 8px;border-left:none;border-radius:0 8px 8px 0;cursor:pointer;'>⚠</summary>"
-                  + "<div style='position:absolute;right:0;top:calc(100% + 4px);z-index:9;background:#0f1726;border:1px solid #36517a;border-radius:8px;padding:8px;min-width:190px;'>"
+                var hintExplain = "Remote updates are only offered when this master recognizes the agent as a supported Unix install. If the agent does not advertise a known platform, updates stay disabled until you allow them here.";
+                var ap = String(p.agent_platform || "").trim();
+                var af = String(p.agent_platform_family || "").trim();
+                var detParts = [];
+                if (ap) detParts.push("OS: " + ap);
+                if (af) detParts.push("family: " + af);
+                var det = detParts.length ? detParts.join(" · ") : "Not reported yet (wait for the next agent sync).";
+                var hintHtml = "<div class='peer-update-options-hint'>"
+                  + "<p class='muted' style='font-size:11px;line-height:1.4;margin:0 0 8px 0;'>" + escapeHtml(hintExplain) + "</p>"
+                  + "<p style='font-size:11px;line-height:1.4;margin:0 0 10px 0;color:#c8dbf8;'>" + escapeHtml(det) + "</p>"
+                  + "</div>";
+                updateOptionsCell = "<details class='peer-update-policy-menu'>"
+                  + "<summary class='peer-update-policy-summary' title='Unclear platform: open for details and to allow or block remote updates.' style='" + pbs + "'>update-options</summary>"
+                  + "<div class='peer-update-policy-panel'>" + hintHtml
                   + "<form method='post' action='/peer/update-unknown-policy' style='margin:0;'>"
                   + "<input type='hidden' name='peer_id' value='" + escapeHtml(p.instance_id || "") + "'>"
                   + "<input type='hidden' name='allow_unknown_update' value='" + toggleValue + "'>"
-                  + "<button type='submit' style='" + pbs + "width:100%;text-align:left;display:block;'>" + toggleLabel + "</button>"
+                  + "<button type='submit' class='peer-update-policy-submit' style='" + pbs + "width:100%;text-align:left;display:block;'>" + toggleLabel + "</button>"
                   + "</form></div></details>";
+              }} else {{
+                updateOptionsCell = "<span class='peer-action-placeholder peer-action-col-update-options' aria-hidden='true'></span>";
               }}
-              var openBtn = openUrl
+              var openCell = openUrl
                 ? "<a href='" + escapeHtml(openUrl) + "' target='_blank' rel='noopener noreferrer' style='" + pbs + "text-decoration:none;display:inline-block;text-align:center;'>Open</a>"
-                : "";
+                : "<span class='peer-action-placeholder peer-action-col-open' aria-hidden='true'></span>";
               var removeBtn = "<form method='post' action='/peer/remove' style='margin:0;'>"
                 + "<input type='hidden' name='peer_id' value='" + pid + "'>"
                 + "<button type='submit' onclick='return confirm(&#39;Remove this agent?&#39;)' "
@@ -6230,8 +6768,8 @@ def _render_setup_html(
                 + "<span class='muted' style='font-size:11px;'>Last seen: " + syncedTime + " (" + latTxt + ")</span>"
                 + "<span class='muted' style='font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>" + escapeHtml(pUrl || "no URL") + "</span>"
                 + "</div>"
-                + "<div style='display:flex;align-items:center;gap:6px;margin-top:8px;'>"
-                + "<form method='post' action='/peer/update-peer-url' style='margin:0;display:flex;gap:4px;flex:1;'>"
+                + "<div class='peer-actions-row'>"
+                + "<form method='post' action='/peer/update-peer-url' style='margin:0;display:flex;gap:4px;align-items:center;min-width:0;'>"
                 + "<input type='hidden' name='peer_id' value='" + pid + "'>"
                 + "<input name='peer_url' value='" + escapeHtml(pUrlDisplay) + "' placeholder='agent-nas or 192.168.31.10' style='flex:1;padding:4px 6px;font-size:11px;'>"
                 + "<button type='submit' style='" + pbs + "'>Set URL</button>"
@@ -6241,8 +6779,8 @@ def _render_setup_html(
                 + "<button type='submit' style='" + pbs + "'>Sync</button>"
                 + "</form>"
                 + updateBtn
-                + unknownToggle
-                + openBtn
+                + updateOptionsCell
+                + openCell
                 + removeBtn
                 + "</div></div>";
             }}).join("");
@@ -6333,7 +6871,7 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
             <img class="hero-logo" src="{html.escape(BRAND_LOGO_URL)}" alt="{html.escape(BRAND_NAME)} logo">
           </a>
         </div>
-        <div class="hero-tagline">All-in-one Synology monitoring: SMART, storage, backup, ping, port, DNS, secure peering, and instant Uptime Kuma alerts.</div>
+        <div class="hero-tagline">EasySystem - Monitoring</div>
         <div class="muted" style="text-align:center;margin-top:10px;">Recommendation: publish this UI behind Synology Reverse Proxy with HTTPS.</div>
       </div>
       <div class="card">
@@ -6345,6 +6883,20 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
       </div>
     </div>
   </div>
+  <script>
+  (function () {{
+    function focusAuthPrimary() {{
+      var el = document.getElementById("auth-password")
+        || document.getElementById("auth-totp-token")
+        || document.getElementById("auth-recovery-code")
+        || document.getElementById("auth-setup-password");
+      if (!el || !el.focus) return;
+      try {{ el.focus({{ preventScroll: true }}); }} catch (e) {{ el.focus(); }}
+    }}
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", focusAuthPrimary);
+    else focusAuthPrimary();
+  }})();
+  </script>
 </body>
 </html>"""
 
@@ -6405,7 +6957,7 @@ def _render_auth_setup_page(
         <form method="post" action="/auth/setup">
           <input type="hidden" name="username" value="admin" autocomplete="username">
           <label>Create admin password</label>
-          <input name="password" type="password" autocomplete="new-password" minlength="10" required>
+          <input id="auth-setup-password" name="password" type="password" autocomplete="new-password" minlength="10" required autofocus>
           <label>Confirm password</label>
           <input name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
           <div class="button-row">
@@ -6423,7 +6975,7 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
     <form method="post" action="/auth/login">
       <input type="hidden" name="username" value="admin" autocomplete="username">
       <label>Admin password</label>
-      <input name="password" type="password" autocomplete="current-password" required>
+      <input id="auth-password" name="password" type="password" autocomplete="current-password" required autofocus>
       <div class="button-row">
         <button type="submit">Continue</button>
       </div>
@@ -6436,7 +6988,7 @@ def _render_auth_verify_page(info: str = "", error: str = "", ssl_warning: str =
     body = """
     <form method="post" action="/auth/verify-2fa">
       <label>6-digit authenticator code</label>
-      <input name="token" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
+      <input id="auth-totp-token" name="token" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required autofocus>
       <div class="button-row">
         <button type="submit">Verify and Sign In</button>
         <a class="btn secondary" href="/auth/recovery">Use recovery code</a>
@@ -6450,7 +7002,7 @@ def _render_auth_recovery_page(info: str = "", error: str = "", ssl_warning: str
     body = """
     <form method="post" action="/auth/recovery">
       <label>One-time recovery code</label>
-      <input name="recovery_code" placeholder="ABCD-1234" required>
+      <input id="auth-recovery-code" name="recovery_code" placeholder="ABCD-1234" required autofocus>
       <div class="button-row">
         <button type="submit">Sign In with Recovery Code</button>
         <a class="btn secondary" href="/auth/verify-2fa">Back to TOTP</a>
@@ -6823,14 +7375,14 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 return "overview"
             return v if v in ("overview", "setup", "settings") else "overview"
 
-        def _ui_context_from_referer(self) -> Tuple[str, str, str, str]:
+        def _ui_context_from_referer(self) -> Tuple[str, str, str, str, str, str, str, str, str]:
             ref = self.headers.get("Referer", "")
             if not ref:
-                return ("overview", "logs", "all", "local")
+                return ("overview", "logs", "all", "local", "all", "all", "", "", "")
             try:
                 q = parse_qs(urlparse(ref).query)
             except Exception:
-                return ("overview", "logs", "all", "local")
+                return ("overview", "logs", "all", "local", "all", "all", "", "", "")
             ui_view = (q.get("ui_view", [q.get("view", ["overview"])[0]])[0] or "overview").strip().lower()
             if ui_view not in ("overview", "setup", "settings"):
                 ui_view = "overview"
@@ -6841,12 +7393,19 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             if log_filter not in ("all", "smart", "storage", "ping", "port", "dns", "backup"):
                 log_filter = "all"
             log_source = (q.get("source", [q.get("log_source", ["local"])[0]])[0] or "local").strip() or "local"
-            return (ui_view, diag_view, log_filter, log_source)
+            log_date = _normalize_log_date((q.get("log_date", ["all"])[0] or "all").strip().lower())
+            log_time_scope = _normalize_log_time_scope((q.get("log_time_scope", ["all"])[0] or "all").strip().lower())
+            log_time_from = _normalize_log_time_hhmm((q.get("log_time_from", [""])[0] or "").strip())
+            log_time_to = _normalize_log_time_hhmm((q.get("log_time_to", [""])[0] or "").strip())
+            server_panel = (q.get("server_panel", [""])[0] or "").strip().lower()
+            if server_panel not in ("name", "ip", "time", "package", "login", "login-time"):
+                server_panel = ""
+            return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel)
 
-        def _resolve_ui_context(self, form: Optional[Dict[str, List[str]]] = None) -> Tuple[str, str, str, str]:
-            ui_view, diag_view, log_filter, log_source = self._ui_context_from_referer()
+        def _resolve_ui_context(self, form: Optional[Dict[str, List[str]]] = None) -> Tuple[str, str, str, str, str, str, str, str, str]:
+            ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._ui_context_from_referer()
             if not isinstance(form, dict):
-                return (ui_view, diag_view, log_filter, log_source)
+                return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel)
             form_view = (form.get("ui_view", [form.get("view", [ui_view])[0]])[0] or ui_view).strip().lower()
             if form_view in ("overview", "setup", "settings"):
                 ui_view = form_view
@@ -6859,7 +7418,20 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             form_source = (form.get("source", [form.get("log_source", [log_source])[0]])[0] or log_source).strip()
             if form_source:
                 log_source = form_source
-            return (ui_view, diag_view, log_filter, log_source)
+            form_log_date = (form.get("log_date", [log_date])[0] or log_date).strip().lower()
+            if form_log_date:
+                log_date = _normalize_log_date(form_log_date)
+            form_log_time = (form.get("log_time_scope", [log_time_scope])[0] or log_time_scope).strip().lower()
+            if form_log_time:
+                log_time_scope = _normalize_log_time_scope(form_log_time)
+            form_log_time_from = (form.get("log_time_from", [log_time_from])[0] or log_time_from).strip()
+            log_time_from = _normalize_log_time_hhmm(form_log_time_from)
+            form_log_time_to = (form.get("log_time_to", [log_time_to])[0] or log_time_to).strip()
+            log_time_to = _normalize_log_time_hhmm(form_log_time_to)
+            form_panel = (form.get("server_panel", [server_panel])[0] or server_panel).strip().lower()
+            if form_panel in ("name", "ip", "time", "package", "login", "login-time"):
+                server_panel = form_panel
+            return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel)
 
         def _is_authenticated(self) -> bool:
             auth = _load_auth_state()
@@ -7067,9 +7639,14 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 qs = parse_qs(parsed.query)
                 view = str(qs.get("view", ["logs"])[0] or "logs").strip().lower()
                 lf = str(qs.get("log_filter", ["all"])[0] or "all").strip().lower()
+                ld = _normalize_log_date(str(qs.get("log_date", ["all"])[0] or "all").strip().lower())
+                lt = _normalize_log_time_scope(str(qs.get("log_time_scope", ["all"])[0] or "all").strip().lower())
+                ltf = _normalize_log_time_hhmm(str(qs.get("log_time_from", [""])[0] or "").strip())
+                ltt = _normalize_log_time_hhmm(str(qs.get("log_time_to", [""])[0] or "").strip())
+                lw = str(qs.get("log_word", [""])[0] or "").strip()[:80]
                 cfg = load_config()
                 history = _load_history()
-                text = _build_diag_text(cfg, history, diag_view=view, log_filter=lf)
+                text = _build_diag_text(cfg, history, diag_view=view, log_filter=lf, log_date=ld, log_time_scope=lt, log_time_from=ltf, log_time_to=ltt, log_word=lw)
                 self._reply_peer_json({"text": text}, 200)
                 return
             if parsed.path == "/api/peer/update-status":
@@ -7212,6 +7789,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 peer_id = (qs.get("peer_id", [""])[0] or "").strip()
                 view = (qs.get("view", ["logs"])[0] or "logs").strip().lower()
                 log_filter = (qs.get("log_filter", ["all"])[0] or "all").strip().lower()
+                log_date = _normalize_log_date((qs.get("log_date", ["all"])[0] or "all").strip().lower())
+                log_time_scope = _normalize_log_time_scope((qs.get("log_time_scope", ["all"])[0] or "all").strip().lower())
+                log_time_from = _normalize_log_time_hhmm((qs.get("log_time_from", [""])[0] or "").strip())
+                log_time_to = _normalize_log_time_hhmm((qs.get("log_time_to", [""])[0] or "").strip())
+                log_word = (qs.get("log_word", [""])[0] or "").strip()[:80]
                 if not peer_id:
                     self._reply_json({"error": "Missing peer_id"}, 400)
                     return
@@ -7221,6 +7803,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     peer_id,
                     view,
                     log_filter,
+                    log_date=log_date,
+                    log_time_scope=log_time_scope,
+                    log_time_from=log_time_from,
+                    log_time_to=log_time_to,
+                    log_word=log_word,
                     resolve_timeout=5,
                     fetch_timeout=10,
                 )
@@ -7243,6 +7830,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             ui_view = (qs.get("view", ["overview"])[0] or "overview").strip().lower()
             highlight = (qs.get("highlight", [""])[0] or "").strip().lower()
             log_source = (qs.get("log_source", ["local"])[0] or "local").strip()
+            log_date = _normalize_log_date((qs.get("log_date", ["all"])[0] or "all").strip().lower())
+            log_time_scope = _normalize_log_time_scope((qs.get("log_time_scope", ["all"])[0] or "all").strip().lower())
+            log_time_from = _normalize_log_time_hhmm((qs.get("log_time_from", [""])[0] or "").strip())
+            log_time_to = _normalize_log_time_hhmm((qs.get("log_time_to", [""])[0] or "").strip())
+            log_word = (qs.get("log_word", [""])[0] or "").strip()[:80]
             diagnose = (qs.get("diagnose", ["0"])[0] or "0").strip().lower() in ("1", "true", "yes")
             if highlight not in ("smart", "storage", "ping", "port", "dns", "backup"):
                 highlight = ""
@@ -7250,6 +7842,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             self._reply_html(
                 _render_setup_html(
                     log_filter=log_filter,
+                    log_date=log_date,
+                    log_time_scope=log_time_scope,
+                    log_time_from=log_time_from,
+                    log_time_to=log_time_to,
+                    log_word=log_word,
                     diag_view=diag_view,
                     ui_view=ui_view,
                     highlight_channel=highlight,
@@ -7455,6 +8052,16 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 self._reply_peer_json({
                     "error": "Synology packages are updated via Package Center. Download the SPK from GitHub releases and install manually."
                 }, 400)
+                return
+            if self.path == "/api/peer/clear-logs":
+                if not self._require_peer_mtls(allow_token_only=True):
+                    return
+                if not self._verify_peer_token():
+                    self._reply_json({"error": "unauthorized"}, 401)
+                    return
+                clear_ui_log()
+                append_ui_log("peer-clear-logs | cleared by master request")
+                self._reply_peer_json({"status": "ok", "message": "Remote logs cleared"}, 200)
                 return
             if self.path == "/peer/test-connection":
                 if not self._is_authenticated():
@@ -7878,7 +8485,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             )
             auth = _load_auth_state()
             ssl_warning = self._ssl_warning_text()
-            ui_view, diag_view, log_filter, log_source = self._resolve_ui_context()
+            ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context()
             if self.path in auth_routes:
                 content_type = (self.headers.get("Content-Type", "") or "").lower()
                 import_file_json = ""
@@ -8230,6 +8837,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 "/edit-monitor",
                 "/delete-monitor",
                 "/clear-logs",
+                "/clear-logs-remote",
                 "/clear-task-status",
                 "/clear-cache",
                 "/clear-history",
@@ -8285,6 +8893,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     instance_name = (form.get("instance_name", [""])[0] or "").strip()
                     cfg = load_config()
                     cfg["instance_name"] = instance_name
@@ -8292,7 +8901,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     append_ui_log(f"settings | instance name saved: {instance_name or '-'}")
                     self._reply_html(_render_setup_html(
                         security_message="Instance name saved.",
-                        ui_view="settings",
+                        ui_view=ui_view,
+                        diag_view=diag_view,
+                        log_filter=log_filter,
+                        log_source=log_source,
+                        server_panel=server_panel,
                         ssl_warning=ssl_warning,
                     ))
                     return
@@ -8300,7 +8913,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     vals = form.get("update_from_main", []) or []
                     enabled = "1" in vals
                     cfg = load_config()
@@ -8317,6 +8930,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         diag_view=diag_view,
                         log_filter=log_filter,
                         log_source=log_source,
+                        server_panel=server_panel,
                         ssl_warning=ssl_warning,
                     ))
                     return
@@ -8324,7 +8938,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     cfg = load_config()
                     _run_update_check(cfg)
                     check = _load_update_check_result()
@@ -8339,6 +8953,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             diag_view=diag_view,
                             log_filter=log_filter,
                             log_source=log_source,
+                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         ))
                         return
@@ -8349,6 +8964,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         diag_view=diag_view,
                         log_filter=log_filter,
                         log_source=log_source,
+                        server_panel=server_panel,
                         ssl_warning=ssl_warning,
                     ))
                     return
@@ -8413,7 +9029,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
                     output = _ui_run_check_now(target_monitor=monitor_name)
                     self._reply_html(
@@ -8425,6 +9041,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             diag_view=diag_view,
                             log_filter=log_filter,
                             log_source=log_source,
+                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
@@ -8447,7 +9064,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
                     output = _ui_test_push(target_monitor=monitor_name)
                     self._reply_html(
@@ -8459,6 +9076,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             diag_view=diag_view,
                             log_filter=log_filter,
                             log_source=log_source,
+                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
@@ -8523,7 +9141,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
                     output = _ui_delete_monitor(monitor_name)
                     self._reply_html(
@@ -8533,6 +9151,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             diag_view=diag_view,
                             log_filter=log_filter,
                             log_source=log_source,
+                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
@@ -8547,6 +9166,30 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             diag_view=diag_view,
                             log_filter=log_filter,
                             log_source=log_source,
+                            ssl_warning=ssl_warning,
+                        )
+                    )
+                    return
+                if self.path == "/clear-logs-remote":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    target_peer = (form.get("source", [log_source])[0] or log_source).strip()
+                    if not target_peer or target_peer == "local":
+                        msg = "Select a remote source first."
+                    else:
+                        msg = _clear_agent_logs(load_config(), target_peer)
+                        append_ui_log(f"remote-clear-logs | source={target_peer} | {msg}")
+                    self._reply_html(
+                        _render_setup_html(
+                            message=msg,
+                            ui_view="overview",
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_source=log_source,
+                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
