@@ -6669,6 +6669,31 @@ def _render_setup_html(
         }}
         var postForms = document.querySelectorAll("form[method='post'], form[method='POST']");
         postForms.forEach(function(form) {{ ensureUiViewField(form); }});
+        var SERVER_PANEL_STATE_KEY = "unix_monitor_open_server_panel";
+        function setOpenServerPanelKey(key) {{
+          try {{
+            if (key) localStorage.setItem(SERVER_PANEL_STATE_KEY, key);
+            else localStorage.removeItem(SERVER_PANEL_STATE_KEY);
+          }} catch (e) {{}}
+        }}
+        function getOpenServerPanelKey() {{
+          try {{
+            return localStorage.getItem(SERVER_PANEL_STATE_KEY) || "";
+          }} catch (e) {{
+            return "";
+          }}
+        }}
+        function restoreOpenServerPanel() {{
+          var key = getOpenServerPanelKey();
+          if (!key) return;
+          var panel = document.querySelector(".server-action-panel[data-server-panel='" + key + "']");
+          if (!panel) return;
+          document.querySelectorAll(".server-action-panel.open").forEach(function(p) {{
+            if (p !== panel) p.classList.remove("open");
+          }});
+          panel.classList.add("open");
+        }}
+        restoreOpenServerPanel();
         // Ensure source chips (Local, agent names) navigate reliably when clicked (handles subpath + edge cases)
         document.addEventListener("click", function(ev) {{
           var a = ev.target && ev.target.closest ? ev.target.closest("a.chip[href*='source=']") : null;
@@ -6685,12 +6710,43 @@ def _render_setup_html(
           var key = b.getAttribute("data-server-action");
           var panel = document.querySelector(".server-action-panel[data-server-panel='" + key + "']");
           if (!panel) return;
-          document.querySelectorAll(".server-action-panel.open").forEach(function(p) {{
-            if (p !== panel) p.classList.remove("open");
-          }});
-          panel.classList.toggle("open");
-          if (panel.classList.contains("open")) {{
+          var alreadyOpen = panel.classList.contains("open");
+          document.querySelectorAll(".server-action-panel.open").forEach(function(p) {{ p.classList.remove("open"); }});
+          if (alreadyOpen) {{
+            setOpenServerPanelKey("");
+          }} else {{
+            panel.classList.add("open");
+            setOpenServerPanelKey(key);
             panel.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
+          }}
+        }});
+        document.addEventListener("submit", function(ev) {{
+          var form = ev && ev.target && ev.target.closest ? ev.target.closest("form") : null;
+          if (!form) return;
+          var method = (form.getAttribute("method") || "").toLowerCase();
+          if (method && method !== "post") return;
+          function ensureSubmitHidden(name, value) {{
+            var input = form.querySelector("input[type='hidden'][name='" + name + "']");
+            if (!input) {{
+              input = document.createElement("input");
+              input.type = "hidden";
+              input.name = name;
+              form.appendChild(input);
+            }}
+            input.value = String(value || "");
+          }}
+          var panel = form.closest ? form.closest(".server-action-panel[data-server-panel]") : null;
+          if (panel) {{
+            var panelKey = panel.getAttribute("data-server-panel") || "";
+            setOpenServerPanelKey(panelKey);
+            ensureSubmitHidden("server_panel", panelKey);
+            return;
+          }}
+          var openPanel = document.querySelector(".server-action-panel.open[data-server-panel]");
+          if (openPanel) {{
+            var openPanelKey = openPanel.getAttribute("data-server-panel") || "";
+            setOpenServerPanelKey(openPanelKey);
+            ensureSubmitHidden("server_panel", openPanelKey);
           }}
         }}, true);
         // Intercept POST forms: fetch and update page without reload (except auth, danger, exports)
