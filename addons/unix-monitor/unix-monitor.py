@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.5.4-0004"
+VERSION = "1.5.4-0005"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6034,15 +6034,19 @@ def _render_setup_html(
         f"<select id='diag-view-sel' name='diag_view'>{_dvo}</select></div>"
         "<div><label for='log-filter-sel'>Event / channel</label>"
         f"<select id='log-filter-sel' name='log_filter'>{_evo}</select></div>"
-        "<div><label for='log-date-inp'>Date (calendar)</label>"
-        f"<input id='log-date-inp' type='date' name='log_date' value='{html.escape(_date_value)}'></div>"
         "<div><label for='log-time-sel'>Time window</label>"
         f"<select id='log-time-sel' name='log_time_scope'>{_tto}</select></div>"
+        "</div>"
+        "<details data-advanced-filtering='1' style='margin-top:10px;'>"
+        "<summary data-advanced-summary='1' style='cursor:pointer;'>Advanced filtering</summary>"
+        "<div class='log-diag-filter-grid' style='margin-top:8px;'>"
+        "<div><label for='log-date-inp'>Date (calendar)</label>"
+        f"<input id='log-date-inp' type='date' name='log_date' value='{html.escape(_date_value)}'></div>"
         "<div><label for='log-time-from'>Time from</label>"
         f"<input id='log-time-from' type='time' name='log_time_from' value='{html.escape(log_time_from_norm)}'></div>"
         "<div><label for='log-time-to'>Time to</label>"
         f"<input id='log-time-to' type='time' name='log_time_to' value='{html.escape(log_time_to_norm)}'></div>"
-        "</div>"
+        "</div></details>"
         "<div class='muted' data-log-filter-note='1' style='margin-top:6px;'>Filters apply to Logs view only.</div>"
         "<div class='button-row' style='margin-top:8px;'>"
         "<button type='submit'>Apply filter</button>"
@@ -6856,39 +6860,73 @@ def _render_setup_html(
           var diagSelect = logDiagForm.querySelector("#diag-view-sel");
           if (!diagSelect) return;
           var selectedView = String(diagSelect.value || "logs").toLowerCase();
-          var isLogsView = selectedView === "logs";
+          var viewCapabilities = {{
+            logs: {{ event: true, time: true, date: true, exact: true, word: true }},
+            task: {{ event: false, time: false, date: false, exact: false, word: false }},
+            cache: {{ event: false, time: false, date: false, exact: false, word: false }},
+            config: {{ event: false, time: false, date: false, exact: false, word: false }},
+            history: {{ event: false, time: false, date: false, exact: false, word: false }},
+            paths: {{ event: false, time: false, date: false, exact: false, word: false }},
+            system: {{ event: false, time: false, date: false, exact: false, word: false }}
+          }};
+          var caps = viewCapabilities[selectedView] || {{ event: false, time: false, date: false, exact: false, word: false }};
           var eventSelect = logDiagForm.querySelector("#log-filter-sel");
           var timeSelect = logDiagForm.querySelector("#log-time-sel");
           var dateInput = logDiagForm.querySelector("#log-date-inp");
           var timeFromInput = logDiagForm.querySelector("#log-time-from");
           var timeToInput = logDiagForm.querySelector("#log-time-to");
+          var wordInput = logDiagForm.querySelector("#log-word-inp");
+          var advancedDetails = logDiagForm.querySelector("details[data-advanced-filtering='1']");
+          var advancedSummary = logDiagForm.querySelector("summary[data-advanced-summary='1']");
           var filterNote = logDiagForm.querySelector("[data-log-filter-note='1']");
-          if (eventSelect && !eventSelect.dataset.logsOptionsHtml) eventSelect.dataset.logsOptionsHtml = eventSelect.innerHTML;
-          if (timeSelect && !timeSelect.dataset.logsOptionsHtml) timeSelect.dataset.logsOptionsHtml = timeSelect.innerHTML;
-          if (eventSelect) {{
-            if (isLogsView) {{
-              if (eventSelect.dataset.logsOptionsHtml) eventSelect.innerHTML = eventSelect.dataset.logsOptionsHtml;
+          var viewLabel = selectedView.charAt(0).toUpperCase() + selectedView.slice(1);
+          var hasWordControl = !!wordInput;
+          var labels = {{
+            event: "Event / channel",
+            time: "Time window",
+            date: "Date (calendar)",
+            exact: "Time from/to",
+            word: "Contains word"
+          }};
+
+          function setSelectAvailability(sel, enabled) {{
+            if (!sel) return;
+            if (!sel.dataset.logsOptionsHtml) sel.dataset.logsOptionsHtml = sel.innerHTML;
+            if (enabled) {{
+              if (sel.dataset.logsOptionsHtml) sel.innerHTML = sel.dataset.logsOptionsHtml;
             }} else {{
-              eventSelect.innerHTML = "<option value='all' selected>Not available for selected view</option>";
+              sel.innerHTML = "<option value='all' selected>Not available for " + viewLabel + "</option>";
             }}
-            eventSelect.disabled = !isLogsView;
+            sel.disabled = !enabled;
           }}
-          if (timeSelect) {{
-            if (isLogsView) {{
-              if (timeSelect.dataset.logsOptionsHtml) timeSelect.innerHTML = timeSelect.dataset.logsOptionsHtml;
-            }} else {{
-              timeSelect.innerHTML = "<option value='all' selected>Not available for selected view</option>";
-            }}
-            timeSelect.disabled = !isLogsView;
+
+          setSelectAvailability(eventSelect, !!caps.event);
+          setSelectAvailability(timeSelect, !!caps.time);
+          if (dateInput) dateInput.disabled = !caps.date;
+          if (timeFromInput) timeFromInput.disabled = !caps.exact;
+          if (timeToInput) timeToInput.disabled = !caps.exact;
+          if (wordInput) wordInput.disabled = !caps.word;
+
+          var hasAdvancedAvailable = !!(caps.date || caps.exact || (hasWordControl && caps.word));
+          if (advancedDetails && !hasAdvancedAvailable) advancedDetails.removeAttribute("open");
+          if (advancedSummary) {{
+            advancedSummary.textContent = hasAdvancedAvailable
+              ? "Advanced filtering"
+              : "Advanced filtering (not available for " + viewLabel + ")";
           }}
-          [dateInput, timeFromInput, timeToInput].forEach(function (el) {{
-            if (!el) return;
-            el.disabled = !isLogsView;
-          }});
+
           if (filterNote) {{
-            filterNote.textContent = isLogsView
-              ? "All filters are available for Logs view."
-              : "Selected diagnostic view does not support event/time filters.";
+            var controls = ["event", "time", "date", "exact"];
+            if (hasWordControl) controls.push("word");
+            var supported = controls.filter(function (k) {{ return !!caps[k]; }}).map(function (k) {{ return labels[k]; }});
+            var unsupported = controls.filter(function (k) {{ return !caps[k]; }}).map(function (k) {{ return labels[k]; }});
+            if (unsupported.length === 0) {{
+              filterNote.textContent = "All filters are available for " + viewLabel + " view.";
+            }} else if (supported.length === 0) {{
+              filterNote.textContent = viewLabel + " view does not support filters. Switch to Logs view to use filtering.";
+            }} else {{
+              filterNote.textContent = "Available for " + viewLabel + ": " + supported.join(", ") + ". Unavailable: " + unsupported.join(", ") + ".";
+            }}
           }}
         }}
         if (logDiagForm) {{
