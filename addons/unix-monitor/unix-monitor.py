@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.0.0-0064"
+VERSION = "1.5.0-0001"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1870,6 +1870,99 @@ def _peer_create_remote_monitor(cfg: Dict[str, Any], peer_id: str,
         return f"Error: {type(e).__name__}: {e}"
 
 
+def _trigger_agent_monitor_action(
+    cfg: Dict[str, Any],
+    peer_id: str,
+    action: str,
+    monitor_name: str = "",
+    timeout: int = 20,
+) -> Tuple[bool, str, str]:
+    token = str(cfg.get("peering_token", "") or "").strip()
+    if not token:
+        return False, "No peering token configured.", ""
+    peers = cfg.get("peers", [])
+    target = None
+    for p in (peers if isinstance(peers, list) else []):
+        if str(p.get("instance_id", "")) == peer_id:
+            target = p
+            break
+    if not target:
+        return False, f"Agent '{peer_id}' not found in peers.", ""
+    p_name = str(target.get("instance_name", "") or peer_id[:8])
+    p_url_raw = str(target.get("url", "") or "").strip().rstrip("/")
+    if not p_url_raw:
+        return False, f"No URL configured for agent '{p_name}'.", ""
+    p_url = _resolve_peer_url_from_stored(p_url_raw, token, timeout=8)
+    if not p_url:
+        return False, f"Cannot reach agent '{p_name}' at {p_url_raw}.", ""
+    payload = {
+        "action": action,
+        "monitor_name": monitor_name,
+        "triggered_by": "master",
+    }
+    try:
+        status, body = _peer_http_request(p_url, token, "POST", "/api/peer/monitor-action", payload=payload, timeout=timeout)
+        if status < 300:
+            try:
+                data = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                data = {}
+            msg = str(data.get("message", f"Action '{action}' executed on agent")).strip()
+            out = str(data.get("output", "") or "").strip()
+            return True, f"{p_name}: {msg}", out
+        try:
+            err = json.loads(body)
+            err_msg = str(err.get("error", body)).strip()
+        except (json.JSONDecodeError, ValueError):
+            err_msg = body.strip()[:500]
+        return False, f"{p_name}: HTTP {status} - {err_msg}", ""
+    except Exception as e:
+        return False, f"{p_name}: {type(e).__name__}: {e}", ""
+
+
+def _agent_request_master_monitor_action(
+    cfg: Dict[str, Any],
+    action: str,
+    monitor_name: str = "",
+    timeout: int = 25,
+) -> Tuple[bool, str, str]:
+    role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+    if role != "agent":
+        return False, "This action is only supported on agent role.", ""
+    master_host, master_port = _parse_peer_host_port(
+        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+    )
+    token = str(cfg.get("peering_token", "") or "").strip()
+    if not master_host or not token:
+        return False, "Missing master host or peering token.", ""
+    master_url = _resolve_peer_url(master_host, master_port, token, timeout=10)
+    if not master_url:
+        return False, f"Cannot reach master at {master_host}:{master_port}.", ""
+    payload = {
+        "instance_id": _get_instance_id(cfg),
+        "action": action,
+        "monitor_name": monitor_name,
+    }
+    try:
+        status, body = _peer_http_request(master_url, token, "POST", "/api/peer/trigger-monitor-action", payload=payload, timeout=timeout)
+        if status < 300:
+            try:
+                data = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                data = {}
+            msg = str(data.get("message", "Action executed via master")).strip()
+            out = str(data.get("output", "") or "").strip()
+            return True, msg, out
+        try:
+            err = json.loads(body)
+            err_msg = str(err.get("error", body)).strip()
+        except (json.JSONDecodeError, ValueError):
+            err_msg = body.strip()[:500]
+        return False, f"HTTP {status} - {err_msg}", ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", ""
+
+
 def _infer_peer_source_platform(cfg: Dict[str, Any], peer_id: str) -> str:
     for p in (cfg.get("peers", []) or []):
         if str(p.get("instance_id", "")) != peer_id:
@@ -2094,7 +2187,7 @@ def _get_update_check_path() -> Path:
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
-    """Parse '1.0.0-0055' or 'v1.0.0-0055' to (1, 0, 0, 55) for comparison."""
+    """Parse '1.5.0-0001' or 'v1.0.0-0055' to (1, 0, 0, 55) for comparison."""
     s = str(version or "").strip().lstrip("vV")
     if not s:
         return (0, 0, 0, 0)
@@ -2262,7 +2355,7 @@ def _ensure_fresh_update_check(
 
 
 def _parse_info_version_text(content: str) -> str:
-    m = re.search(r'^version="1.0.0-0064"]+)"', str(content or ""), flags=re.MULTILINE)
+    m = re.search(r'^version="1.5.0-0001"]+)"', str(content or ""), flags=re.MULTILINE)
     return str(m.group(1)).strip() if m else ""
 
 
@@ -7174,7 +7267,8 @@ def _render_setup_html(
         btn.disabled = true;
         btn.textContent = orig + "…";
         try {{
-          var body = "monitor_name=" + encodeURIComponent(name);
+          var curSource = (document.body && document.body.getAttribute("data-log-source")) || "local";
+          var body = "monitor_name=" + encodeURIComponent(name) + "&source=" + encodeURIComponent(curSource) + "&log_source=" + encodeURIComponent(curSource);
           var r = await fetch(url, {{
             method: "POST",
             headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
@@ -7859,7 +7953,7 @@ def _find_monitor_by_name(monitors: List[Dict[str, Any]], name: str) -> Optional
     return None
 
 
-def _ui_run_check_now(target_monitor: Optional[str] = None) -> str:
+def _ui_run_check_now(target_monitor: Optional[str] = None, initiated_by: str = "local") -> str:
     cfg = load_config()
     monitors = cfg.get("monitors", [])
     dbg = bool(cfg.get("debug", False))
@@ -7873,6 +7967,8 @@ def _ui_run_check_now(target_monitor: Optional[str] = None) -> str:
             return f"Monitor not found: {target_monitor}"
         monitors = [target]
     lines: List[str] = []
+    triggered_by_master = str(initiated_by or "").strip().lower() == "master"
+    trigger_suffix = " (triggered by master)" if triggered_by_master else ""
     for m in monitors:
         name = m.get("name", "?")
         mode = str(m.get("check_mode", "smart")).lower()
@@ -7883,10 +7979,12 @@ def _ui_run_check_now(target_monitor: Optional[str] = None) -> str:
         if not url:
             line = f"x {name}: no Kuma URL"
             lines.append(line)
-            _set_monitor_state(str(name), "Monitor check failed", line, level="err")
-            append_ui_log(f"run-check | {name} | no Kuma URL")
+            _set_monitor_state(str(name), "Monitor check failed" + trigger_suffix, line, level="err")
+            append_ui_log(f"run-check | {name} | no Kuma URL | triggered_by={'master' if triggered_by_master else 'local'}")
             continue
         status, msg, lat = check_host_with_monitor(mode, devices, monitor=m, debug=dbg)
+        if triggered_by_master:
+            msg = f"{msg}\nTriggered by master."
         ok = push_to_kuma(url, status, msg, lat, debug=dbg)
         recorded_status = status if ok else "warning"
         _record_history(str(name), mode, recorded_status, lat)
@@ -7894,12 +7992,12 @@ def _ui_run_check_now(target_monitor: Optional[str] = None) -> str:
         lines.append(line)
         _set_monitor_state(
             str(name),
-            "Monitor check completed" if ok else "Monitor check completed with errors",
+            ("Monitor check completed" if ok else "Monitor check completed with errors") + trigger_suffix,
             line,
             level="ok" if ok else "err",
         )
         append_ui_log(
-            f"run-check | {name} | mode={mode} | status={status} | ping_ms={lat:.2f} | push={'OK' if ok else 'FAILED'}"
+            f"run-check | {name} | mode={mode} | status={status} | ping_ms={lat:.2f} | push={'OK' if ok else 'FAILED'} | triggered_by={'master' if triggered_by_master else 'local'}"
         )
         compact_msg = " ".join(msg.replace("\n", " | ").split())
         append_ui_log(f"run-check-detail | {name} | {compact_msg}")
@@ -7924,7 +8022,7 @@ def _ui_run_check_now(target_monitor: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
-def _ui_test_push(target_monitor: Optional[str] = None) -> str:
+def _ui_test_push(target_monitor: Optional[str] = None, initiated_by: str = "local") -> str:
     cfg = load_config()
     monitors = cfg.get("monitors", [])
     if not monitors:
@@ -7938,22 +8036,26 @@ def _ui_test_push(target_monitor: Optional[str] = None) -> str:
         monitors = [target]
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     lines: List[str] = []
+    triggered_by_master = str(initiated_by or "").strip().lower() == "master"
+    trigger_suffix = " (triggered by master)" if triggered_by_master else ""
     for m in monitors:
         source_platform = _monitor_source_platform(m)
         flavor = "synology-monitor" if source_platform == "synology" else "unix-monitor"
         msg = f"Test push @ {now} - {BRAND_NAME} {flavor} connectivity check"
+        if triggered_by_master:
+            msg += " (triggered by master)"
         ok = push_to_kuma(m.get("kuma_url", ""), "up", msg, 0, debug=bool(cfg.get("debug", False)))
         line = f"{'ok' if ok else 'x'} {m.get('name', '?')}: push {'OK' if ok else 'FAILED'}"
         lines.append(line)
         _set_monitor_state(
             str(m.get("name", "?")),
-            "Monitor test push completed" if ok else "Monitor test push failed",
+            ("Monitor test push completed" if ok else "Monitor test push failed") + trigger_suffix,
             line,
             level="ok" if ok else "err",
         )
         parsed = urlparse(m.get("kuma_url", ""))
         append_ui_log(
-            f"test-push | {m.get('name', '?')} | host={parsed.hostname or '?'} | push={'OK' if ok else 'FAILED'}"
+            f"test-push | {m.get('name', '?')} | host={parsed.hostname or '?'} | push={'OK' if ok else 'FAILED'} | triggered_by={'master' if triggered_by_master else 'local'}"
         )
     return "\n".join(lines)
 
@@ -8946,6 +9048,72 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 clear_ui_log()
                 append_ui_log("peer-clear-logs | cleared by master request")
                 self._reply_peer_json({"status": "ok", "message": "Remote logs cleared"}, 200)
+                return
+            if self.path == "/api/peer/monitor-action":
+                if not self._require_peer_mtls(allow_token_only=True):
+                    return
+                if not self._verify_peer_token():
+                    self._reply_json({"error": "unauthorized"}, 401)
+                    return
+                body, ok_body = self._read_peer_body()
+                if not ok_body:
+                    self._reply_json({"error": "invalid encrypted payload"}, 400)
+                    return
+                try:
+                    data = json.loads(body) if body else {}
+                except (json.JSONDecodeError, ValueError):
+                    self._reply_json({"error": "invalid json"}, 400)
+                    return
+                action = str(data.get("action", "") or "").strip().lower()
+                monitor_name = str(data.get("monitor_name", "") or "").strip()
+                triggered_by = str(data.get("triggered_by", "master") or "master").strip().lower()
+                if action not in ("run-check", "test-push"):
+                    self._reply_peer_json({"error": "unsupported action"}, 400)
+                    return
+                append_ui_log(
+                    f"peer-monitor-action | action={action} | monitor={monitor_name or '(all)'} | triggered_by={triggered_by}"
+                )
+                if action == "run-check":
+                    output = _ui_run_check_now(target_monitor=monitor_name or None, initiated_by="master")
+                    message = "Run check executed on agent (triggered by master)."
+                else:
+                    output = _ui_test_push(target_monitor=monitor_name or None, initiated_by="master")
+                    message = "Test push executed on agent (triggered by master)."
+                self._reply_peer_json({"status": "ok", "message": message, "output": output}, 200)
+                return
+            if self.path == "/api/peer/trigger-monitor-action":
+                if not self._require_peer_mtls(allow_token_only=True):
+                    return
+                if not self._verify_peer_token():
+                    self._reply_json({"error": "unauthorized"}, 401)
+                    return
+                body, ok_body = self._read_peer_body()
+                if not ok_body:
+                    self._reply_json({"error": "invalid encrypted payload"}, 400)
+                    return
+                try:
+                    data = json.loads(body) if body else {}
+                except (json.JSONDecodeError, ValueError):
+                    self._reply_json({"error": "invalid json"}, 400)
+                    return
+                cfg = load_config()
+                if str(cfg.get("peer_role", "standalone") or "standalone").lower() != "master":
+                    self._reply_peer_json({"error": "master role required"}, 403)
+                    return
+                peer_id = str(data.get("instance_id", "") or "").strip()
+                action = str(data.get("action", "") or "").strip().lower()
+                monitor_name = str(data.get("monitor_name", "") or "").strip()
+                if not peer_id:
+                    self._reply_peer_json({"error": "missing instance_id"}, 400)
+                    return
+                if action not in ("run-check", "test-push"):
+                    self._reply_peer_json({"error": "unsupported action"}, 400)
+                    return
+                ok_action, summary, output = _trigger_agent_monitor_action(cfg, peer_id, action, monitor_name=monitor_name)
+                if ok_action:
+                    self._reply_peer_json({"status": "ok", "message": summary, "output": output}, 200)
+                else:
+                    self._reply_peer_json({"error": summary}, 502)
                 return
             if self.path == "/peer/test-connection":
                 if not self._is_authenticated():
@@ -10071,10 +10239,18 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         ))
                     return
                 if self.path == "/run-check":
-                    output = _ui_run_check_now()
+                    cfg = load_config()
+                    role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+                    if role == "agent":
+                        ok_action, summary, remote_output = _agent_request_master_monitor_action(cfg, "run-check")
+                        output = remote_output or summary
+                        message_text = "Run check completed (triggered by master)" if ok_action else "Run check failed (master trigger)"
+                    else:
+                        output = _ui_run_check_now()
+                        message_text = "Run check completed"
                     self._reply_html(
                         _render_setup_html(
-                            message="Run check completed",
+                            message=message_text,
                             action_output=output,
                             ui_view=ui_view,
                             diag_view=diag_view,
@@ -10094,11 +10270,23 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     form = parse_qs(body, keep_blank_values=True)
                     ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
-                    output = _ui_run_check_now(target_monitor=monitor_name)
+                    cfg = load_config()
+                    role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+                    if role == "master" and log_source != "local":
+                        ok_action, summary, remote_output = _trigger_agent_monitor_action(cfg, log_source, "run-check", monitor_name=monitor_name)
+                        output = remote_output or summary
+                        action_msg = "Monitor check completed (triggered by master)" if ok_action else "Monitor check failed (triggered by master)"
+                    elif role == "agent":
+                        ok_action, summary, remote_output = _agent_request_master_monitor_action(cfg, "run-check", monitor_name=monitor_name)
+                        output = remote_output or summary
+                        action_msg = "Monitor check completed (triggered by master)" if ok_action else "Monitor check failed (master trigger)"
+                    else:
+                        output = _ui_run_check_now(target_monitor=monitor_name)
+                        action_msg = "Monitor check completed"
                     self._reply_html(
                         _render_setup_html(
                             monitor_action_name=monitor_name,
-                            monitor_action_message="Monitor check completed",
+                            monitor_action_message=action_msg,
                             monitor_action_output=output,
                             ui_view=ui_view,
                             diag_view=diag_view,
@@ -10113,10 +10301,18 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     )
                     return
                 if self.path == "/test-push":
-                    output = _ui_test_push()
+                    cfg = load_config()
+                    role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+                    if role == "agent":
+                        ok_action, summary, remote_output = _agent_request_master_monitor_action(cfg, "test-push")
+                        output = remote_output or summary
+                        message_text = "Connection test completed (triggered by master)" if ok_action else "Connection test failed (master trigger)"
+                    else:
+                        output = _ui_test_push()
+                        message_text = "Connection test completed"
                     self._reply_html(
                         _render_setup_html(
-                            message="Connection test completed",
+                            message=message_text,
                             action_output=output,
                             ui_view=ui_view,
                             diag_view=diag_view,
@@ -10136,11 +10332,23 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     form = parse_qs(body, keep_blank_values=True)
                     ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
-                    output = _ui_test_push(target_monitor=monitor_name)
+                    cfg = load_config()
+                    role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+                    if role == "master" and log_source != "local":
+                        ok_action, summary, remote_output = _trigger_agent_monitor_action(cfg, log_source, "test-push", monitor_name=monitor_name)
+                        output = remote_output or summary
+                        action_msg = "Monitor test push completed (triggered by master)" if ok_action else "Monitor test push failed (triggered by master)"
+                    elif role == "agent":
+                        ok_action, summary, remote_output = _agent_request_master_monitor_action(cfg, "test-push", monitor_name=monitor_name)
+                        output = remote_output or summary
+                        action_msg = "Monitor test push completed (triggered by master)" if ok_action else "Monitor test push failed (master trigger)"
+                    else:
+                        output = _ui_test_push(target_monitor=monitor_name)
+                        action_msg = "Monitor test push completed"
                     self._reply_html(
                         _render_setup_html(
                             monitor_action_name=monitor_name,
-                            monitor_action_message="Monitor test push completed",
+                            monitor_action_message=action_msg,
                             monitor_action_output=output,
                             ui_view=ui_view,
                             diag_view=diag_view,
