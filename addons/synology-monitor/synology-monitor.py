@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.0.0-0056"
+VERSION = "1.0.0-0059"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -491,7 +491,7 @@ def _fetch_public_spk_version_from_info(ref: str) -> Tuple[Optional[str], Option
         req.close()
         if resp.status != 200:
             return None, f"HTTP {resp.status}"
-        m = re.search(r'^version="([^"]+)"', data, flags=re.MULTILINE)
+        m = re.search(r'^version="1.0.0-0059"]+)"', data, flags=re.MULTILINE)
         if not m:
             return None, "No version in INFO"
         return m.group(1).strip(), None
@@ -596,6 +596,61 @@ def _ensure_fresh_update_check_async(
         return False
     threading.Thread(target=lambda: _run_update_check(cfg), daemon=True).start()
     return True
+
+
+def _parse_info_version_text(content: str) -> str:
+    m = re.search(r'^version="1.0.0-0059"]+)"', str(content or ""), flags=re.MULTILINE)
+    return str(m.group(1)).strip() if m else ""
+
+
+def _detect_installed_synology_monitor_version() -> str:
+    candidates = [
+        Path("/var/packages/synology-monitor/INFO"),
+        Path("/var/packages/synology-monitor/target/INFO"),
+        Path("/usr/local/synology-monitor/INFO"),
+        Path("/opt/synology-monitor/INFO"),
+        get_script_path().parent / "community-package" / "package" / "INFO",
+    ]
+    for p in candidates:
+        try:
+            if p.exists():
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+                v = _parse_info_version_text(txt)
+                if v:
+                    return v
+        except OSError:
+            continue
+    return VERSION
+
+
+def _build_synology_update_sync_report(cfg: Optional[Dict[str, Any]] = None, force: bool = True) -> Dict[str, Any]:
+    if cfg is None:
+        cfg = load_config()
+    if force:
+        _run_update_check(cfg)
+    check = _load_update_check_result()
+    installed = _detect_installed_synology_monitor_version()
+    public_version = str(check.get("public_version", "") or check.get("latest_version", "") or "").strip()
+    cmp_val = 0
+    if public_version:
+        if _version_tuple(installed) < _version_tuple(public_version):
+            cmp_val = -1
+        elif _version_tuple(installed) > _version_tuple(public_version):
+            cmp_val = 1
+    status = "unknown"
+    if str(check.get("error", "") or "").strip():
+        status = "error"
+    elif public_version:
+        status = "update_available" if cmp_val < 0 else "up_to_date"
+    return {
+        "installed_version": installed or VERSION,
+        "public_version": public_version,
+        "selected_channel": str(check.get("selected_channel", "") or _selected_update_channel(cfg)),
+        "error": str(check.get("error", "") or "").strip(),
+        "status": status,
+        "cmp": cmp_val,
+        "raw_check": check,
+    }
 
 
 def get_config_path() -> Path:
@@ -8940,11 +8995,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     form = parse_qs(body, keep_blank_values=True)
                     ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     cfg = load_config()
-                    _run_update_check(cfg)
-                    check = _load_update_check_result()
-                    selected_channel = str(check.get("selected_channel", "") or ("main" if bool(cfg.get("update_from_main", False)) else "latest"))
-                    public_version = str(check.get("public_version", "") or check.get("latest_version", "") or "")
-                    err = str(check.get("error", "") or "").strip()
+                    report = _build_synology_update_sync_report(cfg=cfg, force=True)
+                    selected_channel = str(report.get("selected_channel", "") or ("main" if bool(cfg.get("update_from_main", False)) else "latest"))
+                    public_version = str(report.get("public_version", "") or "")
+                    installed_version = str(report.get("installed_version", "") or VERSION)
+                    err = str(report.get("error", "") or "").strip()
                     if err:
                         append_ui_log(f"settings | recheck updates failed ({selected_channel}): {err}")
                         self._reply_html(_render_setup_html(
@@ -8957,9 +9012,16 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ssl_warning=ssl_warning,
                         ))
                         return
-                    append_ui_log(f"settings | recheck updates ok ({selected_channel}) public={public_version or '?'} local={VERSION}")
+                    status_note = "Update available." if str(report.get("status", "")) == "update_available" else "Installed is up to date."
+                    append_ui_log(
+                        f"settings | recheck updates ok ({selected_channel}) "
+                        f"public={public_version or '?'} installed={installed_version} runtime={VERSION}"
+                    )
                     self._reply_html(_render_setup_html(
-                        security_message=f"Rechecked updates ({selected_channel}). Local SPK: {VERSION}. Public SPK: {public_version or 'unknown'}.",
+                        security_message=(
+                            f"Rechecked updates ({selected_channel}). Installed SPK: {installed_version}. "
+                            f"Runtime: {VERSION}. Public SPK: {public_version or 'unknown'}. {status_note}"
+                        ),
                         ui_view=ui_view,
                         diag_view=diag_view,
                         log_filter=log_filter,

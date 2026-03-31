@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import stat
@@ -82,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.0.0-0056"
+VERSION = "1.0.0-0059"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -2258,6 +2259,92 @@ def _ensure_fresh_update_check(
     result = _run_update_check(cfg)
     _save_update_check_result(result)
     return result
+
+
+def _parse_info_version_text(content: str) -> str:
+    m = re.search(r'^version="1.0.0-0059"]+)"', str(content or ""), flags=re.MULTILINE)
+    return str(m.group(1)).strip() if m else ""
+
+
+def _detect_installed_unix_monitor_version() -> str:
+    info_candidates = [
+        Path("/var/packages/synology-monitor/INFO"),
+        Path("/var/packages/synology-monitor/target/INFO"),
+        Path("/usr/local/synology-monitor/INFO"),
+        Path("/opt/synology-monitor/INFO"),
+    ]
+    for p in info_candidates:
+        try:
+            if p.exists():
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+                v = _parse_info_version_text(txt)
+                if v:
+                    return v
+        except OSError:
+            continue
+    py_candidates = [
+        Path("/opt/unix-monitor/unix-monitor.py"),
+        get_script_path(),
+    ]
+    for p in py_candidates:
+        try:
+            if p.exists():
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r'^VERSION\s*=\s*"([^"]+)"', txt, flags=re.MULTILINE)
+                if m:
+                    return str(m.group(1)).strip()
+        except OSError:
+            continue
+    return VERSION
+
+
+def _version_cmp_value(a: str, b: str) -> int:
+    ta = _version_tuple(a)
+    tb = _version_tuple(b)
+    if ta < tb:
+        return -1
+    if ta > tb:
+        return 1
+    return 0
+
+
+def _build_unix_update_sync_report(cfg: Optional[Dict[str, Any]] = None, force: bool = True) -> Dict[str, Any]:
+    if cfg is None:
+        cfg = load_config()
+    check = _ensure_fresh_update_check(cfg=cfg, force=force, ttl_sec=AUTOUPDATE_CHECK_INTERVAL_SEC)
+    installed = _detect_installed_unix_monitor_version()
+    public_version = str(check.get("public_version", "") or check.get("latest_version", "") or "").strip()
+    cmp_val = _version_cmp_value(installed or "0", public_version or "0") if public_version else 0
+    status = "unknown"
+    if check.get("error"):
+        status = "error"
+    elif public_version:
+        status = "update_available" if cmp_val < 0 else "up_to_date"
+    return {
+        "installed_version": installed or VERSION,
+        "public_version": public_version,
+        "selected_channel": str(check.get("selected_channel", "") or _selected_update_channel(cfg)),
+        "error": str(check.get("error", "") or "").strip(),
+        "cmp": cmp_val,
+        "status": status,
+        "raw_check": check,
+    }
+
+
+def _cleanup_update_runtime_cache() -> None:
+    cleanup_paths = [
+        Path("/var/lib/unix-monitor/__pycache__"),
+        Path("/var/lib/unix-monitor/cache"),
+        Path.home() / ".cache" / "unix-monitor",
+    ]
+    for p in cleanup_paths:
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+        except Exception:
+            pass
 
 
 def _get_autoupdate_on_logout_flag_path() -> Path:
@@ -9725,14 +9812,14 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     form = parse_qs(body, keep_blank_values=True)
                     ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                     cfg = load_config()
-                    result = _run_update_check(cfg)
-                    _save_update_check_result(result)
-                    selected_channel = str(result.get("selected_channel", "") or "latest")
-                    public_version = str(result.get("public_version", "") or result.get("latest_version", "") or "")
-                    if result.get("error"):
-                        append_ui_log(f"settings | recheck updates failed ({selected_channel}): {result.get('error')}")
+                    report = _build_unix_update_sync_report(cfg=cfg, force=True)
+                    selected_channel = str(report.get("selected_channel", "") or "latest")
+                    public_version = str(report.get("public_version", "") or "")
+                    installed_version = str(report.get("installed_version", "") or VERSION)
+                    if report.get("error"):
+                        append_ui_log(f"settings | recheck updates failed ({selected_channel}): {report.get('error')}")
                         self._reply_html(_render_setup_html(
-                            error=f"Recheck failed ({selected_channel}): {result.get('error')}",
+                            error=f"Recheck failed ({selected_channel}): {report.get('error')}",
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
@@ -9745,9 +9832,16 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             open_server_panel="package",
                         ))
                         return
-                    append_ui_log(f"settings | recheck updates ok ({selected_channel}) public={public_version or '?'} local={VERSION}")
+                    status_note = "Update available." if str(report.get("status", "")) == "update_available" else "Local is up to date."
+                    append_ui_log(
+                        f"settings | recheck updates ok ({selected_channel}) "
+                        f"public={public_version or '?'} local_installed={installed_version} runtime={VERSION}"
+                    )
                     self._reply_html(_render_setup_html(
-                        security_message=f"Rechecked updates ({selected_channel}). Local: {VERSION}. Public: {public_version or 'unknown'}.",
+                        security_message=(
+                            f"Rechecked updates ({selected_channel}). Installed: {installed_version}. "
+                            f"Runtime: {VERSION}. Public: {public_version or 'unknown'}. {status_note}"
+                        ),
                         ui_view=ui_view,
                         diag_view=diag_view,
                         log_filter=log_filter,
@@ -9837,6 +9931,16 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         return
                     try:
                         cfg = load_config()
+                        pre = _build_unix_update_sync_report(cfg=cfg, force=True)
+                        if pre.get("error"):
+                            msg = f"Update pre-check failed ({pre.get('selected_channel', 'latest')}): {pre.get('error')}"
+                            append_ui_log(f"self-update | blocked | {msg}")
+                            self._reply_html(_render_setup_html(
+                                error=msg,
+                                ui_view=ui_view,
+                                ssl_warning=ssl_warning,
+                            ))
+                            return
                         rc, out = _run_cmd([str(helper), script_dir, "update", "no-restart"], timeout_sec=30, env=_update_helper_env(cfg))
                         if rc != 0:
                             self._reply_html(_render_setup_html(
@@ -9846,13 +9950,20 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                                 ssl_warning=ssl_warning,
                             ))
                             return
+                        _cleanup_update_runtime_cache()
                         append_ui_log("self-update | completed successfully")
-                        try:
-                            _save_update_check_result(_run_update_check(load_config()))
-                        except Exception:
-                            pass
+                        post = _build_unix_update_sync_report(cfg=load_config(), force=True)
+                        post_status = str(post.get("status", "") or "unknown")
+                        post_note = (
+                            "Sync check: update available still detected."
+                            if post_status == "update_available"
+                            else ("Sync check: local is up to date." if post_status == "up_to_date" else "Sync check: status unknown.")
+                        )
                         self._reply_html(_render_setup_html(
-                            security_message="Update complete. Config and data preserved. Restarting services…",
+                            security_message=(
+                                "Update complete. Config and data preserved. Restarting services… "
+                                + post_note
+                            ),
                             action_output=out,
                             ui_view=ui_view,
                             ssl_warning=ssl_warning,
