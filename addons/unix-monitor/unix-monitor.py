@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.5.4-0005"
+VERSION = "1.5.4-0006"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6025,6 +6025,19 @@ def _render_setup_html(
         f"<option value='{html.escape(v)}'{' selected' if log_time_norm == v else ''}>{html.escape(time_labels[v])}</option>"
         for v in ("all", "15m", "1h", "6h", "24h")
     )
+    _diag_view_human = diag_view_labels.get(diag_label, diag_label.title())
+    _is_logs_view = diag_label == "logs"
+    _event_options_html = _evo if _is_logs_view else f"<option value='all' selected>Not available for {html.escape(_diag_view_human)}</option>"
+    _time_options_html = _tto if _is_logs_view else f"<option value='all' selected>Not available for {html.escape(_diag_view_human)}</option>"
+    _event_disabled_attr = "" if _is_logs_view else " disabled"
+    _time_disabled_attr = "" if _is_logs_view else " disabled"
+    _advanced_inputs_disabled_attr = "" if _is_logs_view else " disabled"
+    _advanced_summary_text = "Advanced filtering" if _is_logs_view else f"Advanced filtering (not available for {_diag_view_human})"
+    _filter_note_text = (
+        f"All filters are available for {_diag_view_human} view."
+        if _is_logs_view
+        else f"{_diag_view_human} view does not support filters. Switch to Logs view to use filtering."
+    )
     log_diag_filter_form = (
         "<form method='get' action='/' class='log-diag-filter-form'>"
         "<input type='hidden' name='view' value='overview'>"
@@ -6033,21 +6046,21 @@ def _render_setup_html(
         "<div><label for='diag-view-sel'>Diagnostic view</label>"
         f"<select id='diag-view-sel' name='diag_view'>{_dvo}</select></div>"
         "<div><label for='log-filter-sel'>Event / channel</label>"
-        f"<select id='log-filter-sel' name='log_filter'>{_evo}</select></div>"
+        f"<select id='log-filter-sel' name='log_filter'{_event_disabled_attr}>{_event_options_html}</select></div>"
         "<div><label for='log-time-sel'>Time window</label>"
-        f"<select id='log-time-sel' name='log_time_scope'>{_tto}</select></div>"
+        f"<select id='log-time-sel' name='log_time_scope'{_time_disabled_attr}>{_time_options_html}</select></div>"
         "</div>"
         "<details data-advanced-filtering='1' style='margin-top:10px;'>"
-        "<summary data-advanced-summary='1' style='cursor:pointer;'>Advanced filtering</summary>"
+        f"<summary data-advanced-summary='1' style='cursor:pointer;'>{html.escape(_advanced_summary_text)}</summary>"
         "<div class='log-diag-filter-grid' style='margin-top:8px;'>"
         "<div><label for='log-date-inp'>Date (calendar)</label>"
-        f"<input id='log-date-inp' type='date' name='log_date' value='{html.escape(_date_value)}'></div>"
+        f"<input id='log-date-inp' type='date' name='log_date' value='{html.escape(_date_value)}'{_advanced_inputs_disabled_attr}></div>"
         "<div><label for='log-time-from'>Time from</label>"
-        f"<input id='log-time-from' type='time' name='log_time_from' value='{html.escape(log_time_from_norm)}'></div>"
+        f"<input id='log-time-from' type='time' name='log_time_from' value='{html.escape(log_time_from_norm)}'{_advanced_inputs_disabled_attr}></div>"
         "<div><label for='log-time-to'>Time to</label>"
-        f"<input id='log-time-to' type='time' name='log_time_to' value='{html.escape(log_time_to_norm)}'></div>"
+        f"<input id='log-time-to' type='time' name='log_time_to' value='{html.escape(log_time_to_norm)}'{_advanced_inputs_disabled_attr}></div>"
         "</div></details>"
-        "<div class='muted' data-log-filter-note='1' style='margin-top:6px;'>Filters apply to Logs view only.</div>"
+        f"<div class='muted' data-log-filter-note='1' style='margin-top:6px;'>{html.escape(_filter_note_text)}</div>"
         "<div class='button-row' style='margin-top:8px;'>"
         "<button type='submit'>Apply filter</button>"
         f"<a class='btn-inline btn-inline-muted' href='/?view=overview&diag_view=logs&log_filter=all&log_date=all&log_time_scope=all&log_time_from=&log_time_to=&source={html.escape(source_label)}'>Clear filters</a>"
