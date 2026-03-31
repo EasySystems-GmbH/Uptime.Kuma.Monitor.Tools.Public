@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.5.2-0001"
+VERSION = "1.5.2-0002"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -491,7 +491,7 @@ def _fetch_public_spk_version_from_info(ref: str) -> Tuple[Optional[str], Option
         req.close()
         if resp.status != 200:
             return None, f"HTTP {resp.status}"
-        m = re.search(r'^version="1.5.2-0001"]+)"', data, flags=re.MULTILINE)
+        m = re.search(r'^version="1.5.2-0002"]+)"', data, flags=re.MULTILINE)
         if not m:
             return None, "No version in INFO"
         return m.group(1).strip(), None
@@ -599,7 +599,7 @@ def _ensure_fresh_update_check_async(
 
 
 def _parse_info_version_text(content: str) -> str:
-    m = re.search(r'^version="([^"]+)"', str(content or ""), flags=re.MULTILINE)
+    m = re.search(r'^version="1.5.2-0002"]+)"', str(content or ""), flags=re.MULTILINE)
     return str(m.group(1)).strip() if m else ""
 
 

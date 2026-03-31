@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.5.2-0001"
+VERSION = "1.5.2-0002"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1352,6 +1352,8 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
         "history": history[-200:],
         "state": state,
         "pushed_at": int(time.time()),
+        "last_login_ip": str(auth.get("last_login_ip", "") or "").strip(),
+        "last_login_at": int(auth.get("last_login_at", 0) or 0),
     }
     if cb_host:
         push_payload["callback_url"] = f"{cb_host}:{cb_port}"
@@ -2355,7 +2357,7 @@ def _ensure_fresh_update_check(
 
 
 def _parse_info_version_text(content: str) -> str:
-    m = re.search(r'^version="1.5.2-0001"]+)"', str(content or ""), flags=re.MULTILINE)
+    m = re.search(r'^version="1.5.2-0002"]+)"', str(content or ""), flags=re.MULTILINE)
     return str(m.group(1)).strip() if m else ""
 
 
@@ -5760,6 +5762,7 @@ def _render_setup_html(
     display_source_name = source_name if source_name else local_source_name
     display_server_ip = server_ip
     display_now_text = now_text
+    display_runtime_version = VERSION
     display_last_login_ip = last_login_ip
     display_last_login_at_text = last_login_at_text
     if source_is_remote:
@@ -5771,10 +5774,15 @@ def _render_setup_html(
         peer_url = str(peer_cfg.get("url", "") or "") if isinstance(peer_cfg, dict) else ""
         peer_host, _peer_port = _parse_peer_host_port(peer_url, PEER_DEFAULT_PORT)
         display_server_ip = peer_host or "remote"
+        remote_version = str((remote_snap or {}).get("version", "") or "").strip()
+        if remote_version:
+            display_runtime_version = remote_version
         pushed_at = int((remote_snap or {}).get("pushed_at", 0) or 0)
         display_now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pushed_at)) if pushed_at else "n/a"
-        display_last_login_ip = "n/a (remote)"
-        display_last_login_at_text = "n/a (remote)"
+        remote_login_ip = str((remote_snap or {}).get("last_login_ip", "") or "").strip()
+        remote_login_at = int((remote_snap or {}).get("last_login_at", 0) or 0)
+        display_last_login_ip = remote_login_ip or "n/a (remote)"
+        display_last_login_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(remote_login_at)) if remote_login_at else "n/a (remote)"
 
     # Setup steps with integrated screenshots.
     guide_images = get_task_guide_images()
@@ -6282,7 +6290,7 @@ def _render_setup_html(
         + "<a class='btn-inline' href='" + html.escape(REPO_URL) + "' target='_blank' rel='noopener noreferrer'>Open GitHub repository</a>"
         + (" <form method='post' action='/settings/recheck-updates' style='display:inline;'><button type='submit' class='btn-inline btn-inline-muted'>Recheck for updates</button></form>" if not source_is_remote else "")
         + "</div>"
-        + "<div class='muted'>Selected source: " + html.escape(selected_channel_label) + " | Local Unix runtime: " + html.escape(VERSION) + " | Public Unix runtime (" + html.escape(public_label) + "): " + html.escape(latest_version or "unknown") + " | Status: " + html.escape(update_status_text) + "</div>"
+        + "<div class='muted'>Selected source: " + html.escape(selected_channel_label) + " | Current Unix runtime (" + html.escape(display_source_name) + "): " + html.escape(display_runtime_version) + " | Public Unix runtime (" + html.escape(public_label) + "): " + html.escape(latest_version or "unknown") + " | Status: " + html.escape(update_status_text) + "</div>"
         + "<pre>" + html.escape(update_curl_cmd) + "</pre>"
         + "<div class='muted'>Update: backs up, downloads latest, validates, replaces. On failure restores previous. Config and data preserved.</div>"
         + "<div class='muted'>" + html.escape(source_scope_text) + "</div></div>"
@@ -6292,7 +6300,7 @@ def _render_setup_html(
         f"<button type='button' class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(display_source_name)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(display_server_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(display_now_text)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong>{html.escape(VERSION)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong>{html.escape(display_runtime_version)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(display_last_login_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(display_last_login_at_text)}</strong></button>"
         "</div>"
@@ -8559,10 +8567,13 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 cfg = load_config()
                 history = _load_history()
                 state = _load_monitor_state()
+                auth = load_auth()
                 self._reply_peer_json({
                     "instance_id": _get_instance_id(cfg),
                     "instance_name": str(cfg.get("instance_name", "") or ""),
                     "version": VERSION,
+                    "last_login_ip": str(auth.get("last_login_ip", "") or "").strip(),
+                    "last_login_at": int(auth.get("last_login_at", 0) or 0),
                     "monitors": cfg.get("monitors", []),
                     "history": history[-200:],
                     "state": state,
