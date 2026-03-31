@@ -293,12 +293,20 @@ fetch_public_version_for_ref() {
     local ref="$1"
     local url="https://raw.githubusercontent.com/${PUBLIC_REPO}/${ref}/${SCRIPT_VERSION_REMOTE_PATH}"
     local content=""
+    local version=""
     if command -v curl >/dev/null 2>&1; then
         content="$(curl -fsSL "${url}" 2>/dev/null || true)"
     elif command -v wget >/dev/null 2>&1; then
         content="$(wget -qO- "${url}" 2>/dev/null || true)"
     fi
-    printf '%s\n' "${content}" | sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' | head -n 1
+    version="$(printf '%s\n' "${content}" | sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' | head -n 1)"
+    if [ -n "${version}" ]; then
+        printf '%s\n' "${version}"
+        return 0
+    fi
+    if [[ "${ref}" =~ ^v?[0-9]+(\.[0-9]+){1,3}([.-][0-9A-Za-z._-]+)?$ ]]; then
+        printf '%s\n' "${ref#v}"
+    fi
 }
 
 version_cmp() {
@@ -426,8 +434,7 @@ refresh_download_urls
 LOCAL_VERSION="$(detect_local_version "${INSTALL_DIR}/${SCRIPT_NAME}")"
 PUBLIC_VERSION="$(fetch_public_version_for_ref "${REF}")"
 if [ -z "${PUBLIC_VERSION}" ] && [ "${REF}" != "main" ]; then
-    warn "Selected ref ${REF} does not contain unix-monitor script version; falling back to main for version check."
-    PUBLIC_VERSION="$(fetch_public_version_for_ref "main")"
+    warn "Selected ref ${REF} does not expose script VERSION metadata."
 fi
 echo ""
 info "Selected update source: ${UPDATE_CHANNEL} (ref: ${REF})"
