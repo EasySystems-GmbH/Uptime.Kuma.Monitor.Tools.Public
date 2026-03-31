@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.5.2-0002"
+VERSION = "1.5.2-0003"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -2357,7 +2357,7 @@ def _ensure_fresh_update_check(
 
 
 def _parse_info_version_text(content: str) -> str:
-    m = re.search(r'^version="1.5.2-0002"]+)"', str(content or ""), flags=re.MULTILINE)
+    m = re.search(r'^version="1.5.2-0003"]+)"', str(content or ""), flags=re.MULTILINE)
     return str(m.group(1)).strip() if m else ""
 
 
