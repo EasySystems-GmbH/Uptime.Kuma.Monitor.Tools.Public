@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.0.0-0059"
+VERSION = "1.0.0-0064"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -491,7 +491,7 @@ def _fetch_public_spk_version_from_info(ref: str) -> Tuple[Optional[str], Option
         req.close()
         if resp.status != 200:
             return None, f"HTTP {resp.status}"
-        m = re.search(r'^version="1.0.0-0059"]+)"', data, flags=re.MULTILINE)
+        m = re.search(r'^version="1.0.0-0064"]+)"', data, flags=re.MULTILINE)
         if not m:
             return None, "No version in INFO"
         return m.group(1).strip(), None
@@ -599,7 +599,7 @@ def _ensure_fresh_update_check_async(
 
 
 def _parse_info_version_text(content: str) -> str:
-    m = re.search(r'^version="1.0.0-0059"]+)"', str(content or ""), flags=re.MULTILINE)
+    m = re.search(r'^version="1.0.0-0064"]+)"', str(content or ""), flags=re.MULTILINE)
     return str(m.group(1)).strip() if m else ""
 
 
@@ -5562,7 +5562,7 @@ def _render_setup_html(
         <h3>Logs & Diagnostics</h3>
         <div class='log-diag-active-banner'><strong>Viewing:</strong> {html.escape(diag_view_labels.get(diag_label, diag_label))} · {html.escape(event_labels.get(filter_label, filter_label))} · {html.escape(time_labels.get(log_time_norm, log_time_norm))} · date {html.escape(date_labels.get(log_date_norm, log_date_norm))} · exact {html.escape((log_time_from_norm or '--:--') + ' to ' + (log_time_to_norm or '--:--')) if (log_time_from_norm or log_time_to_norm) else 'full day'} · word {html.escape(log_word_norm or '(any)')}</div>
         {"<div class='log-diag-meta'>UI log file: " + html.escape(_fmt_ui_log_size(log_bytes)) + f" · {log_lines_total:,} lines on disk · rolling window: up to {UI_LOG_DISPLAY_LINES} newest matching lines.</div>" if diag_label == "logs" and source_label == "local" else ("<div class='log-diag-meta'>UI log file: remote agent (" + html.escape(selected_source_name) + ") · size/line count shown on agent UI · rolling window: up to " + str(UI_LOG_DISPLAY_LINES) + " newest matching lines.</div>" if diag_label == "logs" else "")}
-        <form method="get" action="/" class="log-diag-filter-form"><input type="hidden" name="view" value="overview"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><div class="log-diag-filter-grid"><div><label>Diagnostic view</label><select name="diag_view" onchange="this.form.submit()">{_dvo}</select></div><div><label>Event / channel</label><select name="log_filter" onchange="this.form.submit()">{_evo}</select></div><div><label>Time window</label><select name="log_time_scope" onchange="this.form.submit()">{_tto}</select></div></div><details style="margin-top:10px;"><summary style="cursor:pointer;">Advanced filtering</summary><div class="log-diag-filter-grid" style="margin-top:8px;"><div><label>Date (calendar)</label><input type="date" name="log_date" value="{html.escape('' if log_date_norm == 'all' else log_date_norm)}" onchange="this.form.submit()"></div><div><label>Time from</label><input type="time" name="log_time_from" value="{html.escape(log_time_from_norm)}" onchange="this.form.submit()"></div><div><label>Time to</label><input type="time" name="log_time_to" value="{html.escape(log_time_to_norm)}" onchange="this.form.submit()"></div><div><label>Contains word</label><input type="text" name="log_word" value="{html.escape(log_word_norm)}" placeholder="e.g. timeout, failed, dns" onchange="this.form.submit()"></div></div></details><div class='button-row' style='margin-top:8px;'><a class='btn-inline btn-inline-muted' href='/?view=overview&diag_view=logs&log_filter=all&log_date=all&log_time_scope=all&log_time_from=&log_time_to=&log_word=&log_source={html.escape(source_label)}'>Clear filters</a></div></form>
+        <form method="get" action="/" class="log-diag-filter-form"><input type="hidden" name="view" value="overview"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><div class="log-diag-filter-grid"><div><label for="diag-view-sel">Diagnostic view</label><select id="diag-view-sel" name="diag_view">{_dvo}</select></div><div><label for="log-filter-sel">Event / channel</label><select id="log-filter-sel" name="log_filter">{_evo}</select></div><div><label for="log-time-sel">Time window</label><select id="log-time-sel" name="log_time_scope">{_tto}</select></div></div><details data-advanced-filtering="1" style="margin-top:10px;"><summary data-advanced-summary="1" style="cursor:pointer;">Advanced filtering</summary><div class="log-diag-filter-grid" style="margin-top:8px;"><div><label for="log-date-inp">Date (calendar)</label><input id="log-date-inp" type="date" name="log_date" value="{html.escape('' if log_date_norm == 'all' else log_date_norm)}"></div><div><label for="log-time-from">Time from</label><input id="log-time-from" type="time" name="log_time_from" value="{html.escape(log_time_from_norm)}"></div><div><label for="log-time-to">Time to</label><input id="log-time-to" type="time" name="log_time_to" value="{html.escape(log_time_to_norm)}"></div><div><label for="log-word-inp">Contains word</label><input id="log-word-inp" type="text" name="log_word" value="{html.escape(log_word_norm)}" placeholder="e.g. timeout, failed, dns"></div></div></details><div class='muted' data-log-filter-note='1' style='margin-top:6px;'>Filters apply to Logs view only.</div><div class='button-row' style='margin-top:8px;'><button type='submit'>Apply filter</button><a class='btn-inline btn-inline-muted' href='/?view=overview&diag_view=logs&log_filter=all&log_date=all&log_time_scope=all&log_time_from=&log_time_to=&log_word=&log_source={html.escape(source_label)}'>Clear filters</a></div></form>
         <div class="log-diag-toolbar"><div class="log-diag-toolbar-left">{log_diag_clear_actions_html}</div><div class="button-row" style="margin:0;"><form method="get" action="/"><input type="hidden" name="view" value="overview"><input type="hidden" name="diag_view" value="{html.escape(diag_label)}"><input type="hidden" name="log_filter" value="{html.escape(filter_label)}"><input type="hidden" name="log_date" value="{html.escape(log_date_norm)}"><input type="hidden" name="log_time_scope" value="{html.escape(log_time_norm)}"><input type="hidden" name="log_time_from" value="{html.escape(log_time_from_norm)}"><input type="hidden" name="log_time_to" value="{html.escape(log_time_to_norm)}"><input type="hidden" name="log_word" value="{html.escape(log_word_norm)}"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><button type="submit">Refresh</button></form>{("<form method='get' action='/' style='margin-left:auto;'><input type='hidden' name='view' value='overview'><input type='hidden' name='diag_view' value='" + html.escape(diag_label) + "'><input type='hidden' name='log_filter' value='" + html.escape(filter_label) + "'><input type='hidden' name='log_date' value='" + html.escape(log_date_norm) + "'><input type='hidden' name='log_time_scope' value='" + html.escape(log_time_norm) + "'><input type='hidden' name='log_time_from' value='" + html.escape(log_time_from_norm) + "'><input type='hidden' name='log_time_to' value='" + html.escape(log_time_to_norm) + "'><input type='hidden' name='log_word' value='" + html.escape(log_word_norm) + "'><input type='hidden' name='log_source' value='" + html.escape(source_label) + "'><input type='hidden' name='diagnose' value='1'><button type='submit'>Diagnose connection</button></form>") if source_label != "local" else ""}</div></div>
         <pre id="log-diag-pre"{_log_pre_attrs}>{html.escape(log_text)}</pre>
       </div>
@@ -6062,6 +6062,59 @@ def _render_setup_html(
           }}
         }} else if (logPre) {{
           try {{ logPre.scrollTop = logPre.scrollHeight; }} catch (e) {{}}
+        }}
+        var logDiagForm = document.querySelector("form.log-diag-filter-form");
+        function updateDiagFilterAvailability() {{
+          if (!logDiagForm) return;
+          var diagSelect = logDiagForm.querySelector("#diag-view-sel");
+          if (!diagSelect) return;
+          var selectedView = String(diagSelect.value || "logs").toLowerCase();
+          var isLogsView = selectedView === "logs";
+          var eventSelect = logDiagForm.querySelector("#log-filter-sel");
+          var timeSelect = logDiagForm.querySelector("#log-time-sel");
+          var dateInput = logDiagForm.querySelector("#log-date-inp");
+          var timeFromInput = logDiagForm.querySelector("#log-time-from");
+          var timeToInput = logDiagForm.querySelector("#log-time-to");
+          var wordInput = logDiagForm.querySelector("#log-word-inp");
+          var advancedDetails = logDiagForm.querySelector("details[data-advanced-filtering='1']");
+          var advancedSummary = logDiagForm.querySelector("summary[data-advanced-summary='1']");
+          var filterNote = logDiagForm.querySelector("[data-log-filter-note='1']");
+          if (eventSelect && !eventSelect.dataset.logsOptionsHtml) eventSelect.dataset.logsOptionsHtml = eventSelect.innerHTML;
+          if (timeSelect && !timeSelect.dataset.logsOptionsHtml) timeSelect.dataset.logsOptionsHtml = timeSelect.innerHTML;
+          if (eventSelect) {{
+            if (isLogsView) {{
+              if (eventSelect.dataset.logsOptionsHtml) eventSelect.innerHTML = eventSelect.dataset.logsOptionsHtml;
+            }} else {{
+              eventSelect.innerHTML = "<option value='all' selected>Not available for selected view</option>";
+            }}
+            eventSelect.disabled = !isLogsView;
+          }}
+          if (timeSelect) {{
+            if (isLogsView) {{
+              if (timeSelect.dataset.logsOptionsHtml) timeSelect.innerHTML = timeSelect.dataset.logsOptionsHtml;
+            }} else {{
+              timeSelect.innerHTML = "<option value='all' selected>Not available for selected view</option>";
+            }}
+            timeSelect.disabled = !isLogsView;
+          }}
+          [dateInput, timeFromInput, timeToInput, wordInput].forEach(function (el) {{
+            if (!el) return;
+            el.disabled = !isLogsView;
+          }});
+          if (advancedDetails && !isLogsView) advancedDetails.removeAttribute("open");
+          if (advancedSummary) {{
+            advancedSummary.textContent = isLogsView ? "Advanced filtering" : "Advanced filtering (not available for selected view)";
+          }}
+          if (filterNote) {{
+            filterNote.textContent = isLogsView
+              ? "All filters are available for Logs view."
+              : "Selected diagnostic view does not support event/time/advanced filters.";
+          }}
+        }}
+        if (logDiagForm) {{
+          var diagSelect = logDiagForm.querySelector("#diag-view-sel");
+          if (diagSelect) diagSelect.addEventListener("change", updateDiagFilterAvailability);
+          updateDiagFilterAvailability();
         }}
         function ensureUiViewField(form) {{
           if (!form || !form.querySelector) return;
