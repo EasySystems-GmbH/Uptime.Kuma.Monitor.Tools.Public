@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.5.4-0006"
+VERSION = "1.5.4-0007"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6246,7 +6246,20 @@ def _render_setup_html(
         }}
         if (logDiagForm) {{
           var diagSelect = logDiagForm.querySelector("#diag-view-sel");
-          if (diagSelect) diagSelect.addEventListener("change", updateDiagFilterAvailability);
+          if (diagSelect) {{
+            diagSelect.addEventListener("change", function () {{
+              updateDiagFilterAvailability();
+              try {{
+                if (logDiagForm.requestSubmit) {{
+                  logDiagForm.requestSubmit();
+                }} else {{
+                  logDiagForm.submit();
+                }}
+              }} catch (e) {{
+                try {{ logDiagForm.submit(); }} catch (err) {{}}
+              }}
+            }});
+          }}
           updateDiagFilterAvailability();
         }}
         function ensureUiViewField(form) {{
