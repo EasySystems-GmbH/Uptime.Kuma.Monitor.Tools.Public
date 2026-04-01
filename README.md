@@ -5,7 +5,7 @@ This is the public distribution/runtime repository.
 ## Quick Start
 
 ```bash
-cd deploy
+cd apps/kuma-management-console-deploy
 cp -n .env.example .env
 docker compose up -d
 docker compose ps
@@ -25,12 +25,12 @@ Open `http://localhost:5080`.
 ```text
 .
 ├── apps/                      # Active runtime applications
+│   ├── kuma-management-console-deploy/
 │   ├── unix-monitor/
 │   └── synology-monitor/
 ├── legacy/                    # Deprecated monitors (migration compatibility)
 │   ├── mount-monitor/
 │   └── unix-storage-monitor/
-├── deploy/                    # Docker compose entrypoint
 ├── docs/
 │   └── apps/                  # Tutorials per public app
 ├── scripts/                   # Migration helpers
