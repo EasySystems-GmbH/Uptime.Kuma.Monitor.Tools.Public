@@ -6,6 +6,7 @@
 - Docs folder: `docs/apps/synology-monitor/`
 - Tutorial: `docs/apps/synology-monitor/tutorial.md`
 
+- UI Preview: [`docs/apps/synology-monitor/preview.png`](../../docs/apps/synology-monitor/preview.png)
 Monitors Synology NAS health and reports to Uptime Kuma.
 
 This addon provides:

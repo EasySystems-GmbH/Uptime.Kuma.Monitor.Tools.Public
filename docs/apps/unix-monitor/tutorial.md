@@ -1,5 +1,12 @@
 # unix-monitor Tutorial
 
+## UI Preview
+
+![Preview](preview.png)
+
+*Unix/Linux system monitoring web interface*
+
+
 ## Prerequisites
 
 - Access to an Uptime Kuma instance

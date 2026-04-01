@@ -1,5 +1,12 @@
 # synology-monitor Tutorial
 
+## UI Preview
+
+![Preview](preview.png)
+
+*Synology NAS monitoring web interface*
+
+
 ## Prerequisites
 
 - Access to an Uptime Kuma instance

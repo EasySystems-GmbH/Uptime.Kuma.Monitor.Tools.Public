@@ -6,6 +6,7 @@
 - Docs folder: `docs/apps/unix-monitor/`
 - Tutorial: `docs/apps/unix-monitor/tutorial.md`
 
+- UI Preview: [`docs/apps/unix-monitor/preview.png`](../../docs/apps/unix-monitor/preview.png)
 Unix monitor addon with Synology-grade runtime complexity adapted for generic Unix hosts.
 
 It combines:

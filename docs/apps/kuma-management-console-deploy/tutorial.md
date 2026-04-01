@@ -1,5 +1,12 @@
 # kuma-management-console-deploy Tutorial
 
+## UI Preview
+
+![Preview](preview.png)
+
+*Docker Compose deployment setup*
+
+
 ## Prerequisites
 
 - Docker and Docker Compose installed
