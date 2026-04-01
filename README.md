@@ -6,13 +6,6 @@ This is the public distribution/runtime repository.
 
 - App tutorials index: `docs/apps/README.md`
 - Each app README starts with:
-<<<<<<< HEAD
-  - entry point (`apps/<app>/`)
-  - docs folder (`docs/apps/<app>/`)
-  - tutorial (`docs/apps/<app>/tutorial.md`)
-
-## Quick Start
-=======
   - entry point (`apps/{app}/`)
   - docs folder (`docs/apps/{app}/`)
   - tutorial (`docs/apps/{app}/tutorial.md`)
@@ -20,7 +13,6 @@ This is the public distribution/runtime repository.
 ## Installation (By Application)
 
 ### Install Kuma Management Console (Docker)
->>>>>>> d906a0a (docs(readme): reorganize install guidance by application)
 
 ```bash
 cd apps/kuma-management-console-deploy
@@ -37,21 +29,21 @@ Open `http://localhost:5080`.
 curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
 
-### Install Synology Monitor (Preferred: Package Center)
+### Install Synology Monitor (Preferred: SPK Package)
 
-Use DSM Package Center with this package source URL:
+Use package files for manual install in DSM Package Center:
 
-```text
-https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/community-package/repo/packages.json
-```
+- Dist package (branch artifact): [apps/synology-monitor/community-package/dist/synology-monitor-basic.spk](https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/blob/main/apps/synology-monitor/community-package/dist/synology-monitor-basic.spk)
+- Latest stable package (recommended): [releases/latest/download/synology-monitor-basic.spk](https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/releases/latest/download/synology-monitor-basic.spk)
+- All release packages: [github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/releases](https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/releases)
 
-Alternative (advanced): script install via `curl`.
+Alternative (advanced, not preferred): script install via `curl`.
 
 ```bash
 curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
 
-Warning: on Synology DSM, direct script installs can be affected by DSM updates and may require manual repair/reinstall. Package Center install is safer and recommended.
+Warning: on Synology DSM, direct script installs can be affected by DSM updates and may require manual repair/reinstall. SPK package install is safer and recommended.
 
 ## Structure
 
