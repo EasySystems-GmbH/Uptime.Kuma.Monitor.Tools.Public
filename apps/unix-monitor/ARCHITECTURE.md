@@ -1,4 +1,4 @@
-# Unix Monitor Addon - System Architecture
+# Unix Monitor App - System Architecture
 
 ![System Architecture](unix-monitor-architecture.png)
 
