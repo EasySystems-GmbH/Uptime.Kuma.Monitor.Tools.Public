@@ -1,49 +1,46 @@
-# Uptime Kuma Monitor Tools
+# Uptime Kuma Monitor Tools (Public)
 
-This repository contains applications and add-ons for Uptime Kuma, organized by role.
+This is the public distribution/runtime repository.
 
-## Quick start
-
-### Web UI (recommended)
+## Quick Start
 
 ```bash
-cd main
+cd deploy
 cp -n .env.example .env
 docker compose up -d
 docker compose ps
 ```
 
-Then open: `http://localhost:5080`
+Open `http://localhost:5080`.
 
-### Addons (monitoring scripts)
+## Install Monitors
 
-| Addon | Platform | Install |
-|-------|----------|---------|
-| **Unix Monitor** | Linux, macOS | `curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/unix-monitor/install.sh \| sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash` |
-| **Synology Monitor** | Synology DSM | `curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/synology-monitor/install.sh \| env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash` |
-
-*Mount Monitor and Unix Storage Monitor are deprecated; their installers redirect to Unix Monitor.*
+| Application | Platform | Install |
+|---|---|---|
+| Unix Monitor | Linux, macOS | `curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh \| sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash` |
+| Synology Monitor | Synology DSM | `curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/install.sh \| env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash` |
 
 ## Structure
 
-```
+```text
 .
-├── main/                    # Docker compose entry point
-├── apps/
-│   ├── kuma-management-console/   # Web UI
-│   ├── kuma-bulk-editor/          # CLI bulk editor
-│   └── kuma-notifications-editor/ # CLI notifications editor
-├── addons/
-│   ├── unix-monitor/        # Unix/Linux monitor (mount, SMART, storage, web UI)
-│   ├── synology-monitor/    # Synology NAS monitor
-│   ├── mount-monitor/       # DEPRECATED → use unix-monitor
-│   └── unix-storage-monitor/# DEPRECATED → use unix-monitor
-├── scripts/                 # Version bump, migration helpers
-└── docs/                    # Shared assets
+├── apps/                      # Active runtime applications
+│   ├── unix-monitor/
+│   └── synology-monitor/
+├── legacy/                    # Deprecated monitors (migration compatibility)
+│   ├── mount-monitor/
+│   └── unix-storage-monitor/
+├── deploy/                    # Docker compose entrypoint
+├── docs/
+│   └── apps/                  # Tutorials per public app
+├── scripts/                   # Migration helpers
+└── addons/                    # Compatibility paths (legacy URLs)
 ```
 
-## Documentation
+## Start Here (Per Application)
 
-- **Web UI:** `main/README.md`, `apps/kuma-management-console/README.md`
-- **Addons:** `addons/README.md`
-- **CLI tools:** `apps/kuma-bulk-editor/README.md`, `apps/kuma-notifications-editor/README.md`
+- App tutorials index: `docs/apps/README.md`
+- Each app README starts with:
+  - entry point (`apps/<app>/`)
+  - docs folder (`docs/apps/<app>/`)
+  - tutorial (`docs/apps/<app>/tutorial.md`)

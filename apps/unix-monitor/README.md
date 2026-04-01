@@ -1,5 +1,11 @@
 # Unix Monitor
 
+## Start Here
+
+- Entry point: `apps/unix-monitor/`
+- Docs folder: `docs/apps/unix-monitor/`
+- Tutorial: `docs/apps/unix-monitor/tutorial.md`
+
 Unix monitor addon with Synology-grade runtime complexity adapted for generic Unix hosts.
 
 It combines:
@@ -15,13 +21,13 @@ Runtime name is generated from system info:
 ## Quick Install
 
 ```bash
-curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/unix-monitor/install.sh | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
 
 ## Architecture
 
-- Architecture document: `addons/unix-monitor/ARCHITECTURE.md`
-- Diagram image: `addons/unix-monitor/unix-monitor-architecture.png`
+- Architecture document: `apps/unix-monitor/ARCHITECTURE.md`
+- Diagram image: `apps/unix-monitor/unix-monitor-architecture.png`
 
 ## Setup Modes
 

@@ -18,12 +18,12 @@ Build and release tooling lives in the private dev repository (`Uptime.Kuma.Moni
 Use this if you do not want manual `.spk` upload each time.
 
 1. Publish `synology-monitor-basic.spk` as a GitHub release asset in your repository.
-2. Commit/push `addons/synology-monitor/community-package/repo/packages.json`.
+2. Commit/push `apps/synology-monitor/community-package/repo/packages.json`.
 3. In DSM: Package Center -> Settings -> Package Sources -> Add
 4. Use this URL pattern as source:
 
 ```text
-https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/synology-monitor/community-package/repo/packages.json
+https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/community-package/repo/packages.json
 ```
 
 5. Open your source in Package Center and install/update from there.
@@ -33,7 +33,7 @@ https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Pub
 Use this URL in DSM Package Sources (this is the correct one):
 
 ```text
-https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/synology-monitor/community-package/repo/packages.json
+https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/community-package/repo/packages.json
 ```
 
 Release asset URL expected by the package source:
@@ -50,7 +50,7 @@ https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/releases/la
 Important: this GitHub page URL is only for browsing files and will NOT work as DSM package source:
 
 ```text
-https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/tree/main/addons/synology-monitor/community-package
+https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/tree/main/apps/synology-monitor/community-package
 ```
 
 The package source JSON points to:

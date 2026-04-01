@@ -28,8 +28,8 @@ python3 scripts/bump-addon-version.py unix-monitor 1.0.0-0056
 ```
 
 **synology-monitor** updates:
-- `addons/synology-monitor/synology-monitor.py` (VERSION)
-- `addons/synology-monitor/community-package/package/INFO` (version)
+- `apps/synology-monitor/synology-monitor.py` (VERSION)
+- `apps/synology-monitor/community-package/package/INFO` (version)
 
 **unix-monitor** updates:
-- `addons/unix-monitor/unix-monitor.py` (VERSION)
+- `apps/unix-monitor/unix-monitor.py` (VERSION)

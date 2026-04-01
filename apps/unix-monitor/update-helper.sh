@@ -31,7 +31,7 @@ fi
 
 PUBLIC_REPO="${PUBLIC_REPO:-EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public}"
 SCRIPT_NAME="unix-monitor.py"
-SCRIPT_VERSION_REMOTE_PATH="addons/unix-monitor/unix-monitor.py"
+SCRIPT_VERSION_REMOTE_PATH="apps/unix-monitor/unix-monitor.py"
 
 # Resolve download ref: use latest release tag so updates match what the UI checks against.
 # Set UNIX_MONITOR_USE_MAIN=1 to force main branch (e.g. for testing unreleased changes).
@@ -43,7 +43,7 @@ if [ "${UNIX_MONITOR_USE_MAIN:-0}" != "1" ] && command -v curl >/dev/null 2>&1; 
     fi
 fi
 
-URL="https://raw.githubusercontent.com/${PUBLIC_REPO}/${REF}/addons/unix-monitor/${SCRIPT_NAME}"
+URL="https://raw.githubusercontent.com/${PUBLIC_REPO}/${REF}/apps/unix-monitor/${SCRIPT_NAME}"
 NEW="${SCRIPT}.new"
 
 fetch_public_version_for_ref() {
@@ -133,7 +133,7 @@ if ! do_download; then
     if [ "${REF}" != "main" ]; then
         echo "Release ${REF} missing unix-monitor addon, falling back to main branch."
         REF="main"
-        URL="https://raw.githubusercontent.com/${PUBLIC_REPO}/${REF}/addons/unix-monitor/${SCRIPT_NAME}"
+        URL="https://raw.githubusercontent.com/${PUBLIC_REPO}/${REF}/apps/unix-monitor/${SCRIPT_NAME}"
         do_download
     else
         echo "ERROR: Download failed"

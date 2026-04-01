@@ -127,8 +127,8 @@ PY
 
 if git -C "${ROOT_DIR}" rev-parse --show-toplevel >/dev/null 2>&1; then
   TOP="$(git -C "${ROOT_DIR}" rev-parse --show-toplevel)"
-  TRACKED_BUILD="$(git -C "${TOP}" ls-files "addons/synology-monitor/community-package/.build/**" "addons/synology-monitor/community-package/dist/**" || true)"
-  DELETED_BUILD="$(git -C "${TOP}" ls-files --deleted "addons/synology-monitor/community-package/.build/**" "addons/synology-monitor/community-package/dist/**" || true)"
+  TRACKED_BUILD="$(git -C "${TOP}" ls-files "apps/synology-monitor/community-package/.build/**" "apps/synology-monitor/community-package/dist/**" || true)"
+  DELETED_BUILD="$(git -C "${TOP}" ls-files --deleted "apps/synology-monitor/community-package/.build/**" "apps/synology-monitor/community-package/dist/**" || true)"
   EFFECTIVE_TRACKED="${TRACKED_BUILD}"
   if [ -n "${DELETED_BUILD}" ] && [ -n "${EFFECTIVE_TRACKED}" ]; then
     EFFECTIVE_TRACKED="$(python3 - <<'PY' "${TRACKED_BUILD}" "${DELETED_BUILD}"

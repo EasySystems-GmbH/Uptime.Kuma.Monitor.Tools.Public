@@ -1,5 +1,11 @@
 # EasySystems GmbH - Kuma Monitor Addon
 
+## Start Here
+
+- Entry point: `apps/synology-monitor/`
+- Docs folder: `docs/apps/synology-monitor/`
+- Tutorial: `docs/apps/synology-monitor/tutorial.md`
+
 Monitors Synology NAS health and reports to Uptime Kuma.
 
 This addon provides:
@@ -24,13 +30,13 @@ This addon provides:
 ### 1) Script install (curl / wget)
 
 ```bash
-curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/synology-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
 
 Or with wget:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/synology-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+wget -qO- https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
 
 ### 2) Package via Package Center (recommended)
@@ -38,7 +44,7 @@ wget -qO- https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor
 Add the package source in DSM Package Center, then install or update from there:
 
 1. DSM → Package Center → Settings → Package Sources → Add
-2. URL: `https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/synology-monitor/community-package/repo/packages.json`
+2. URL: `https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/community-package/repo/packages.json`
 3. Refresh and install **Synology Monitor** from your source
 
 Auto-updates when you refresh Package Center.
@@ -189,6 +195,6 @@ Optional for NVMe checks:
 - Designed for Synology NAS hosts (DSM/Linux).
 - Config file is owner-only (`0600`) and written atomically.
 - HTTPS push uses certificate verification.
-- A basic SPK skeleton is available in `addons/synology-monitor/community-package/`.
+- A basic SPK skeleton is available in `apps/synology-monitor/community-package/`.
 - In the SPK skeleton, setup UI is auto-started after package install on port `8787`.
 - Internal security analysis and hardening documents are maintained in the private `Uptime.Kuma.Monitor.Tools.Dev` repository.

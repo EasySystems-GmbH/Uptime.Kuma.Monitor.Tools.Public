@@ -124,7 +124,7 @@ PUBLIC_GITHUB_REPO = os.environ.get("PUBLIC_REPO", "EasySystems-GmbH/Uptime.Kuma
 REPO_URL = f"https://github.com/{PUBLIC_GITHUB_REPO}"
 GITHUB_REPO = PUBLIC_GITHUB_REPO
 AUTOUPDATE_CHECK_INTERVAL_SEC = 6 * 3600  # Max once per 6 hours
-UPDATE_SCRIPT_REMOTE_PATH = "addons/unix-monitor/unix-monitor.py"
+UPDATE_SCRIPT_REMOTE_PATH = "apps/unix-monitor/unix-monitor.py"
 PRODUCT_DESC = (
     "Checks Unix host SMART and storage health, provides guided elevated-access setup and diagnostics, "
     "and pushes monitor status to Uptime Kuma."
@@ -6221,7 +6221,7 @@ def _render_setup_html(
     )
     update_channel = "main" if bool(cfg.get("update_from_main", False)) else "latest"
     update_curl_cmd = (
-        f"curl -sSL https://raw.githubusercontent.com/{PUBLIC_GITHUB_REPO}/main/addons/unix-monitor/install.sh"
+        f"curl -sSL https://raw.githubusercontent.com/{PUBLIC_GITHUB_REPO}/main/apps/unix-monitor/install.sh"
         f" | sudo env PUBLIC_REPO={PUBLIC_GITHUB_REPO} UNIX_MONITOR_UPDATE_CHANNEL={update_channel} bash"
     )
     has_update_helper = get_update_helper_path().exists()

@@ -11,7 +11,7 @@ set -euo pipefail
 
 PUBLIC_REPO="${PUBLIC_REPO:-EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public}"
 BRANCH="main"
-UNIX_MONITOR_INSTALL_URL="https://raw.githubusercontent.com/${PUBLIC_REPO}/${BRANCH}/addons/unix-monitor/install.sh"
+UNIX_MONITOR_INSTALL_URL="https://raw.githubusercontent.com/${PUBLIC_REPO}/${BRANCH}/apps/unix-monitor/install.sh"
 
 SOURCE="${1:-}"
 if [ -z "${SOURCE}" ]; then

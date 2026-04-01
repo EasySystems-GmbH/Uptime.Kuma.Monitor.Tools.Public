@@ -427,7 +427,7 @@ def _count_unused_recovery(auth: Dict[str, Any]) -> int:
 
 GITHUB_REPO = os.environ.get("PUBLIC_REPO", "EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public")
 UPDATE_CHECK_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-UPDATE_INFO_REMOTE_PATH = "addons/synology-monitor/community-package/package/INFO"
+UPDATE_INFO_REMOTE_PATH = "apps/synology-monitor/community-package/package/INFO"
 
 
 def _get_update_check_path() -> Path:
@@ -5229,7 +5229,7 @@ def _render_setup_html(
     selected_channel = "main" if update_from_main else "latest"
     selected_channel_label = "main branch" if update_from_main else "latest release"
     update_curl_cmd = (
-        f"curl -sSL https://raw.githubusercontent.com/{GITHUB_REPO}/main/addons/synology-monitor/install.sh"
+        f"curl -sSL https://raw.githubusercontent.com/{GITHUB_REPO}/main/apps/synology-monitor/install.sh"
         f" | sudo env PUBLIC_REPO={GITHUB_REPO} UNIX_MONITOR_UPDATE_CHANNEL={selected_channel} bash"
     )
     update_check = _load_update_check_result()

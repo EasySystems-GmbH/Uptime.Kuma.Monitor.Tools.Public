@@ -9,7 +9,7 @@ unix-monitor includes everything unix-storage-monitor did (SMART + storage) plus
 If you run the install script, it will detect an existing install and offer to migrate automatically:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/addons/unix-storage-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-storage-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
 
 Your monitors will be preserved and migrated to unix-monitor.
