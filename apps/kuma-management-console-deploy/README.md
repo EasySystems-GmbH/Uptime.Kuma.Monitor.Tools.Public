@@ -5,8 +5,8 @@
 - Entry point: `apps/kuma-management-console-deploy/`
 - Docs folder: `docs/apps/kuma-management-console-deploy/`
 - Tutorial: `docs/apps/kuma-management-console-deploy/tutorial.md`
+- Screenshot Preview Page: [`docs/screenshots/kmc/README.md`](../../docs/screenshots/kmc/README.md)
 
-- UI Preview: [`docs/apps/kuma-management-console-deploy/preview.png`](../../docs/apps/kuma-management-console-deploy/preview.png)
 This folder is the compose/deployment entrypoint for local run.
 
 ## What this starts
