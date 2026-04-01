@@ -6,11 +6,21 @@ This is the public distribution/runtime repository.
 
 - App tutorials index: `docs/apps/README.md`
 - Each app README starts with:
+<<<<<<< HEAD
   - entry point (`apps/<app>/`)
   - docs folder (`docs/apps/<app>/`)
   - tutorial (`docs/apps/<app>/tutorial.md`)
 
 ## Quick Start
+=======
+  - entry point (`apps/{app}/`)
+  - docs folder (`docs/apps/{app}/`)
+  - tutorial (`docs/apps/{app}/tutorial.md`)
+
+## Installation (By Application)
+
+### Install Kuma Management Console (Docker)
+>>>>>>> d906a0a (docs(readme): reorganize install guidance by application)
 
 ```bash
 cd apps/kuma-management-console-deploy
@@ -21,12 +31,27 @@ docker compose ps
 
 Open `http://localhost:5080`.
 
-## Install Monitors
+### Install Unix Monitor
 
-| Application | Platform | Install |
-|---|---|---|
-| Unix Monitor | Linux, macOS | `curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh \| sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash` |
-| Synology Monitor | Synology DSM | `curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/install.sh \| env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash` |
+```bash
+curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+```
+
+### Install Synology Monitor (Preferred: Package Center)
+
+Use DSM Package Center with this package source URL:
+
+```text
+https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/community-package/repo/packages.json
+```
+
+Alternative (advanced): script install via `curl`.
+
+```bash
+curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/synology-monitor/install.sh | env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+```
+
+Warning: on Synology DSM, direct script installs can be affected by DSM updates and may require manual repair/reinstall. Package Center install is safer and recommended.
 
 ## Structure
 
