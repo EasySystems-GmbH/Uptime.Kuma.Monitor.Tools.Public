@@ -2,6 +2,14 @@
 
 This is the public distribution/runtime repository.
 
+## Start Here (Per Application)
+
+- App tutorials index: `docs/apps/README.md`
+- Each app README starts with:
+  - entry point (`apps/<app>/`)
+  - docs folder (`docs/apps/<app>/`)
+  - tutorial (`docs/apps/<app>/tutorial.md`)
+
 ## Quick Start
 
 ```bash
@@ -36,11 +44,3 @@ Open `http://localhost:5080`.
 ├── scripts/                   # Migration helpers
 └── addons/                    # Compatibility paths (legacy URLs)
 ```
-
-## Start Here (Per Application)
-
-- App tutorials index: `docs/apps/README.md`
-- Each app README starts with:
-  - entry point (`apps/<app>/`)
-  - docs folder (`docs/apps/<app>/`)
-  - tutorial (`docs/apps/<app>/tutorial.md`)
