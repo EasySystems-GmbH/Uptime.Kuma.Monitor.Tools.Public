@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0030"
+VERSION = "1.6.0-0031"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1016,6 +1016,21 @@ def _is_valid_peer_instance_id(instance_id: str) -> bool:
     if iid.lower() in {"none", "null", "unknown", "-", "?"}:
         return False
     return bool(re.match(r"^[A-Za-z0-9_-]+$", iid))
+
+
+def _registered_peer_instance_ids(cfg: Dict[str, Any]) -> set[str]:
+    """Instance IDs listed under cfg['peers'] (master's registered agents)."""
+    peers = cfg.get("peers", [])
+    if not isinstance(peers, list):
+        return set()
+    out: set[str] = set()
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("instance_id", "") or "").strip()
+        if _is_valid_peer_instance_id(pid):
+            out.add(pid)
+    return out
 
 
 def get_peer_data_dir() -> Path:
@@ -2862,7 +2877,9 @@ def _build_live_snapshot() -> Dict[str, Any]:
         now = int(time.time())
         token = str(cfg.get("peering_token", "") or "").strip()
         for snap in _load_all_peer_snapshots():
-            peer_id = str(snap.get("instance_id", ""))
+            peer_id = str(snap.get("instance_id", "") or "").strip()
+            if not peer_id or peer_id not in peers_cfg_map:
+                continue
             peer_name = str(snap.get("instance_name", "") or peer_id[:8])
             received_at = int(snap.get("received_at", 0) or 0)
             pc_info = peers_cfg_map.get(peer_id, {})
@@ -5028,11 +5045,12 @@ def _render_setup_html(
     if ssl_warning:
         status_html = f"<div class='err'>{html.escape(ssl_warning)}</div>" + status_html
     peer_role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+    registered_peer_ids = _registered_peer_instance_ids(cfg)
     peer_snapshots = _load_all_peer_snapshots() if peer_role == "master" else []
     snapshot_by_id: Dict[str, Dict[str, Any]] = {}
     for snap in peer_snapshots:
         snap_id = str(snap.get("instance_id", "") or "").strip()
-        if _is_valid_peer_instance_id(snap_id):
+        if _is_valid_peer_instance_id(snap_id) and snap_id in registered_peer_ids:
             snapshot_by_id[snap_id] = snap
     source_label = (log_source or "local").strip()
     if peer_role != "master":
@@ -8243,8 +8261,6 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 if not peer_id:
                     self._reply_json({"error": "missing instance_id"}, 400)
                     return
-                data["received_at"] = int(time.time())
-                _save_peer_snapshot(peer_id, data)
                 cfg = load_config()
                 peers = cfg.get("peers", [])
                 if not isinstance(peers, list):
@@ -8265,18 +8281,14 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         found = True
                         break
                 if not found:
-                    new_peer: Dict[str, Any] = {
-                        "instance_id": peer_id,
-                        "instance_name": str(data.get("instance_name", "") or ""),
-                        "last_seen": int(time.time()),
-                        "monitor_count": len(data.get("monitors", [])),
-                        "version": str(data.get("version", "") or ""),
-                        "status": "online",
-                        "role": "agent",
-                    }
-                    if agent_url:
-                        new_peer["url"] = agent_url
-                    peers.append(new_peer)
+                    append_ui_log(f"peer-push | rejected unregistered agent {peer_id}")
+                    self._reply_peer_json(
+                        {"error": "peer not registered on master", "rejected": True},
+                        403,
+                    )
+                    return
+                data["received_at"] = int(time.time())
+                _save_peer_snapshot(peer_id, data)
                 cfg["peers"] = peers
                 save_config(cfg, reapply_cron=False)
                 append_ui_log(f"peer-push | received from {data.get('instance_name', peer_id)} | monitors={len(data.get('monitors', []))}")
