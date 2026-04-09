@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0031"
+VERSION = "1.6.0-0032"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1030,6 +1030,29 @@ def _registered_peer_instance_ids(cfg: Dict[str, Any]) -> set[str]:
         pid = str(p.get("instance_id", "") or "").strip()
         if _is_valid_peer_instance_id(pid):
             out.add(pid)
+    return out
+
+
+def _dedupe_peers_by_instance_id(peers: Any) -> List[Dict[str, Any]]:
+    """Collapse duplicate peer rows sharing the same instance_id (keeps most recently seen)."""
+    if not isinstance(peers, list):
+        return []
+    valid: List[Dict[str, Any]] = []
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("instance_id", "") or "").strip()
+        if _is_valid_peer_instance_id(pid):
+            valid.append(p)
+    valid.sort(key=lambda x: int(x.get("last_seen", 0) or 0), reverse=True)
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for p in valid:
+        pid = str(p.get("instance_id", "") or "").strip()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(p)
     return out
 
 
@@ -4936,6 +4959,33 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
     else:
         token_section = ""  # standalone: no peering token
 
+    peer_cleanup_html = ""
+    if role == "master":
+        reg_ids = sorted(_registered_peer_instance_ids(cfg))
+        id_lines = ", ".join(html.escape(i) for i in reg_ids) if reg_ids else html.escape("(none)")
+        peer_cleanup_html = f"""
+        <div style="margin-top:14px;padding:12px;border:1px solid rgba(245,158,11,.28);border-radius:10px;background:rgba(245,158,11,.07);">
+          <strong style="font-size:13px;">Peering cleanup</strong>
+          <div class="muted" style="margin-top:6px;font-size:11px;line-height:1.45;">
+            Remove stale agents from Overview / Create Monitor, delete leftover snapshot files, or merge duplicate peer rows.
+            Configured instance IDs: <code style="font-size:10px;word-break:break-word;">{id_lines}</code>
+          </div>
+          <div class="button-row" style="margin-top:10px;flex-wrap:wrap;gap:8px;">
+            <form method="post" action="/peer/prune-orphan-snapshots" style="margin:0;" onsubmit="return confirm('Delete cached snapshot files for any instance ID not in the list above?');">
+              <button type="submit">Prune orphan snapshot files</button>
+            </form>
+            <form method="post" action="/peer/dedupe-peers" style="margin:0;">
+              <button type="submit">Deduplicate peer list</button>
+            </form>
+          </div>
+          <form method="post" action="/peer/remove" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;" onsubmit="return confirm('Remove this instance ID from configuration and delete its cache file?');">
+            <label class="muted" style="font-size:12px;margin:0;">Remove by instance ID</label>
+            <input name="peer_id" placeholder="Paste full instance UUID" style="min-width:220px;flex:1;max-width:min(100%,420px);">
+            <button type="submit" style="border-color:#ef4444;color:#ef4444;">Remove</button>
+          </form>
+        </div>
+        """
+
     return f"""
       <div class="card" id="peering-card">
         <h3>Multi-Instance Peering</h3>
@@ -4951,6 +5001,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
           {master_peer_actions_html}
           {token_section}
           {agent_fields}
+        {peer_cleanup_html}
         {live_panel_html}
       </div>
     """
@@ -8603,16 +8654,105 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                 form = parse_qs(body, keep_blank_values=True)
                 rm_id = (form.get("peer_id", [""])[0] or "").strip()
+                ssl_warning = self._ssl_warning_text()
+                if not rm_id:
+                    self._reply_html(_render_setup_html(
+                        peering_message="No instance ID provided.",
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
                 cfg = load_config()
                 peers = [p for p in cfg.get("peers", []) if str(p.get("instance_id", "")) != rm_id]
                 cfg["peers"] = peers
+                raw_allow = cfg.get("allow_unknown_update_peers", [])
+                if isinstance(raw_allow, list):
+                    cfg["allow_unknown_update_peers"] = sorted(
+                        str(x or "").strip()
+                        for x in raw_allow
+                        if str(x or "").strip() and str(x or "").strip() != rm_id
+                    )
                 save_config(cfg, reapply_cron=False)
                 snap_file = get_peer_data_dir() / f"{rm_id}.json"
                 _clear_file(snap_file)
                 append_ui_log(f"peer-remove | removed peer {rm_id}")
-                ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
                     peering_message="Peer removed.",
+                    ui_view="settings",
+                    ssl_warning=ssl_warning,
+                ))
+                return
+            if self.path == "/peer/prune-orphan-snapshots":
+                if not self._is_authenticated():
+                    self._reply_json({"error": "unauthorized"}, 401)
+                    return
+                ssl_warning = self._ssl_warning_text()
+                cfg = load_config()
+                if str(cfg.get("peer_role", "") or "").lower() != "master":
+                    self._reply_html(_render_setup_html(
+                        peering_message="Orphan snapshot cleanup is only available in master role.",
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
+                reg = _registered_peer_instance_ids(cfg)
+                d = get_peer_data_dir()
+                removed = 0
+                names: List[str] = []
+                if d.exists():
+                    for p in sorted(d.glob("*.json")):
+                        stem = p.stem
+                        if stem not in reg:
+                            _clear_file(p)
+                            removed += 1
+                            names.append(stem)
+                raw_allow = cfg.get("allow_unknown_update_peers", [])
+                allow_changed = False
+                if isinstance(raw_allow, list):
+                    allow_norm = sorted({str(x or "").strip() for x in raw_allow if str(x or "").strip()})
+                    new_allow = sorted(x for x in allow_norm if x in reg)
+                    if new_allow != allow_norm:
+                        cfg["allow_unknown_update_peers"] = new_allow
+                        allow_changed = True
+                if allow_changed:
+                    save_config(cfg, reapply_cron=False)
+                msg = f"Removed {removed} orphan snapshot file(s)."
+                if names:
+                    show = names[:5]
+                    msg += " (" + ", ".join(show) + ("…" if len(names) > 5 else "") + ")"
+                append_ui_log(f"peer-cleanup | prune orphan snapshots | removed_files={removed}")
+                self._reply_html(_render_setup_html(
+                    peering_message=msg,
+                    ui_view="settings",
+                    ssl_warning=ssl_warning,
+                ))
+                return
+            if self.path == "/peer/dedupe-peers":
+                if not self._is_authenticated():
+                    self._reply_json({"error": "unauthorized"}, 401)
+                    return
+                ssl_warning = self._ssl_warning_text()
+                cfg = load_config()
+                if str(cfg.get("peer_role", "") or "").lower() != "master":
+                    self._reply_html(_render_setup_html(
+                        peering_message="Peer deduplication is only available in master role.",
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
+                old_peers = cfg.get("peers", [])
+                if not isinstance(old_peers, list):
+                    old_peers = []
+                new_peers = _dedupe_peers_by_instance_id(old_peers)
+                if new_peers == old_peers:
+                    msg = "No duplicate peer rows found."
+                else:
+                    cfg["peers"] = new_peers
+                    save_config(cfg, reapply_cron=False)
+                    msg = f"Deduplicated peer list ({len(old_peers)} → {len(new_peers)} entries)."
+                append_ui_log(f"peer-cleanup | dedupe peers | {msg}")
+                self._reply_html(_render_setup_html(
+                    peering_message=msg,
                     ui_view="settings",
                     ssl_warning=ssl_warning,
                 ))
