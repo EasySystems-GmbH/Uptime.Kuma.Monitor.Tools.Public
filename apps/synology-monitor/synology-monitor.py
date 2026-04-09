@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0010"
+VERSION = "1.6.0-0011"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6115,6 +6115,32 @@ def _render_setup_html(
     <script>
       (function () {{
         var bodyMeta = document.body || null;
+        window._syncMonitorModalFields = function () {{
+          var modal = document.getElementById("monitor-modal");
+          if (!modal) return;
+          var modeEl = modal.querySelector("#check_mode");
+          var nameEl = modal.querySelector("#name");
+          var phw = modal.querySelector("#probe-host-wrap");
+          var ppw = modal.querySelector("#probe-port-wrap");
+          var dnw = modal.querySelector("#dns-name-wrap");
+          var dsw = modal.querySelector("#dns-server-wrap");
+          if (!modeEl) return;
+          var m = (modeEl.value || "smart").toLowerCase();
+          var showHost = (m === "ping" || m === "port");
+          var showPort = (m === "port");
+          var showDns = (m === "dns");
+          if (phw) {{ phw.style.display = showHost ? "block" : "none"; var inp = phw.querySelector("input"); if (inp) inp.disabled = !showHost; }}
+          if (ppw) {{ ppw.style.display = showPort ? "block" : "none"; var inp = ppw.querySelector("input"); if (inp) inp.disabled = !showPort; }}
+          if (dnw) {{ dnw.style.display = showDns ? "block" : "none"; var inp = dnw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
+          if (dsw) {{ dsw.style.display = showDns ? "block" : "none"; var inp = dsw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
+          if (nameEl) {{
+            var cur = (nameEl.value || "").trim();
+            var autoNames = ["smart-synology-check","storage-synology-check","ping-synology-check","port-synology-check","dns-synology-check","backup-synology-check","synology-main"];
+            if (!cur || autoNames.indexOf(cur) >= 0) {{
+              nameEl.value = (modeEl.value || "smart") + "-synology-check";
+            }}
+          }}
+        }};
         var uiView = bodyMeta ? (bodyMeta.getAttribute("data-ui-view") || "overview") : "overview";
         var diagView = bodyMeta ? (bodyMeta.getAttribute("data-diag-view") || "logs") : "logs";
         var logFilter = bodyMeta ? (bodyMeta.getAttribute("data-log-filter") || "all") : "all";
@@ -6680,33 +6706,6 @@ def _render_setup_html(
         }}
       }}
 
-      window._syncMonitorModalFields = function () {{
-        var modal = document.getElementById("monitor-modal");
-        if (!modal) return;
-        var modeEl = modal.querySelector("#check_mode");
-        var nameEl = modal.querySelector("#name");
-        var phw = modal.querySelector("#probe-host-wrap");
-        var ppw = modal.querySelector("#probe-port-wrap");
-        var dnw = modal.querySelector("#dns-name-wrap");
-        var dsw = modal.querySelector("#dns-server-wrap");
-        if (!modeEl) return;
-        var m = (modeEl.value || "smart").toLowerCase();
-        var showHost = (m === "ping" || m === "port");
-        var showPort = (m === "port");
-        var showDns = (m === "dns");
-        if (phw) {{ phw.style.display = showHost ? "block" : "none"; var inp = phw.querySelector("input"); if (inp) inp.disabled = !showHost; }}
-        if (ppw) {{ ppw.style.display = showPort ? "block" : "none"; var inp = ppw.querySelector("input"); if (inp) inp.disabled = !showPort; }}
-        if (dnw) {{ dnw.style.display = showDns ? "block" : "none"; var inp = dnw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
-        if (dsw) {{ dsw.style.display = showDns ? "block" : "none"; var inp = dsw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
-        if (nameEl) {{
-          var cur = (nameEl.value || "").trim();
-          var autoNames = ["smart-synology-check","storage-synology-check","ping-synology-check","port-synology-check","dns-synology-check","backup-synology-check","synology-main"];
-          if (!cur || autoNames.indexOf(cur) >= 0) {{
-            nameEl.value = (modeEl.value || "smart") + "-synology-check";
-          }}
-        }}
-      }};
-
       function _injectModal(html) {{
         var doc = new DOMParser().parseFromString(html, "text/html");
         var modal = doc.querySelector(".modal-backdrop.open");
@@ -6721,6 +6720,12 @@ def _render_setup_html(
       function _hookModalSave() {{
         var modal = document.getElementById("monitor-modal");
         if (!modal) return;
+        var checkModeEl = modal.querySelector("#check_mode");
+        if (checkModeEl) {{
+          checkModeEl.onchange = function () {{
+            if (typeof window._syncMonitorModalFields === "function") window._syncMonitorModalFields();
+          }};
+        }}
         if (typeof window._syncMonitorModalFields === "function") window._syncMonitorModalFields();
         var targetEl = modal.querySelector("#target_peer");
         var agentInfo = modal.querySelector("#agent-kuma-info");
@@ -6834,7 +6839,7 @@ def _render_setup_html(
 
       var prevChannelTs = {{}};
       var prevMonitorTs = {{}};
-      var selectedHighlight = "{html.escape(highlight_channel)}";
+      var selectedHighlight = {json.dumps(highlight_channel or "")};
 
       function applyLiveSnapshot(data) {{
         if (!data || !data.channels || !data.monitors) return;
