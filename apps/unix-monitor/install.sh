@@ -881,7 +881,10 @@ EOF
     sudo systemctl enable --now "${SYSTEMD_TIMER_SMART_HELPER}"
     sudo systemctl enable --now "${SYSTEMD_TIMER_BACKUP_HELPER}"
     sudo systemctl enable --now "${SYSTEMD_TIMER_SYSLOG_HELPER}"
-    info "systemd services enabled."
+    # Without this, a reinstall while the machine has been up for a while can leave no run for a long time:
+    # OnBootSec is from *boot*, not from install; OnUnitInactiveSec only applies after a prior service run.
+    sudo systemctl start "${SYSTEMD_SERVICE_SCHED}" 2>/dev/null || true
+    info "systemd services enabled (scheduler oneshot started once to prime the timer)."
 elif [ "${SCHED_BACKEND}" = "cron" ]; then
     info "Config set to cron fallback. Enable cron schedule from script menu."
 fi
