@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0037"
+VERSION = "1.6.0-0038"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -91,6 +91,7 @@ INTERVAL_MAX = 1440
 CHECK_MODES = ("mount", "smart", "storage", "ping", "port", "dns", "backup")
 PEER_ROLES = ("standalone", "agent", "master")
 PEER_HEALTH_TIMEOUT_SEC = 180
+PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC = 120
 BACK_KEYS = ("0", "b", "back", "q", "quit")
 CHANGES_NOTICE = "  Changes are not saved until you confirm (Save/Apply)."
 ALLOWED_SCHEMES = ("https", "http")
@@ -1687,6 +1688,32 @@ def _trigger_peer_sync_bg(cfg: Dict[str, Any]) -> None:
         except Exception as exc:
             append_ui_log(f"peer-sync | auto error: {type(exc).__name__}: {exc}")
     threading.Thread(target=_do_sync, daemon=True).start()
+
+
+def _agent_peer_should_push(cfg: Dict[str, Any]) -> bool:
+    """True if this instance is an agent with enough config to push snapshots to the master."""
+    return (
+        str(cfg.get("peer_role", "") or "").lower() == "agent"
+        and bool(str(cfg.get("peer_master_url", "") or "").strip())
+        and bool(str(cfg.get("peering_token", "") or "").strip())
+    )
+
+
+def _agent_peer_heartbeat_loop() -> None:
+    """Background loop while the setup UI runs: push to master on an interval so the master stays 'online' after reboot."""
+    time.sleep(5)
+    while True:
+        try:
+            cfg = load_config()
+            if not _agent_peer_should_push(cfg):
+                time.sleep(30)
+                continue
+            interval = int(cfg.get("peer_agent_push_interval_sec", PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC) or PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC)
+            interval = max(30, min(interval, 3600))
+            _trigger_peer_sync_bg(cfg)
+            time.sleep(interval)
+        except Exception:
+            time.sleep(60)
 
 
 def _fetch_agent_diag(
@@ -11480,6 +11507,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
     else:
         print(f"Setup UI running on http://{host}:{port}")
     print("Press Ctrl+C to stop.")
+    threading.Thread(target=_agent_peer_heartbeat_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -11495,7 +11523,13 @@ def run_scheduled() -> int:
     cfg_path = str(get_config_path())
     runtime_dir = str(get_runtime_data_dir())
     if not monitors:
-        append_ui_log(f"scheduled-run | skipped | no monitors | cfg={cfg_path} | data_dir={runtime_dir}")
+        if _agent_peer_should_push(cfg):
+            append_ui_log(
+                f"scheduled-run | no monitors | agent peer push | cfg={cfg_path} | data_dir={runtime_dir}"
+            )
+            _trigger_peer_sync_bg(cfg)
+        else:
+            append_ui_log(f"scheduled-run | skipped | no monitors | cfg={cfg_path} | data_dir={runtime_dir}")
         return 0
     global_cron = bool(cfg.get("cron_enabled", False))
     global_interval = int(cfg.get("cron_interval_minutes", 60) or 60)
@@ -11559,6 +11593,7 @@ def run_scheduled() -> int:
             _touch_scheduled_run(monitor_name=name)
     if ran_any:
         _touch_scheduled_run()
+    if ran_any or _agent_peer_should_push(cfg):
         _trigger_peer_sync_bg(cfg)
     append_ui_log(
         "scheduled-run | done | "
