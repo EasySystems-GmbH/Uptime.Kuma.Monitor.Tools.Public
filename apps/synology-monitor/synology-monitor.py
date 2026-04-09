@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0018"
+VERSION = "1.6.0-0019"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6405,6 +6405,25 @@ def _render_setup_html(
         }}
         var postForms = document.querySelectorAll("form[method='post'], form[method='POST']");
         postForms.forEach(function(form) {{ ensureUiViewField(form); }});
+        document.addEventListener("submit", function (ev) {{
+          var form = ev && ev.target ? ev.target : null;
+          if (!form || !form.getAttribute) return;
+          if ((form.getAttribute("action") || "") !== "/auth/import") return;
+          if ((form.getAttribute("method") || "").toLowerCase() !== "post") return;
+          var ta = form.querySelector("textarea[name='import_payload']");
+          var keyIn = form.querySelector("input[name='backup_key']");
+          var raw = (ta && ta.value ? ta.value : "").trim();
+          var key = (keyIn && keyIn.value ? keyIn.value : "").trim();
+          if (!raw) return;
+          try {{
+            var j = JSON.parse(raw);
+            if (j && typeof j.enc === "string" && j.enc.length > 0 && !key) {{
+              ev.preventDefault();
+              ev.stopImmediatePropagation();
+              alert("Encrypted backup requires the decryption key.");
+            }}
+          }} catch (e) {{}}
+        }}, true);
         var SERVER_PANEL_STATE_KEY = "synology_monitor_open_server_panel";
         function setOpenServerPanelKey(key) {{
           try {{
@@ -8900,6 +8919,15 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     if isinstance(bk, bytes):
                         bk = bk.decode("utf-8", errors="ignore")
                     form = {"import_payload": [str(raw_payload or "")], "backup_key": [str(bk or "")]}
+                    for _ctx in ("ui_view", "diag_view", "log_filter", "log_date", "log_time_scope", "log_time_from", "log_time_to", "source", "log_source", "server_panel"):
+                        if _ctx in fs:
+                            try:
+                                _v = fs.getvalue(_ctx)
+                                if isinstance(_v, bytes):
+                                    _v = _v.decode("utf-8", errors="ignore")
+                                form[_ctx] = [str(_v or "")]
+                            except Exception:
+                                pass
                     if "import_file" in fs:
                         up = fs["import_file"]
                         if getattr(up, "file", None):
@@ -8913,6 +8941,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
+                ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                 if self.path == "/auth/logout":
                     self._redirect(
                         "/auth/login",
@@ -9169,7 +9198,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     if not isinstance(parsed, dict):
                         self._reply_html(_render_setup_html(error="Import payload must be a JSON object.", ui_view=ui_view, ssl_warning=ssl_warning))
                         return
-                    if parsed.get("enc") and parsed.get("v"):
+                    enc_blob = str(parsed.get("enc", "") or "").strip()
+                    if enc_blob:
                         backup_key = (form.get("backup_key", [""])[0] or "").strip()
                         if not backup_key:
                             self._reply_html(_render_setup_html(
@@ -9178,7 +9208,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                                 ssl_warning=ssl_warning,
                             ))
                             return
-                        dec = _decrypt_backup(str(parsed.get("enc", "")), backup_key)
+                        dec = _decrypt_backup(enc_blob, backup_key)
                         if dec is None:
                             self._reply_html(_render_setup_html(
                                 error="Decryption failed. Wrong key or corrupted backup.",
