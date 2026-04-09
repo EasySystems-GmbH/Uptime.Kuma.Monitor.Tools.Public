@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0015"
+VERSION = "1.6.0-0017"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -7246,7 +7246,7 @@ def _render_setup_html(
               if (m && mContent) {{
                 var overviewPath = "/?view=overview";
                 mContent.innerHTML = "<p class='err'>Update failed: " + escapeHtml(String(e)) + "</p>"
-                  + "<p style='margin-top:12px;'><button type='button' class='close-link' onclick=\"window.location.href='" + overviewPath + "'\">Return to overview</button></p>";
+                  + "<p style='margin-top:12px;'><button type='button' class='close-link' onclick='window.location.href=\\\"" + overviewPath + "\\\"'>Return to overview</button></p>";
               }} else {{
                 location.reload();
               }}
