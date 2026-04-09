@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0009"
+VERSION = "1.6.0-0010"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6726,7 +6726,7 @@ def _render_setup_html(
           <div class="row">
             <div>
               <label>Check Mode</label>
-              <select id="check_mode" name="check_mode">
+              <select id="check_mode" name="check_mode" onchange="window._syncMonitorModalFields&amp;&amp;window._syncMonitorModalFields()">
                 <option value="smart" {"selected" if current_mode == "smart" else ""}>smart</option>
                 <option value="storage" {"selected" if current_mode == "storage" else ""}>storage</option>
                 <option value="ping" {"selected" if current_mode == "ping" else ""}>ping</option>
@@ -7233,34 +7233,6 @@ def _render_setup_html(
             btn.disabled = false;
           }}
         }}, true);
-        var modeEl = document.getElementById("check_mode");
-        var nameEl = document.getElementById("name");
-        var probeHostWrap = document.getElementById("probe-host-wrap");
-        var probePortWrap = document.getElementById("probe-port-wrap");
-        var dnsNameWrap = document.getElementById("dns-name-wrap");
-        var dnsServerWrap = document.getElementById("dns-server-wrap");
-        if (modeEl && nameEl) {{
-          function toggleProbeFields() {{
-            var selected = modeEl.value || "smart";
-            var showHost = (selected === "ping" || selected === "port");
-            var showPort = (selected === "port");
-            var showDns = (selected === "dns");
-            if (probeHostWrap) {{ probeHostWrap.style.display = showHost ? "block" : "none"; var inp = probeHostWrap.querySelector("input"); if (inp) inp.disabled = !showHost; }}
-            if (probePortWrap) {{ probePortWrap.style.display = showPort ? "block" : "none"; var inp = probePortWrap.querySelector("input"); if (inp) inp.disabled = !showPort; }}
-            if (dnsNameWrap) {{ dnsNameWrap.style.display = showDns ? "block" : "none"; var inp = dnsNameWrap.querySelector("input"); if (inp) inp.disabled = !showDns; }}
-            if (dnsServerWrap) {{ dnsServerWrap.style.display = showDns ? "block" : "none"; var inp = dnsServerWrap.querySelector("input"); if (inp) inp.disabled = !showDns; }}
-          }}
-          function autoName() {{
-            var selected = modeEl.value || "smart";
-            var defaultName = selected + "-unix-check";
-            var current = (nameEl.value || "").trim();
-            var known = ["smart-unix-check", "storage-unix-check", "ping-unix-check", "port-unix-check", "dns-unix-check", "backup-unix-check", "unix-main"];
-            if (!current || known.indexOf(current) >= 0) nameEl.value = defaultName;
-            toggleProbeFields();
-          }}
-          modeEl.addEventListener("change", autoName);
-          autoName();
-        }}
 
       var zoomWraps = document.querySelectorAll(".zoom-wrap");
       zoomWraps.forEach(function (wrap) {{
@@ -7444,6 +7416,33 @@ def _render_setup_html(
         }}
       }}
 
+      window._syncMonitorModalFields = function () {{
+        var modal = document.getElementById("monitor-modal");
+        if (!modal) return;
+        var modeEl = modal.querySelector("#check_mode");
+        var nameEl = modal.querySelector("#name");
+        var phw = modal.querySelector("#probe-host-wrap");
+        var ppw = modal.querySelector("#probe-port-wrap");
+        var dnw = modal.querySelector("#dns-name-wrap");
+        var dsw = modal.querySelector("#dns-server-wrap");
+        if (!modeEl) return;
+        var m = (modeEl.value || "smart").toLowerCase();
+        var showHost = (m === "ping" || m === "port");
+        var showPort = (m === "port");
+        var showDns = (m === "dns");
+        if (phw) {{ phw.style.display = showHost ? "block" : "none"; var inp = phw.querySelector("input"); if (inp) inp.disabled = !showHost; }}
+        if (ppw) {{ ppw.style.display = showPort ? "block" : "none"; var inp = ppw.querySelector("input"); if (inp) inp.disabled = !showPort; }}
+        if (dnw) {{ dnw.style.display = showDns ? "block" : "none"; var inp = dnw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
+        if (dsw) {{ dsw.style.display = showDns ? "block" : "none"; var inp = dsw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
+        if (nameEl) {{
+          var cur = (nameEl.value || "").trim();
+          var autoNames = ["smart-unix-check","storage-unix-check","ping-unix-check","port-unix-check","dns-unix-check","backup-unix-check","unix-main"];
+          if (!cur || autoNames.indexOf(cur) >= 0) {{
+            nameEl.value = (modeEl.value || "smart") + "-unix-check";
+          }}
+        }}
+      }};
+
       function _injectModal(html) {{
         var doc = new DOMParser().parseFromString(html, "text/html");
         var modal = doc.querySelector(".modal-backdrop.open");
@@ -7458,36 +7457,7 @@ def _render_setup_html(
       function _hookModalSave() {{
         var modal = document.getElementById("monitor-modal");
         if (!modal) return;
-        var modeEl = modal.querySelector("#check_mode");
-        var phw = modal.querySelector("#probe-host-wrap");
-        var ppw = modal.querySelector("#probe-port-wrap");
-        var dnw = modal.querySelector("#dns-name-wrap");
-        var dsw = modal.querySelector("#dns-server-wrap");
-        function _toggleFields() {{
-          if (!modeEl) return;
-          var m = modeEl.value || "smart";
-          var showHost = (m === "ping" || m === "port");
-          var showPort = (m === "port");
-          var showDns = (m === "dns");
-          if (phw) {{ phw.style.display = showHost ? "block" : "none"; var inp = phw.querySelector("input"); if (inp) inp.disabled = !showHost; }}
-          if (ppw) {{ ppw.style.display = showPort ? "block" : "none"; var inp = ppw.querySelector("input"); if (inp) inp.disabled = !showPort; }}
-          if (dnw) {{ dnw.style.display = showDns ? "block" : "none"; var inp = dnw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
-          if (dsw) {{ dsw.style.display = showDns ? "block" : "none"; var inp = dsw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
-        }}
-        var nameEl = modal.querySelector("#name");
-        var autoNames = ["smart-unix-check","storage-unix-check","ping-unix-check","port-unix-check","dns-unix-check","backup-unix-check","unix-main"];
-        function _autoName() {{
-          if (!modeEl || !nameEl) return;
-          var cur = (nameEl.value || "").trim();
-          if (!cur || autoNames.indexOf(cur) >= 0) {{
-            nameEl.value = (modeEl.value || "smart") + "-unix-check";
-          }}
-          _toggleFields();
-        }}
-        if (modeEl) {{
-          modeEl.addEventListener("change", _autoName);
-          _autoName();
-        }}
+        if (typeof window._syncMonitorModalFields === "function") window._syncMonitorModalFields();
         var targetEl = modal.querySelector("#target_peer");
         var agentInfo = modal.querySelector("#agent-kuma-info");
         function _onTarget() {{
