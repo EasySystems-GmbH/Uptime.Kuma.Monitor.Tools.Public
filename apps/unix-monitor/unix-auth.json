@@ -1,0 +1,12 @@
+{
+  "auth_initialized": false,
+  "password_hash": "",
+  "totp_secret": "",
+  "recovery_hashes": [],
+  "failed_attempts": 0,
+  "lockout_until": 0,
+  "last_login_ip": "",
+  "last_login_at": 0,
+  "login_history": [],
+  "session_secret": "cdd330d68128d6a73054a6f67e3c7cf808688358036885d1e9e575b9bca9861e"
+}

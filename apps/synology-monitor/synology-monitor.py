@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0007"
+VERSION = "1.6.0-0008"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5611,7 +5611,8 @@ def _render_setup_html(
     first_start = (len(monitors) == 0 and len(history) == 0)
     show_guide_button = (not elevated_ok) or first_start
     setup_header_action = (
-        "<button onclick=\"openModal('/open-setup-popup',this)\">Elevation access guide</button>"
+        "<form method='post' action='/open-setup-popup' style='display:inline;margin:0;'>"
+        "<button type='submit'>Elevation access guide</button></form>"
         if show_guide_button
         else ""
     )
@@ -5690,7 +5691,9 @@ def _render_setup_html(
         <h3>Monitor Setup</h3>
         <div class="button-row">{setup_header_action}</div>
         <div class="muted">Create, edit, and delete monitors from this view.</div>
-        <button onclick="openModal('/open-create', this)" style="margin-top:10px;">Create monitor</button>
+        <form method="post" action="/open-create" style="margin-top:10px;">
+          <button type="submit">Create monitor</button>
+        </form>
       </div>
       <div class="card"><h3>Local Monitors <span class="badge muted-badge">{len(local_cards)}</span></h3><div class="monitor-grid">{local_monitors_html}</div></div>
       {remote_monitors_html}
@@ -6644,27 +6647,7 @@ def _render_setup_html(
         }}
       }}
 
-      async function openModal(url, btn) {{
-        var orig = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = orig + "…";
-        try {{
-          var r = await fetch(url, {{
-            method: "POST",
-            headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
-            body: ""
-          }});
-          if (r.ok) _injectModal(await r.text());
-        }} catch (e) {{
-          /* ignore */
-        }} finally {{
-          btn.disabled = false;
-          btn.textContent = orig;
-        }}
-      }}
-
       window.monitorAction = monitorAction;
-      window.openModal = openModal;
 
       function _updatePageFromResponse(txt) {{
         var doc = new DOMParser().parseFromString(txt, "text/html");
