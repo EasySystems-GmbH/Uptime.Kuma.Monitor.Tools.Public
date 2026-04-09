@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0012"
+VERSION = "1.6.0-0013"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -7205,18 +7205,21 @@ def _render_setup_html(
             var errMsg = (data && data.error) ? String(data.error) : "Failed to start update";
             var diagLines = ["HTTP " + r.status, "Error: " + errMsg];
             if (data && data.diagnostic) diagLines.push("", data.diagnostic);
-            else if (rawText && rawText.length > 0) diagLines.push("", "Response: " + (rawText.length < 400 ? rawText.replace(/\\n/g, " ").trim() : rawText.substring(0, 300) + "..."));
+            else if (rawText && rawText.length > 0) {{
+              var respSnippet = rawText.length < 400 ? rawText.replace(/\\n/g, " ").trim() : rawText.substring(0, 300) + "...";
+              diagLines.push("", "Response: " + respSnippet);
+            }}
             var diagBlock = "<div style='margin-top:10px;padding:10px;background:#0b1321;border:1px solid #283852;border-radius:8px;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;'>" + escapeHtml(diagLines.join("\\n")) + "</div>";
             if (!r.ok || !data || data.error) {{
               mContent.innerHTML = "<p class='err'>" + escapeHtml(errMsg) + "</p>" + diagBlock;
-              mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
+              mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
               btn.disabled = false;
               return;
             }}
             var sessionId = data.session_id;
             if (!sessionId) {{
               mContent.innerHTML = "<p class='err'>No session ID returned</p>";
-              mContent.innerHTML += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
+              mContent.innerHTML += "<p><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
               btn.disabled = false;
               return;
             }}
@@ -7228,10 +7231,13 @@ def _render_setup_html(
                 var sdata = sr.ok && sraw ? (function() {{ try {{ return JSON.parse(sraw); }} catch(e) {{ return {{}}; }} }})() : {{}};
                 if (sdata.error && !sdata.log) {{
                   var sdiagLines = ["HTTP " + sr.status, "Error: " + (sdata.error || "unknown")];
-                  if (sraw && sraw.length > 0) sdiagLines.push("", "Response: " + (sraw.length < 400 ? sraw.replace(/\\n/g, " ").trim() : sraw.substring(0, 300) + "..."));
+                  if (sraw && sraw.length > 0) {{
+                    var srespSnippet = sraw.length < 400 ? sraw.replace(/\\n/g, " ").trim() : sraw.substring(0, 300) + "...";
+                    sdiagLines.push("", "Response: " + srespSnippet);
+                  }}
                   var sdiagBlock = "<div style='margin-top:10px;padding:10px;background:#0b1321;border:1px solid #283852;border-radius:8px;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;'>" + escapeHtml(sdiagLines.join("\\n")) + "</div>";
                   mContent.innerHTML = "<p class='err'>" + escapeHtml(sdata.error) + "</p>" + sdiagBlock;
-                  mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
+                  mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
                   clearInterval(pollInterval);
                   btn.disabled = false;
                   return;
@@ -7246,7 +7252,7 @@ def _render_setup_html(
                 if (stage === "done" || stage === "failed") {{
                   clearInterval(pollInterval);
                   html += (stage === "done" ? "<p class='ok'>Update complete. Agent may restart.</p>" : "<p class='err'>Update failed.</p>");
-                  html += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
+                  html += "<p><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
                   mContent.innerHTML = html;
                   btn.disabled = false;
                   if (stage === "done") setTimeout(function() {{ refreshLive && refreshLive(); }}, 3000);
@@ -7257,7 +7263,7 @@ def _render_setup_html(
             }}, 600);
           }} catch (e) {{
             mContent.innerHTML = "<p class='err'>" + escapeHtml(String(e)) + "</p>";
-            mContent.innerHTML += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
+            mContent.innerHTML += "<p><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
             btn.disabled = false;
           }}
         }}, true);
@@ -7344,8 +7350,9 @@ def _render_setup_html(
       function tsText(ts) {{
         if (!ts) return "never";
         var d = new Date(ts * 1000);
-        return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0")
-          + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") + ":" + String(d.getSeconds()).padStart(2, "0");
+        function p2(n) {{ n = String(n); return n.length < 2 ? "0" + n : n; }}
+        return d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate())
+          + " " + p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
       }}
       function escapeHtml(s) {{
         return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
