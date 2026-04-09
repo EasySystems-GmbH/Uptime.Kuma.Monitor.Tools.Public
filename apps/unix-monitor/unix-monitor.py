@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0004"
+VERSION = "1.6.0-0006"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1338,6 +1338,7 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
     instance_name = str(cfg.get("instance_name", "") or "").strip() or instance_id[:8]
     history = _load_history()
     state = _load_monitor_state()
+    auth = _load_auth_state()
     monitors_cfg = cfg.get("monitors", [])
     cb_host, cb_port = _parse_peer_host_port(
         cfg.get("agent_callback_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
