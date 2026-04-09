@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0011"
+VERSION = "1.6.0-0012"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5566,8 +5566,10 @@ def _render_setup_html(
     peers_list = cfg.get("peers", []) if is_master else []
     if not isinstance(peers_list, list):
         peers_list = []
+    # Master: show "Target Instance" only when at least one peer exists (remote create). Standalone/agent: never show.
+    show_monitor_target_selector = bool(is_master and peers_list and not edit_original_name)
     target_options = ""
-    if is_master and peers_list and not edit_original_name:
+    if show_monitor_target_selector:
         target_options = "<option value='local' selected>Local (this instance)</option>"
         seen_target_ids: set[str] = set()
         for tp in peers_list:
@@ -6003,7 +6005,7 @@ def _render_setup_html(
     }}
   </style>
 </head>
-<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-date="{html.escape(log_date_norm)}" data-log-time-scope="{html.escape(log_time_norm)}" data-log-time-from="{html.escape(log_time_from_norm)}" data-log-time-to="{html.escape(log_time_to_norm)}" data-log-word="{html.escape(log_word_norm)}" data-log-source="{html.escape(source_label)}" data-form-error="{('1' if error and modal_open else '0')}" data-monitor-modal-open="{('1' if modal_open else '0')}">
+<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-date="{html.escape(log_date_norm)}" data-log-time-scope="{html.escape(log_time_norm)}" data-log-time-from="{html.escape(log_time_from_norm)}" data-log-time-to="{html.escape(log_time_to_norm)}" data-log-word="{html.escape(log_word_norm)}" data-log-source="{html.escape(source_label)}" data-peer-role="{html.escape(peer_role)}" data-show-monitor-target="{('1' if show_monitor_target_selector else '0')}" data-form-error="{('1' if error and modal_open else '0')}" data-monitor-modal-open="{('1' if modal_open else '0')}">
   <div class="container">
     <div class="card">
       <div class="brand-head">
@@ -6023,7 +6025,7 @@ def _render_setup_html(
         <h3>{html.escape(modal_title)}</h3>
         <form method="post" action="/save" novalidate id="monitor-form">
           <input type="hidden" name="edit_original_name" value="{html.escape(edit_original_name)}">
-          {"<div id='target-peer-wrap'><label>Target Instance</label><select id='target_peer' name='target_peer' onchange='window._onTargetChange && window._onTargetChange()'>" + target_options + "</select><div id='agent-kuma-info' class='muted' style='margin-top:4px;display:none;border:1px solid rgba(47,128,237,.3);background:rgba(47,128,237,.08);border-radius:6px;padding:6px 10px;font-size:12px;'>Kuma Push URL will be added to this master. The master pushes status to Kuma on behalf of the agent.</div></div>" if target_options else ""}
+          {"<div id='target-peer-wrap'><label>Target Instance</label><select id='target_peer' name='target_peer' onchange='window._onTargetChange && window._onTargetChange()'>" + target_options + "</select><div id='agent-kuma-info' class='muted' style='margin-top:4px;display:none;border:1px solid rgba(47,128,237,.3);background:rgba(47,128,237,.08);border-radius:6px;padding:6px 10px;font-size:12px;'>Kuma Push URL will be added to this master. The master pushes status to Kuma on behalf of the agent.</div></div>" if show_monitor_target_selector else ""}
           <label>Monitor Name <span class="required-asterisk">*</span></label>
           <input id="name" name="name" value="{html.escape(current_name)}" required minlength="2" placeholder="e.g. smart-synology-check">
           <label>Kuma Push URL <span class="required-asterisk">*</span></label>
@@ -6671,7 +6673,7 @@ def _render_setup_html(
               if (wantMonitorOpen) mm.classList.add("open");
               else mm.classList.remove("open");
             }}
-            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-date", "data-log-time-scope", "data-log-time-from", "data-log-time-to", "data-log-word", "data-log-source", "data-form-error", "data-monitor-modal-open"].forEach(function(attr) {{
+            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-date", "data-log-time-scope", "data-log-time-from", "data-log-time-to", "data-log-word", "data-log-source", "data-peer-role", "data-show-monitor-target", "data-form-error", "data-monitor-modal-open"].forEach(function(attr) {{
               var v = newBody.getAttribute(attr);
               if (v !== null) document.body.setAttribute(attr, v);
             }});
@@ -9735,6 +9737,18 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
 
                 cfg = load_config()
                 target_peer = (form.get("target_peer", ["local"])[0] or "local").strip()
+                save_role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+                if save_role != "master" or edit_original_name:
+                    target_peer = "local"
+                elif target_peer != "local":
+                    _allowed_tp = False
+                    for _p in (cfg.get("peers", []) or []):
+                        _pid = str(_p.get("instance_id", "") or "").strip()
+                        if _pid == target_peer and _is_valid_peer_instance_id(_pid):
+                            _allowed_tp = True
+                            break
+                    if not _allowed_tp:
+                        target_peer = "local"
                 if target_peer and target_peer != "local" and not edit_original_name:
                     agent_monitor_cfg: Dict[str, Any] = {
                         "name": name,
