@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0006"
+VERSION = "1.6.0-0007"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5996,7 +5996,7 @@ def _render_setup_html(
     }}
   </style>
 </head>
-<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-date="{html.escape(log_date_norm)}" data-log-time-scope="{html.escape(log_time_norm)}" data-log-time-from="{html.escape(log_time_from_norm)}" data-log-time-to="{html.escape(log_time_to_norm)}" data-log-word="{html.escape(log_word_norm)}" data-log-source="{html.escape(source_label)}" data-form-error="{('1' if error and modal_open else '0')}">
+<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-date="{html.escape(log_date_norm)}" data-log-time-scope="{html.escape(log_time_norm)}" data-log-time-from="{html.escape(log_time_from_norm)}" data-log-time-to="{html.escape(log_time_to_norm)}" data-log-word="{html.escape(log_word_norm)}" data-log-source="{html.escape(source_label)}" data-form-error="{('1' if error and modal_open else '0')}" data-monitor-modal-open="{('1' if modal_open else '0')}">
   <div class="container">
     <div class="card">
       <div class="brand-head">
@@ -6673,8 +6673,20 @@ def _render_setup_html(
         var curContainer = document.querySelector(".container");
         if (newContainer && curContainer) {{
           curContainer.innerHTML = newContainer.innerHTML;
+          var inContainerModal = curContainer.querySelector("#monitor-modal");
+          if (inContainerModal) {{
+            document.querySelectorAll("#monitor-modal").forEach(function (m) {{
+              if (m !== inContainerModal) m.remove();
+            }});
+          }}
           if (newBody) {{
-            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-date", "data-log-time-scope", "data-log-time-from", "data-log-time-to", "data-log-word", "data-log-source", "data-form-error"].forEach(function(attr) {{
+            var wantMonitorOpen = newBody.getAttribute("data-monitor-modal-open") === "1";
+            var mm = curContainer.querySelector("#monitor-modal");
+            if (mm) {{
+              if (wantMonitorOpen) mm.classList.add("open");
+              else mm.classList.remove("open");
+            }}
+            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-date", "data-log-time-scope", "data-log-time-from", "data-log-time-to", "data-log-word", "data-log-source", "data-form-error", "data-monitor-modal-open"].forEach(function(attr) {{
               var v = newBody.getAttribute(attr);
               if (v !== null) document.body.setAttribute(attr, v);
             }});
