@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0020"
+VERSION = "1.6.0-0021"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -7063,15 +7063,6 @@ def _render_setup_html(
           if (diagSelect) {{
             diagSelect.addEventListener("change", function () {{
               updateDiagFilterAvailability();
-              try {{
-                if (logDiagForm.requestSubmit) {{
-                  logDiagForm.requestSubmit();
-                }} else {{
-                  logDiagForm.submit();
-                }}
-              }} catch (e) {{
-                try {{ logDiagForm.submit(); }} catch (err) {{}}
-              }}
             }});
           }}
           updateDiagFilterAvailability();
