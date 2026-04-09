@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0032"
+VERSION = "1.6.0-0033"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5554,15 +5554,61 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
     peer_cleanup_html = ""
     if role == "master":
         reg_ids = sorted(_registered_peer_instance_ids(cfg))
-        id_lines = ", ".join(html.escape(i) for i in reg_ids) if reg_ids else html.escape("(none)")
+        peers_by_id: Dict[str, Dict[str, Any]] = {}
+        for p in (cfg.get("peers", []) or []):
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("instance_id", "") or "").strip()
+            if _is_valid_peer_instance_id(pid):
+                peers_by_id[pid] = p
+        peer_cleanup_rows = ""
+        _rm_btn_style = (
+            "padding:6px 12px;font-size:12px;border:1px solid #ef4444;color:#ef4444;"
+            "background:transparent;border-radius:8px;font-weight:600;cursor:pointer;line-height:1.2;"
+        )
+        for pid in reg_ids:
+            prow = peers_by_id.get(pid, {})
+            pname = str(prow.get("instance_name", "") or "").strip()
+            if pname:
+                name_html = (
+                    f"<div style='font-size:11px;margin-top:4px;color:#b8cae3;'>"
+                    f"<strong>{html.escape(pname)}</strong></div>"
+                )
+            else:
+                name_html = (
+                    "<div class='muted' style='font-size:11px;margin-top:4px;'>"
+                    "No display name saved yet.</div>"
+                )
+            peer_cleanup_rows += (
+                f"<div style='display:flex;align-items:flex-start;gap:8px;margin-top:8px;'>"
+                f"<div style='flex:1;min-width:0;'>"
+                f"<div class='muted' style='font-size:11px;word-break:break-all;'>"
+                f"Instance ID: <code>{html.escape(pid)}</code></div>"
+                f"{name_html}"
+                f"</div>"
+                f"<form method='post' action='/peer/remove' style='margin:0;flex-shrink:0;'>"
+                f"<input type='hidden' name='peer_id' value='{html.escape(pid)}'>"
+                f"<button type='submit' style='{_rm_btn_style}'"
+                f" onclick=\"return confirm('Remove this agent from configuration and delete its cache file?')\">"
+                f"Remove</button></form>"
+                f"</div>"
+            )
+        if not peer_cleanup_rows:
+            peer_cleanup_rows = (
+                "<div class='muted' style='font-size:11px;margin-top:6px;'>No agents in the peer list yet.</div>"
+            )
         peer_cleanup_html = f"""
         <div style="margin-top:14px;padding:12px;border:1px solid rgba(245,158,11,.28);border-radius:10px;background:rgba(245,158,11,.07);">
           <strong style="font-size:13px;">Peering cleanup</strong>
           <div class="muted" style="margin-top:6px;font-size:11px;line-height:1.45;">
             Remove stale agents from Overview / Create Monitor, delete leftover snapshot files, or merge duplicate peer rows.
-            Configured instance IDs: <code style="font-size:10px;word-break:break-word;">{id_lines}</code>
           </div>
-          <div class="button-row" style="margin-top:10px;flex-wrap:wrap;gap:8px;">
+          <div style="margin-top:10px;">
+            <div class="muted" style="font-size:12px;font-weight:600;">Configured peers ({len(reg_ids)})</div>
+            <div class="muted" style="font-size:11px;margin-top:4px;">Each row is one agent; Remove deletes its configuration entry and cached snapshot.</div>
+            {peer_cleanup_rows}
+          </div>
+          <div class="button-row" style="margin-top:12px;flex-wrap:wrap;gap:8px;">
             <form method="post" action="/peer/prune-orphan-snapshots" style="margin:0;" onsubmit="return confirm('Delete cached snapshot files for any instance ID not in the list above?');">
               <button type="submit">Prune orphan snapshot files</button>
             </form>
