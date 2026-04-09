@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0023"
+VERSION = "1.6.0-0025"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6319,29 +6319,14 @@ def _render_setup_html(
         + "<div class='muted'>Update: backs up, downloads latest, validates, replaces. On failure restores previous. Config and data preserved.</div>"
         + "<div class='muted'>" + html.escape(source_scope_text) + "</div></div>"
     )
-    server_action_click_attr = (
-        "onclick=\"var key=this.getAttribute('data-server-action');"
-        "var panel=document.querySelector('.server-action-panel[data-server-panel=\\''+key+'\\']');"
-        "if(!panel)return false;"
-        "var alreadyOpen=panel.classList.contains('open');"
-        "document.querySelectorAll('.server-action-panel.open').forEach(function(p){p.classList.remove('open');});"
-        "if(alreadyOpen){"
-        "try{localStorage.removeItem('unix_monitor_open_server_panel');}catch(e){}"
-        "}else{"
-        "panel.classList.add('open');"
-        "try{localStorage.setItem('unix_monitor_open_server_panel',key);}catch(e){}"
-        "panel.scrollIntoView({behavior:'smooth',block:'nearest'});"
-        "}"
-        "return false;\""
-    )
     server_info_card_html = (
         "<div class='server-info-grid'>"
-        f"<button type='button' {server_action_click_attr} class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(display_source_name)}</strong></button>"
-        f"<button type='button' {server_action_click_attr} class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(display_server_ip)}</strong></button>"
-        f"<button type='button' {server_action_click_attr} class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(display_now_text)}</strong></button>"
-        f"<button type='button' {server_action_click_attr} class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong>{html.escape(display_runtime_version)}</strong></button>"
-        f"<button type='button' {server_action_click_attr} class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(display_last_login_ip)}</strong></button>"
-        f"<button type='button' {server_action_click_attr} class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(display_last_login_at_text)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(display_source_name)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(display_server_ip)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(display_now_text)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong>{html.escape(display_runtime_version)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(display_last_login_ip)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(display_last_login_at_text)}</strong></button>"
         "</div>"
         "<div class='server-action-panels'>"
         f"<div class='card server-action-panel' data-server-panel='name'><h4>Change server name</h4><form method='post' action='/settings/save-instance-name'><label>Instance Name</label><input name='instance_name' value='{html.escape(str(cfg.get('instance_name', '') or ''))}' placeholder='e.g. HQ-NAS'><div class='button-row'><button type='submit'>Save name</button></div></form></div>"
