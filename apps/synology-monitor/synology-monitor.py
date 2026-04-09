@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0021"
+VERSION = "1.6.0-0022"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6620,11 +6620,22 @@ def _render_setup_html(
         document.addEventListener("submit", function(ev) {{
           var form = ev && ev.target ? ev.target : null;
           if (!form || !form.getAttribute) return;
-          if ((form.getAttribute("method") || "get").toLowerCase() !== "post") return;
-          ensureUiViewField(form);
-          try {{
-            sessionStorage.setItem("synmon_scroll_y", String(Math.max(0, Math.round(window.scrollY || 0))));
-          }} catch (e) {{}}
+          var method = (form.getAttribute("method") || "get").toLowerCase();
+          if (method === "post") {{
+            ensureUiViewField(form);
+            try {{
+              sessionStorage.setItem("synmon_scroll_y", String(Math.max(0, Math.round(window.scrollY || 0))));
+            }} catch (e) {{}}
+            return;
+          }}
+          if (method === "get") {{
+            var cls = form.classList;
+            var isDiagNav = (cls && cls.contains("log-diag-filter-form")) || (form.closest && form.closest(".log-diag-toolbar"));
+            if (!isDiagNav) return;
+            try {{
+              sessionStorage.setItem("synmon_scroll_y", String(Math.max(0, Math.round(window.scrollY || 0))));
+            }} catch (e) {{}}
+          }}
         }}, true);
 
       var zoomWraps = document.querySelectorAll(".zoom-wrap");
