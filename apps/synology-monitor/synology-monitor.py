@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0036"
+VERSION = "1.6.0-0037"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1325,6 +1325,40 @@ def _get_mtls_security_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "signing_active": signing_active,
         "has_master_cert": has_master_cert,
     }
+
+
+def _peer_agent_bound_to_master(cfg: Dict[str, Any]) -> bool:
+    """True when an agent has established trust or a successful master sync (role change blocked until released)."""
+    if str(cfg.get("peer_role", "") or "").lower() != "agent":
+        return False
+    sec = _get_mtls_security_status(cfg)
+    if sec.get("has_master_cert"):
+        return True
+    res = str(cfg.get("last_peer_sync_result", "") or "")
+    return res.startswith("OK")
+
+
+def _peer_master_has_registered_agents(cfg: Dict[str, Any]) -> bool:
+    return len(_registered_peer_instance_ids(cfg)) > 0
+
+
+def _peer_role_change_blocked_reason(cfg: Dict[str, Any]) -> str:
+    """Non-empty string if the Role control should be locked; empty if the user may change role."""
+    r = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+    if r == "agent" and _peer_agent_bound_to_master(cfg):
+        return "agent"
+    if r == "master" and _peer_master_has_registered_agents(cfg):
+        return "master"
+    return ""
+
+
+def _peer_agent_release_master_binding(cfg: Dict[str, Any]) -> None:
+    """Clear agent-side master trust and sync markers (keeps token / master host fields)."""
+    d = get_certs_dir()
+    (d / "master.crt").unlink(missing_ok=True)
+    cfg["last_peer_sync"] = 0
+    cfg["last_peer_sync_result"] = ""
+    cfg["last_peer_sync_latency_ms"] = None
 
 
 # --- Payload encryption (AES-GCM) for HTTP safety net ---
@@ -4696,6 +4730,44 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
         sel = "selected" if r == role else ""
         role_opts += f"<option value='{r}' {sel}>{r.capitalize()}</option>"
 
+    role_lock_reason = _peer_role_change_blocked_reason(cfg)
+    role_select_disabled = bool(role_lock_reason)
+    if role_lock_reason == "agent":
+        role_lock_note = (
+            "<div class='muted' style='font-size:11px;margin-top:6px;max-width:560px;line-height:1.45;'>"
+            "Role is locked while this agent is connected to a master (stored master certificate or a successful sync). "
+            "Use <strong>Disconnect from master</strong> below to unlock, then pick another role.</div>"
+        )
+    elif role_lock_reason == "master":
+        role_lock_note = (
+            "<div class='muted' style='font-size:11px;margin-top:6px;max-width:560px;line-height:1.45;'>"
+            "Role is locked while configured peers exist. Remove <strong>every</strong> agent in "
+            "<strong>Peering cleanup</strong> (below in this form) first, then change role.</div>"
+        )
+    else:
+        role_lock_note = ""
+    if role_select_disabled:
+        role_select_block = (
+            f"<input type='hidden' name='peer_role' value='{html.escape(role)}'>"
+            f"<select aria-disabled='true' disabled "
+            f"style='opacity:.65;cursor:not-allowed;' title='Role change is disabled until requirements above are met.'>"
+            f"{role_opts}</select>"
+        )
+    else:
+        role_select_block = f"<select name='peer_role'>{role_opts}</select>"
+    agent_disconnect_html = ""
+    if role == "agent" and _peer_agent_bound_to_master(cfg):
+        agent_disconnect_html = (
+            "<div style='margin-top:10px;padding:10px 12px;border:1px solid rgba(245,158,11,.35);border-radius:8px;"
+            "background:rgba(245,158,11,.06);'>"
+            "<div class='muted' style='font-size:11px;margin-bottom:8px;line-height:1.45;'>"
+            "To switch to Standalone or Master, disconnect first. Your peering token and master host fields are kept.</div>"
+            "<form method='post' action='/peer/agent-disconnect-master' style='margin:0;' "
+            "onsubmit=\"return confirm('Disconnect from master? Clears stored master certificate and last sync status.');\">"
+            "<button type='submit' style='border-color:#f59e0b;color:#f59e0b;background:transparent;'>"
+            "Disconnect from master</button></form></div>"
+        )
+
     live_panel_html = ""
     master_peer_actions_html = ""
     now = int(time.time())
@@ -5133,7 +5205,9 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
         <form method="post" action="/peer/save-settings">
           <div>
             <label>Role</label>
-            <select name="peer_role">{role_opts}</select>
+            {role_select_block}
+            {role_lock_note}
+            {agent_disconnect_html}
           </div>
           {master_peer_actions_html}
           {token_section}
@@ -8721,9 +8795,32 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 form = parse_qs(body, keep_blank_values=True)
                 cfg = load_config()
                 prev_role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
-                role = (form.get("peer_role", ["standalone"])[0] or "standalone").strip().lower()
+                role = (form.get("peer_role", [prev_role])[0] or prev_role).strip().lower()
                 if role not in PEER_ROLES:
-                    role = "standalone"
+                    role = prev_role
+                if role != prev_role:
+                    if prev_role == "agent" and _peer_agent_bound_to_master(cfg):
+                        ssl_warning = self._ssl_warning_text()
+                        self._reply_html(_render_setup_html(
+                            peering_message=(
+                                "Cannot change role while this agent is connected to a master. "
+                                "Use Disconnect from master first."
+                            ),
+                            ui_view="settings",
+                            ssl_warning=ssl_warning,
+                        ))
+                        return
+                    if prev_role == "master" and _peer_master_has_registered_agents(cfg):
+                        ssl_warning = self._ssl_warning_text()
+                        self._reply_html(_render_setup_html(
+                            peering_message=(
+                                "Cannot change role while configured peers exist. "
+                                "Remove all agents in Peering cleanup first."
+                            ),
+                            ui_view="settings",
+                            ssl_warning=ssl_warning,
+                        ))
+                        return
                 cfg["peer_role"] = role
                 _m_raw = (form.get("peer_master_url", [""])[0] or "").strip()
                 _cb_raw = (form.get("agent_callback_url", [""])[0] or "").strip()
@@ -8764,6 +8861,28 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
                     peering_message=f"Peering settings saved.{_extra_msg}",
+                    ui_view="settings",
+                    ssl_warning=ssl_warning,
+                ))
+                return
+            if self.path == "/peer/agent-disconnect-master":
+                if not self._is_authenticated():
+                    self._reply_json({"error": "unauthorized"}, 401)
+                    return
+                cfg = load_config()
+                ssl_warning = self._ssl_warning_text()
+                if str(cfg.get("peer_role", "") or "").lower() != "agent":
+                    self._reply_html(_render_setup_html(
+                        peering_message="Disconnect is only available when role is Agent.",
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
+                _peer_agent_release_master_binding(cfg)
+                save_config(cfg, reapply_cron=False)
+                append_ui_log("peer-settings | agent disconnected from master | trust/sync cleared")
+                self._reply_html(_render_setup_html(
+                    peering_message="Disconnected from master. You can change role when ready.",
                     ui_view="settings",
                     ssl_warning=ssl_warning,
                 ))
