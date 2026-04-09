@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0033"
+VERSION = "1.6.0-0034"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1229,6 +1229,22 @@ def _list_signed_agents() -> List[str]:
     for p in sorted(d.glob("agent-*.crt")):
         agents.append(p.stem.replace("agent-", "", 1))
     return agents
+
+
+def _peer_entry_for_instance_id(cfg: Dict[str, Any], instance_id: str) -> Optional[Dict[str, Any]]:
+    needle = str(instance_id or "").strip()
+    if not needle:
+        return None
+    peers = cfg.get("peers", [])
+    if not isinstance(peers, list):
+        return None
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("instance_id", "") or "").strip()
+        if pid == needle:
+            return p
+    return None
 
 
 def _revoke_agent_cert(agent_id: str) -> str:
@@ -4880,18 +4896,53 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
                 )
             signed = sec["signed_agents"]
             if signed:
-                _agent_certs = "".join(
-                    f"<div style='display:flex;align-items:center;gap:6px;margin-top:4px;'>"
-                    f"<span class='muted' style='font-size:11px;flex:1;'>{html.escape(a)}</span>"
-                    f"<form method='post' action='/peer/revoke-agent-cert' style='margin:0;'>"
-                    f"<input type='hidden' name='agent_id' value='{html.escape(a)}'>"
-                    f"<button type='submit' style='padding:6px 12px;font-size:12px;border:1px solid #ef4444;color:#ef4444;background:transparent;border-radius:8px;font-weight:600;cursor:pointer;line-height:1.2;'"
-                    f" onclick=\"return confirm('Revoke cert for {html.escape(a)}?')\">Revoke</button></form></div>"
-                    for a in signed
-                )
+                _agent_certs = ""
+                for a in signed:
+                    prow = _peer_entry_for_instance_id(cfg, a)
+                    if prow is None:
+                        lbl_html = (
+                            "<div class='muted' style='font-size:11px;margin-top:4px;'>"
+                            "No matching peer row yet (agent must register or push).</div>"
+                        )
+                    else:
+                        pname = str(prow.get("instance_name", "") or "").strip()
+                        purl = str(prow.get("url", "") or "").strip()
+                        url_line = ""
+                        if purl:
+                            url_line = (
+                                f"<div class='muted' style='font-size:11px;margin-top:2px;word-break:break-all;'>"
+                                f"{html.escape(purl)}</div>"
+                            )
+                        if pname:
+                            lbl_html = (
+                                f"<div style='font-size:11px;margin-top:4px;color:#b8cae3;'>"
+                                f"<strong>{html.escape(pname)}</strong></div>"
+                                f"{url_line}"
+                            )
+                        else:
+                            lbl_html = (
+                                "<div class='muted' style='font-size:11px;margin-top:4px;'>"
+                                "No display name saved yet.</div>"
+                                f"{url_line}"
+                            )
+                    _agent_certs += (
+                        f"<div style='display:flex;align-items:flex-start;gap:8px;margin-top:8px;'>"
+                        f"<div style='flex:1;min-width:0;'>"
+                        f"<div class='muted' style='font-size:11px;word-break:break-all;'>"
+                        f"Instance ID: <code>{html.escape(a)}</code></div>"
+                        f"{lbl_html}"
+                        f"</div>"
+                        f"<form method='post' action='/peer/revoke-agent-cert' style='margin:0;flex-shrink:0;'>"
+                        f"<input type='hidden' name='agent_id' value='{html.escape(a)}'>"
+                        f"<button type='submit' style='padding:6px 12px;font-size:12px;border:1px solid #ef4444;color:#ef4444;background:transparent;border-radius:8px;font-weight:600;cursor:pointer;line-height:1.2;'"
+                        f" onclick=\"return confirm('Revoke certificate for this agent?')\">Revoke</button></form>"
+                        f"</div>"
+                    )
                 _sec_actions_master += (
                     f"<div style='margin-top:8px;'>"
                     f"<div class='muted' style='font-size:12px;font-weight:600;'>Signed Agent Certificates ({len(signed)})</div>"
+                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>Each certificate matches the agent instance ID below; "
+                    f"names come from the configured peer list when the agent has registered or pushed.</div>"
                     f"{_agent_certs}"
                     f"</div>"
                 )
