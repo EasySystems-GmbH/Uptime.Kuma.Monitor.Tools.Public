@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0014"
+VERSION = "1.6.0-0015"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6804,6 +6804,74 @@ def _render_setup_html(
           window._syncMonitorModalFields();
         }}, false);
         window._syncMonitorModalFields();
+        var monForm = document.getElementById("monitor-form");
+        if (monForm) {{
+          function _ensureCtxFields(form) {{
+            var b = document.body;
+            if (!b || !form) return;
+            function hid(n, v) {{
+              var inp = form.querySelector("input[name='" + n + "']");
+              if (!inp) {{
+                inp = document.createElement("input");
+                inp.type = "hidden";
+                inp.name = n;
+                form.appendChild(inp);
+              }}
+              inp.value = String(v || "");
+            }}
+            hid("ui_view", b.getAttribute("data-ui-view") || "overview");
+            hid("diag_view", b.getAttribute("data-diag-view") || "logs");
+            hid("log_filter", b.getAttribute("data-log-filter") || "all");
+            hid("log_date", b.getAttribute("data-log-date") || "all");
+            hid("log_time_scope", b.getAttribute("data-log-time-scope") || "all");
+            hid("log_time_from", b.getAttribute("data-log-time-from") || "");
+            hid("log_time_to", b.getAttribute("data-log-time-to") || "");
+            var src = b.getAttribute("data-log-source") || "local";
+            hid("source", src);
+            hid("log_source", src);
+          }}
+          function _showModalErr(msg) {{
+            var err = document.getElementById("monitor-form-error");
+            if (err) {{ err.textContent = msg || ""; err.classList.toggle("show", !!msg); }}
+          }}
+          monForm.addEventListener("submit", function (e) {{
+            _ensureCtxFields(monForm);
+            _showModalErr("");
+            var kuma = (monForm.querySelector("input[name='kuma_url']") || {{}}).value || "";
+            if (!String(kuma).trim()) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Kuma Push URL is required."); return; }}
+            var nm = ((monForm.querySelector("#name") || {{}}).value || "").trim();
+            if (nm.length < 2) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Monitor name must be at least 2 characters."); return; }}
+            var mode = ((monForm.querySelector("#check_mode") || {{}}).value || "smart").toLowerCase();
+            var probeHost = ((monForm.querySelector("input[name='probe_host']") || {{}}).value || "").trim();
+            var probePort = parseInt((monForm.querySelector("input[name='probe_port']") || {{}}).value || "0", 10) || 0;
+            var dnsName = ((monForm.querySelector("input[name='dns_name']") || {{}}).value || "").trim();
+            if (mode === "ping" && !probeHost) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Ping mode requires a probe host."); return; }}
+            if (mode === "port") {{
+              if (!probeHost) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Port mode requires a probe host."); return; }}
+              if (probePort < 1 || probePort > 65535) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Port mode requires a valid TCP port (1-65535)."); return; }}
+            }}
+            if (mode === "dns" && !dnsName) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("DNS mode requires a DNS name/domain."); return; }}
+            var urlCheck = kuma;
+            if (!/^https?:\\/\\//i.test(urlCheck)) urlCheck = "https://" + urlCheck;
+            try {{
+              var pu = new URL(urlCheck);
+              if (!pu.hostname) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Kuma Push URL must include a hostname."); return; }}
+              if (!/^\\/api\\/push\\/[A-Za-z0-9_-]+$/.test(pu.pathname)) {{
+                e.preventDefault(); e.stopImmediatePropagation();
+                _showModalErr("Kuma Push URL path must be /api/push/TOKEN (e.g. https://kuma.example.com/api/push/abc123).");
+                return;
+              }}
+            }} catch (uerr) {{
+              e.preventDefault(); e.stopImmediatePropagation();
+              _showModalErr("Kuma Push URL is invalid.");
+            }}
+          }}, true);
+        }}
+        window.monitorAction = function (url, name, btn) {{
+          var impl = window.__monitorActionImpl;
+          if (typeof impl === "function") return impl(url, name, btn);
+          alert("The page did not finish loading scripts. Refresh the page and try again.");
+        }};
       }})();
     </script>
     <div class="modal-backdrop" id="add-agent-modal">
@@ -6969,9 +7037,11 @@ def _render_setup_html(
           var hasAdvancedAvailable = !!(caps.date || caps.exact || (hasWordControl && caps.word));
           if (advancedDetails && !hasAdvancedAvailable) advancedDetails.removeAttribute("open");
           if (advancedSummary) {{
-            advancedSummary.textContent = hasAdvancedAvailable
-              ? "Advanced filtering"
-              : "Advanced filtering (not available for " + viewLabel + ")";
+            if (hasAdvancedAvailable) {{
+              advancedSummary.textContent = "Advanced filtering";
+            }} else {{
+              advancedSummary.textContent = "Advanced filtering (not available for " + viewLabel + ")";
+            }}
           }}
 
           if (filterNote) {{
@@ -7152,9 +7222,14 @@ def _render_setup_html(
               var m = document.getElementById("update-modal");
               var mContent = document.getElementById("update-modal-content");
               if (m && mContent) {{
-                var status = errEl ? (errEl.textContent || "").trim() : (okEl ? (okEl.textContent || "").trim() : "Update complete.");
+                var status = "Update complete.";
+                if (errEl) status = (errEl.textContent || "").trim();
+                else if (okEl) status = (okEl.textContent || "").trim();
                 var output = preEl ? (preEl.textContent || "").trim() : "";
-                mContent.innerHTML = "<p class='" + (errEl ? "err" : "ok") + "'>" + escapeHtml(status) + "</p>" + (output ? "<pre>" + escapeHtml(output) + "</pre>" : "") + "<p class='muted'>Reloading page in 5 seconds…</p>";
+                var kind = errEl ? "err" : "ok";
+                var preBlock = "";
+                if (output) preBlock = "<pre>" + escapeHtml(output) + "</pre>";
+                mContent.innerHTML = "<p class='" + kind + "'>" + escapeHtml(status) + "</p>" + preBlock + "<p class='muted'>Reloading page in 5 seconds…</p>";
                 setTimeout(function() {{ location.reload(); }}, 5000);
               }} else {{
                 _updatePageFromResponse(txt);
@@ -7169,8 +7244,9 @@ def _render_setup_html(
               var m = document.getElementById("update-modal");
               var mContent = document.getElementById("update-modal-content");
               if (m && mContent) {{
+                var overviewPath = "/?view=overview";
                 mContent.innerHTML = "<p class='err'>Update failed: " + escapeHtml(String(e)) + "</p>"
-                  + "<p style='margin-top:12px;'><button type='button' class='close-link' onclick='window.location.href=\"/?view=overview\"'>Return to overview</button></p>";
+                  + "<p style='margin-top:12px;'><button type='button' class='close-link' onclick=\"window.location.href='" + overviewPath + "'\">Return to overview</button></p>";
               }} else {{
                 location.reload();
               }}
@@ -7403,7 +7479,7 @@ def _render_setup_html(
         }}
       }}
 
-      window.monitorAction = monitorAction;
+      window.__monitorActionImpl = monitorAction;
 
       function _updatePageFromResponse(txt) {{
         var doc = new DOMParser().parseFromString(txt, "text/html");
@@ -7611,9 +7687,11 @@ def _render_setup_html(
           if (gl) gl.textContent = "Last update: " + tsText(ch.ts || 0);
           if (dots) {{
             var hs = Array.isArray(ch.history_statuses) ? ch.history_statuses : [];
-            dots.innerHTML = hs.length
-              ? hs.map(function (s) {{ return "<span class='dot " + statusClass(s) + "'></span>"; }}).join("")
-              : "<span class='muted'>no history</span>";
+            if (hs.length) {{
+              dots.innerHTML = hs.map(function (s) {{ return "<span class='dot " + statusClass(s) + "'></span>"; }}).join("");
+            }} else {{
+              dots.innerHTML = "<span class='muted'>no history</span>";
+            }}
           }}
           if ((prevChannelTs[channel] || 0) !== (ch.ts || 0) && ch.ts) {{
             pulse(gauge || card);
@@ -7695,9 +7773,12 @@ def _render_setup_html(
               var sourcePlatform = String(p.source_platform || "");
               var unknownUpdateAllowed = !!p.unknown_update_allowed;
               var updateBlockReason = p.update_block_reason || "Unknown platform; update blocked by default.";
-              var updateBtn = updateSupported
-                ? "<button type='button' class='agent-update-btn' data-peer-id='" + escapeHtml(p.instance_id || "") + "' data-peer-name='" + escapeHtml(p.instance_name || p.instance_id || "?") + "' style='" + pbs + "'>Update</button>"
-                : "<button type='button' class='agent-update-btn' disabled title='" + escapeHtml(updateBlockReason) + "' style='" + pbs + "opacity:.55;cursor:not-allowed;'>Update</button>";
+              var updateBtn;
+              if (updateSupported) {{
+                updateBtn = "<button type='button' class='agent-update-btn' data-peer-id='" + escapeHtml(p.instance_id || "") + "' data-peer-name='" + escapeHtml(p.instance_name || p.instance_id || "?") + "' style='" + pbs + "'>Update</button>";
+              }} else {{
+                updateBtn = "<button type='button' class='agent-update-btn' disabled title='" + escapeHtml(updateBlockReason) + "' style='" + pbs + "opacity:.55;cursor:not-allowed;'>Update</button>";
+              }}
               var updateOptionsCell = "";
               if (sourcePlatform === "unknown") {{
                 var toggleValue = unknownUpdateAllowed ? "0" : "1";
@@ -7724,9 +7805,12 @@ def _render_setup_html(
               }} else {{
                 updateOptionsCell = "<span class='peer-action-placeholder peer-action-col-update-options' aria-hidden='true'></span>";
               }}
-              var openCell = openUrl
-                ? "<a href='" + escapeHtml(openUrl) + "' target='_blank' rel='noopener noreferrer' style='" + pbs + "text-decoration:none;display:inline-block;text-align:center;'>Open</a>"
-                : "<span class='peer-action-placeholder peer-action-col-open' aria-hidden='true'></span>";
+              var openCell;
+              if (openUrl) {{
+                openCell = "<a href='" + escapeHtml(openUrl) + "' target='_blank' rel='noopener noreferrer' style='" + pbs + "text-decoration:none;display:inline-block;text-align:center;'>Open</a>";
+              }} else {{
+                openCell = "<span class='peer-action-placeholder peer-action-col-open' aria-hidden='true'></span>";
+              }}
               var removeBtn = "<form method='post' action='/peer/remove' style='margin:0;'>"
                 + "<input type='hidden' name='peer_id' value='" + pid + "'>"
                 + "<button type='submit' onclick='return confirm(&#39;Remove this agent?&#39;)' "
@@ -10669,6 +10753,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 raw_len = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                 form = parse_qs(body, keep_blank_values=True)
+                ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
 
                 name = (form.get("name", [""])[0] or "").strip()
                 mode = (form.get("check_mode", ["smart"])[0] or "smart").strip().lower()
@@ -10683,15 +10768,60 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
 
                 if mode not in CHECK_MODES:
                     append_ui_log(f"save-config | invalid mode: {mode}")
-                    self._reply_html(_render_setup_html(error="Invalid check mode", ui_view=ui_view, ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error="Invalid check mode",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
                 if not name:
                     name = f"{mode}-unix-check"
                 if len(name) < 2:
-                    self._reply_html(_render_setup_html(error="Monitor name must be at least 2 characters.", ui_view=ui_view, ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error="Monitor name must be at least 2 characters.",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
                 if not kuma_url.strip():
-                    self._reply_html(_render_setup_html(error="Kuma Push URL is required.", ui_view=ui_view, ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error="Kuma Push URL is required.",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
                 if not kuma_url.startswith(("http://", "https://")):
                     kuma_url = "https://" + kuma_url
@@ -10699,7 +10829,22 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 err = validate_kuma_url(kuma_url)
                 if err:
                     append_ui_log(f"save-config | invalid Kuma URL: {err}")
-                    self._reply_html(_render_setup_html(error=f"Invalid Kuma URL: {err}", ui_view=ui_view, ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error=f"Invalid Kuma URL: {err}",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
                 try:
                     interval = max(INTERVAL_MIN, min(INTERVAL_MAX, int(interval_raw)))
@@ -10710,14 +10855,59 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 except ValueError:
                     probe_port = 0
                 if mode == "ping" and not probe_host:
-                    self._reply_html(_render_setup_html(error="Ping mode requires a probe host.", ui_view="setup", ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error="Ping mode requires a probe host.",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
                 if mode == "port":
                     if not probe_host or probe_port < 1 or probe_port > 65535:
-                        self._reply_html(_render_setup_html(error="Port mode requires valid probe host and TCP port (1-65535).", ui_view="setup", ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                        self._reply_html(
+                            _render_setup_html(
+                                error="Port mode requires valid probe host and TCP port (1-65535).",
+                                ui_view=ui_view,
+                                diag_view=diag_view,
+                                log_filter=log_filter,
+                                log_date=log_date,
+                                log_time_scope=log_time_scope,
+                                log_time_from=log_time_from,
+                                log_time_to=log_time_to,
+                                log_source=log_source,
+                                ssl_warning=ssl_warning,
+                                create_mode=not edit_original_name,
+                                edit_original_name=edit_original_name or None,
+                            )
+                        )
                         return
                 if mode == "dns" and not dns_name:
-                    self._reply_html(_render_setup_html(error="DNS mode requires a DNS name/domain.", ui_view="setup", ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error="DNS mode requires a DNS name/domain.",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
 
                 cfg = load_config()
