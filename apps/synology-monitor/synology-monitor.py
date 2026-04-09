@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0034"
+VERSION = "1.6.0-0036"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -118,6 +118,30 @@ PRODUCT_DESC = (
     "Checks Synology NAS SMART and storage health, provides guided elevated-access setup and diagnostics, "
     "and pushes monitor status to Uptime Kuma."
 )
+
+
+def _normalize_source_platform(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "unix"
+    if "synology" in raw or raw == "dsm":
+        return "synology"
+    return "unix"
+
+
+def _monitor_source_platform(monitor: Dict[str, Any]) -> str:
+    hint = (
+        str(monitor.get("source_platform", "") or "")
+        or str(monitor.get("platform", "") or "")
+        or str(monitor.get("source", "") or "")
+    )
+    if not str(hint or "").strip():
+        return "synology"
+    return _normalize_source_platform(hint)
+
+
+def _check_title_for_platform(source_platform: str) -> str:
+    return "Synology check" if _normalize_source_platform(source_platform) == "synology" else "Unix check"
 
 
 def get_script_path() -> Path:
@@ -3996,8 +4020,8 @@ def run_backup_helper() -> int:
     return 0
 
 
-def _probe_backup() -> Tuple[str, List[str], float]:
-    """Check backup status, reading from root helper cache or direct probing."""
+def _probe_backup(source_platform: str = "synology") -> Tuple[str, List[str], float]:
+    """Check backup status, reading from privileged backup-helper cache or direct probing."""
     t0 = time.time()
     lines: List[str] = []
 
@@ -4067,7 +4091,11 @@ def _probe_backup() -> Tuple[str, List[str], float]:
         return status, lines, latency
 
     # No cache: try direct detection (limited without root)
-    lines.append("WARNING: no root helper cache, direct probe (limited)")
+    is_synology_ctx = _normalize_source_platform(source_platform) == "synology"
+    if is_synology_ctx:
+        lines.append("WARNING: no root helper cache, direct probe (limited)")
+    else:
+        lines.append("WARNING: no backup-helper cache; limited check without elevated privileges")
     try:
         packages = _detect_backup_packages()
         if packages:
@@ -4097,12 +4125,22 @@ def _probe_backup() -> Tuple[str, List[str], float]:
                 lines.append("No backup task entries found in logs")
                 status = "warning"
         else:
-            lines.append("Backup logs not accessible (root helper needed)")
-            lines.append("Run the elevated helper task in DSM Task Scheduler to enable full backup monitoring")
+            if is_synology_ctx:
+                lines.append("Backup logs not accessible (root helper needed)")
+                lines.append("Run the elevated helper task in DSM Task Scheduler to enable full backup monitoring")
+            else:
+                lines.append("Backup logs not accessible without root (Hyper Backup logs are typically root-only)")
+                lines.append(
+                    "Run `sudo unix-monitor.py --run-backup-helper` on a schedule "
+                    "(install.sh can install unix-monitor-backup-helper.service / .timer)"
+                )
             status = "warning" if packages else "up"
     except Exception as exc:
         lines.append(f"Direct probe failed: {type(exc).__name__}: {exc}")
-        lines.append("Root helper needed for full backup monitoring")
+        if is_synology_ctx:
+            lines.append("Root helper needed for full backup monitoring")
+        else:
+            lines.append("Elevated backup helper required for full backup monitoring")
         status = "warning"
 
     latency = round((time.time() - t0) * 1000, 1)
@@ -4223,6 +4261,7 @@ def check_host_with_monitor(mode: str, devices: List[str], monitor: Dict[str, An
     worst = "up"
     max_latency = 0.0
     sections: List[str] = []
+    source_platform = _monitor_source_platform(monitor)
 
     if mode == "smart":
         s_status, s_lines, s_lat = check_smart(devices, debug=debug)
@@ -4267,7 +4306,7 @@ def check_host_with_monitor(mode: str, devices: List[str], monitor: Dict[str, An
         sections.append("DNS:\n" + "\n".join(f"  - {x}" for x in d_lines))
 
     if mode == "backup":
-        b_status, b_lines, b_lat = _probe_backup()
+        b_status, b_lines, b_lat = _probe_backup(source_platform=source_platform)
         max_latency = max(max_latency, b_lat)
         if _severity(b_status) > _severity(worst):
             worst = b_status
@@ -4277,7 +4316,8 @@ def check_host_with_monitor(mode: str, devices: List[str], monitor: Dict[str, An
         sections.append("Backup:\n" + "\n".join(f"  - {x}" for x in b_lines))
 
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    msg = f"Synology check ({mode}) = {worst} @ {now}\n" + "\n".join(sections)
+    check_title = _check_title_for_platform(source_platform)
+    msg = f"{check_title} ({mode}) = {worst} @ {now}\n" + "\n".join(sections)
     return worst, msg, max_latency
 
 

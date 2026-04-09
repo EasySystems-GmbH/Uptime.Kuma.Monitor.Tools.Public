@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0034"
+VERSION = "1.6.0-0036"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -4472,7 +4472,7 @@ def run_backup_helper() -> int:
 
 
 def _probe_backup(source_platform: str = "unix") -> Tuple[str, List[str], float]:
-    """Check backup status, reading from root helper cache or direct probing."""
+    """Check backup status, reading from privileged backup-helper cache or direct probing."""
     t0 = time.time()
     lines: List[str] = []
 
@@ -4542,7 +4542,11 @@ def _probe_backup(source_platform: str = "unix") -> Tuple[str, List[str], float]
         return status, lines, latency
 
     # No cache: try direct detection (limited without root)
-    lines.append("WARNING: no root helper cache, direct probe (limited)")
+    is_synology_ctx = _normalize_source_platform(source_platform) == "synology"
+    if is_synology_ctx:
+        lines.append("WARNING: no root helper cache, direct probe (limited)")
+    else:
+        lines.append("WARNING: no backup-helper cache; limited check without elevated privileges")
     try:
         packages = _detect_backup_packages()
         if packages:
@@ -4572,15 +4576,22 @@ def _probe_backup(source_platform: str = "unix") -> Tuple[str, List[str], float]
                 lines.append("No backup task entries found in logs")
                 status = "warning"
         else:
-            lines.append("Backup logs not accessible (root helper needed)")
-            if _normalize_source_platform(source_platform) == "synology":
+            if is_synology_ctx:
+                lines.append("Backup logs not accessible (root helper needed)")
                 lines.append("Run the elevated helper task in DSM Task Scheduler to enable full backup monitoring")
             else:
-                lines.append("Run the elevated backup helper as root (--run-backup-helper) to enable full backup monitoring")
+                lines.append("Backup logs not accessible without root (Hyper Backup logs are typically root-only)")
+                lines.append(
+                    "Run `sudo unix-monitor.py --run-backup-helper` on a schedule "
+                    "(install.sh can install unix-monitor-backup-helper.service / .timer)"
+                )
             status = "warning" if packages else "up"
     except Exception as exc:
         lines.append(f"Direct probe failed: {type(exc).__name__}: {exc}")
-        lines.append("Root helper needed for full backup monitoring")
+        if is_synology_ctx:
+            lines.append("Root helper needed for full backup monitoring")
+        else:
+            lines.append("Elevated backup helper required for full backup monitoring")
         status = "warning"
 
     latency = round((time.time() - t0) * 1000, 1)
