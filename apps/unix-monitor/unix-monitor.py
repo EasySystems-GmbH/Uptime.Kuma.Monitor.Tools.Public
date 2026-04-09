@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0029"
+VERSION = "1.6.0-0030"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5554,6 +5554,8 @@ def _render_setup_html(
     log_source: str = "local",
     diagnose_agent: bool = False,
     open_server_panel: str = "",
+    export_backup_error: str = "",
+    import_backup_error: str = "",
 ) -> str:
     cfg = load_config()
     browser_instance_name = str(cfg.get("instance_name", "") or "").strip()
@@ -6434,6 +6436,7 @@ def _render_setup_html(
           <div style="margin-top:10px;">
             <a class="close-link" href="/auth/export">Export Backup</a>
           </div>
+          {f"<div class='err' style='margin-top:10px;'>{html.escape(export_backup_error)}</div>" if export_backup_error else ""}
         </div>
         <form method="post" action="/auth/import" enctype="multipart/form-data">
           <label>Import settings backup</label>
@@ -6444,6 +6447,7 @@ def _render_setup_html(
           <textarea name="import_payload" rows="5" style="width:100%;margin-top:6px;box-sizing:border-box;border:1px solid #30405b;border-radius:8px;background:#0f1726;color:#d7e2f0;padding:8px;" placeholder="Paste backup JSON or use file below"></textarea>
           <label>Or import from file</label>
           <input name="import_file" type="file" accept=".json,application/json">
+          {f"<div class='err' style='margin-top:10px;'>{html.escape(import_backup_error)}</div>" if import_backup_error else ""}
           <div class="button-row">
             <button type="submit">Import settings</button>
           </div>
@@ -10001,8 +10005,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     backup_key = (form.get("backup_key", [""])[0] or "").strip()
                     if len(backup_key) < 12:
                         self._reply_html(_render_setup_html(
-                            error="Encryption key must be at least 12 characters. Save this key securely; you need it to restore.",
-                            ui_view=ui_view,
+                            export_backup_error="Encryption key must be at least 12 characters. Save this key securely; you need it to restore.",
+                            ui_view="settings",
                             ssl_warning=ssl_warning,
                         ))
                         return
@@ -10019,8 +10023,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         enc = _encrypt_backup(plaintext, backup_key)
                     except Exception as e:
                         self._reply_html(_render_setup_html(
-                            error=f"Encryption failed: {type(e).__name__}: {e}",
-                            ui_view=ui_view,
+                            export_backup_error=f"Encryption failed: {type(e).__name__}: {e}",
+                            ui_view="settings",
                             ssl_warning=ssl_warning,
                         ))
                         return
@@ -10041,38 +10045,38 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     if not raw and import_file_json:
                         raw = import_file_json
                     if not raw:
-                        self._reply_html(_render_setup_html(error="Import payload is empty. Paste JSON or choose a JSON file.", ui_view=ui_view, ssl_warning=ssl_warning))
+                        self._reply_html(_render_setup_html(import_backup_error="Import payload is empty. Paste JSON or choose a JSON file.", ui_view="settings", ssl_warning=ssl_warning))
                         return
                     try:
                         parsed = json.loads(raw)
                     except json.JSONDecodeError:
-                        self._reply_html(_render_setup_html(error="Import payload is not valid JSON.", ui_view=ui_view, ssl_warning=ssl_warning))
+                        self._reply_html(_render_setup_html(import_backup_error="Import payload is not valid JSON.", ui_view="settings", ssl_warning=ssl_warning))
                         return
                     if not isinstance(parsed, dict):
-                        self._reply_html(_render_setup_html(error="Import payload must be a JSON object.", ui_view=ui_view, ssl_warning=ssl_warning))
+                        self._reply_html(_render_setup_html(import_backup_error="Import payload must be a JSON object.", ui_view="settings", ssl_warning=ssl_warning))
                         return
                     enc_blob = str(parsed.get("enc", "") or "").strip()
                     if enc_blob:
                         backup_key = (form.get("backup_key", [""])[0] or "").strip()
                         if not backup_key:
                             self._reply_html(_render_setup_html(
-                                error="Encrypted backup requires the decryption key.",
-                                ui_view=ui_view,
+                                import_backup_error="Encrypted backup requires the decryption key.",
+                                ui_view="settings",
                                 ssl_warning=ssl_warning,
                             ))
                             return
                         dec = _decrypt_backup(enc_blob, backup_key)
                         if dec is None:
                             self._reply_html(_render_setup_html(
-                                error="Decryption failed. Wrong key or corrupted backup.",
-                                ui_view=ui_view,
+                                import_backup_error="Decryption failed. Wrong key or corrupted backup.",
+                                ui_view="settings",
                                 ssl_warning=ssl_warning,
                             ))
                             return
                         try:
                             payload = json.loads(dec)
                         except json.JSONDecodeError:
-                            self._reply_html(_render_setup_html(error="Decrypted backup is not valid JSON.", ui_view=ui_view, ssl_warning=ssl_warning))
+                            self._reply_html(_render_setup_html(import_backup_error="Decrypted backup is not valid JSON.", ui_view="settings", ssl_warning=ssl_warning))
                             return
                     else:
                         payload = parsed
