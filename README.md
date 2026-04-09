@@ -25,8 +25,11 @@ Open `http://localhost:5080`.
 
 ### Install Unix Monitor
 
+Sources: [apps/unix-monitor](https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/tree/main/apps/unix-monitor). Use an interactive shell (`ssh -t`).
+
 ```bash
-curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+curl -fsSL "https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh" \
+  | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
 
 ### Install Synology Monitor (Preferred: SPK Package)

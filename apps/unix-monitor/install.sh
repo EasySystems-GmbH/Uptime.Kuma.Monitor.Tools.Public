@@ -24,6 +24,8 @@ UPDATE_HELPER_REMOTE_PATH="apps/unix-monitor/${UPDATE_HELPER_NAME}"
 UPDATE_HELPER_RAW_URL="https://raw.githubusercontent.com/${PUBLIC_REPO}/${REF}/${UPDATE_HELPER_REMOTE_PATH}"
 SCRIPT_VERSION_REMOTE_PATH="apps/unix-monitor/unix-monitor.py"
 DEFAULT_INSTALL_DIR="/opt/unix-monitor"
+# Optional: UNIX_MONITOR_INSTALL_DIR — install path without prompting (pass via sudo env ...).
+# Update channel is always chosen in the installer menu (1=latest, 2=main) when not migrating.
 MIN_PYTHON_MAJOR=3
 MIN_PYTHON_MINOR=8
 
@@ -365,8 +367,13 @@ else
 fi
 
 if [ -z "${MIGRATE_FROM_LEGACY:-}" ]; then
-    echo -e "Install directory [${BOLD}${DEFAULT_INSTALL_DIR}${NC}]: \c"
-    read_input CUSTOM_DIR || true
+    if [ -n "${UNIX_MONITOR_INSTALL_DIR:-}" ]; then
+        CUSTOM_DIR="${UNIX_MONITOR_INSTALL_DIR}"
+        info "Install directory from UNIX_MONITOR_INSTALL_DIR: ${CUSTOM_DIR}"
+    else
+        echo -e "Install directory [${BOLD}${DEFAULT_INSTALL_DIR}${NC}]: \c"
+        read_input CUSTOM_DIR || true
+    fi
 fi
 INSTALL_DIR="${CUSTOM_DIR:-${DEFAULT_INSTALL_DIR}}"
 
@@ -406,8 +413,8 @@ fi
 
 if [ -z "${MIGRATE_FROM_LEGACY:-}" ]; then
     if [ ! -r /dev/tty ]; then
-        err "Update source must be selected by user, but no interactive terminal is available."
-        err "Run installer in an interactive shell."
+        err "Update source must be selected in the installer, but no interactive terminal (/dev/tty) is available."
+        err "Use a real terminal (e.g. ssh -t user@host), or save the script and run: sudo bash install.sh"
         exit 1
     fi
     echo ""

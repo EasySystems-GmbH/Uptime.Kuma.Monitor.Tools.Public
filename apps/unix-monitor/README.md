@@ -21,9 +21,16 @@ Runtime name is generated from system info:
 
 ## Quick Install
 
+Browse sources: [apps/unix-monitor on GitHub](https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/tree/main/apps/unix-monitor).
+
+Use an **interactive** terminal (`ssh -t user@host`, or a local console). The installer prompts for the update channel and needs `/dev/tty`.
+
 ```bash
-curl -sL https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
+curl -fsSL "https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh" \
+  | sudo env PUBLIC_REPO=EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public bash
 ```
+
+`-f` stops the download on HTTP errors so a failed fetch is not piped silently into `bash`.
 
 ## Architecture
 
