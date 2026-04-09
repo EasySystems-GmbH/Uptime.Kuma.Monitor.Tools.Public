@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0008"
+VERSION = "1.6.0-0009"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5008,6 +5008,10 @@ def _render_setup_html(
     edit_original_name = str(edit_monitor.get("name", "")) if edit_monitor else ""
     current_interval = int(edit_monitor.get("interval", edit_monitor.get("cron_interval_minutes", cfg.get("cron_interval_minutes", 5)))) if edit_monitor else 5
     current_cron_enabled = bool(edit_monitor.get("cron_enabled", cfg.get("cron_enabled", True))) if edit_monitor else True
+    _cm = str(current_mode or "smart").strip().lower()
+    modal_ph_display = "block" if _cm in ("ping", "port") else "none"
+    modal_pp_display = "block" if _cm == "port" else "none"
+    modal_dns_display = "block" if _cm == "dns" else "none"
 
     status_html = ""
     # Elevated check result: only show in Setup & Elevated Access section, not at top
@@ -6041,19 +6045,19 @@ def _render_setup_html(
               <input name="interval" type="number" min="1" max="1440" value="{current_interval}">
             </div>
           </div>
-          <div id="probe-host-wrap">
+          <div id="probe-host-wrap" style="display:{modal_ph_display};">
             <label>Probe Host (for ping/port) <span class="required-asterisk">*</span></label>
             <input name="probe_host" value="{html.escape(current_probe_host)}" placeholder="example.com or 192.168.1.10">
           </div>
-          <div id="probe-port-wrap">
+          <div id="probe-port-wrap" style="display:{modal_pp_display};">
             <label>Probe Port (for port mode) <span class="required-asterisk">*</span></label>
             <input name="probe_port" type="number" min="1" max="65535" value="{html.escape(current_probe_port)}" placeholder="443">
           </div>
-          <div id="dns-name-wrap">
+          <div id="dns-name-wrap" style="display:{modal_dns_display};">
             <label>DNS Name (for dns mode) <span class="required-asterisk">*</span></label>
             <input name="dns_name" value="{html.escape(current_dns_name)}" placeholder="example.com">
           </div>
-          <div id="dns-server-wrap">
+          <div id="dns-server-wrap" style="display:{modal_dns_display};">
             <label>DNS Server (optional)</label>
             <input name="dns_server" value="{html.escape(current_dns_server)}" placeholder="8.8.8.8">
           </div>
