@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0017"
+VERSION = "1.6.0-0018"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6518,14 +6518,14 @@ def _render_setup_html(
             var diagBlock = "<div style='margin-top:10px;padding:10px;background:#0b1321;border:1px solid #283852;border-radius:8px;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;'>" + escapeHtml(diagLines.join("\\n")) + "</div>";
             if (!r.ok || !data || data.error) {{
               mContent.innerHTML = "<p class='err'>" + escapeHtml(errMsg) + "</p>" + diagBlock;
-              mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
+              mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
               btn.disabled = false;
               return;
             }}
             var sessionId = data.session_id;
             if (!sessionId) {{
               mContent.innerHTML = "<p class='err'>No session ID returned</p>";
-              mContent.innerHTML += "<p><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
+              mContent.innerHTML += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
               btn.disabled = false;
               return;
             }}
@@ -6543,7 +6543,7 @@ def _render_setup_html(
                   }}
                   var sdiagBlock = "<div style='margin-top:10px;padding:10px;background:#0b1321;border:1px solid #283852;border-radius:8px;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;'>" + escapeHtml(sdiagLines.join("\\n")) + "</div>";
                   mContent.innerHTML = "<p class='err'>" + escapeHtml(sdata.error) + "</p>" + sdiagBlock;
-                  mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
+                  mContent.innerHTML += "<p style='margin-top:12px;'><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
                   clearInterval(pollInterval);
                   btn.disabled = false;
                   return;
@@ -6558,7 +6558,7 @@ def _render_setup_html(
                 if (stage === "done" || stage === "failed") {{
                   clearInterval(pollInterval);
                   html += (stage === "done" ? "<p class='ok'>Update complete. Agent may restart.</p>" : "<p class='err'>Update failed.</p>");
-                  html += "<p><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
+                  html += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
                   mContent.innerHTML = html;
                   btn.disabled = false;
                   if (stage === "done" && typeof refreshLive === "function") setTimeout(function() {{ refreshLive(); }}, 3000);
@@ -6569,7 +6569,7 @@ def _render_setup_html(
             }}, 600);
           }} catch (e) {{
             mContent.innerHTML = "<p class='err'>" + escapeHtml(String(e)) + "</p>";
-            mContent.innerHTML += "<p><button type='button' class='close-link' onclick='document.getElementById(\"agent-update-modal\").classList.remove(\"open\")'>Close</button></p>";
+            mContent.innerHTML += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
             btn.disabled = false;
           }}
         }}, true);
