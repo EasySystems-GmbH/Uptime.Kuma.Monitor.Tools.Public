@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0019"
+VERSION = "1.6.0-0020"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5710,7 +5710,6 @@ def _render_setup_html(
         <h3>Application Settings & Security</h3>
         {"<div class='ok'>" + html.escape(security_message) + "</div>" if security_message else ""}
         {"<pre>" + html.escape(security_output) + "</pre>" if security_output else ""}
-        <div class="muted">Admin account protected by password + mandatory TOTP 2FA.</div>
         <form method="post" action="/settings/save-instance-name">
           <label>Instance Name</label>
           <input name="instance_name" value="{html.escape(str(cfg.get('instance_name', '') or ''))}" placeholder="e.g. HQ-NAS">
@@ -5769,6 +5768,7 @@ def _render_setup_html(
             <button type="submit">Import settings</button>
           </div>
         </form>
+        <div class="muted" style="margin-top:14px;">Admin account protected by password + mandatory TOTP 2FA.</div>
         <div class="card" style="margin-top:16px;border-color:rgba(239,68,68,.25);">
           <h3>Factory Settings</h3>
           <div class="button-row">
