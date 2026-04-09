@@ -863,7 +863,9 @@ Description=Run ${APP_LABEL} checks every ${SCHED_INTERVAL_MIN} minute(s)
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=${SCHED_INTERVAL_MIN}min
+# OnUnitInactiveSec (not OnUnitActiveSec): schedule from when the oneshot *finished*.
+# OnUnitActiveSec with Type=oneshot can strand the timer (elapsed / empty next realtime on some systemd versions).
+OnUnitInactiveSec=${SCHED_INTERVAL_MIN}min
 AccuracySec=30s
 Persistent=true
 

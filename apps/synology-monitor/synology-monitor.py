@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0025"
+VERSION = "1.6.0-0026"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -7498,6 +7498,11 @@ def _ui_run_scheduled_now() -> str:
         append_ui_log("automation | run-scheduled-now | skipped | automatic checks disabled")
         return "Automatic checks are disabled in monitor settings."
     output = _ui_run_check_now()
+    for m in cfg.get("monitors", []):
+        if isinstance(m, dict):
+            n = str(m.get("name", "") or "").strip()
+            if n:
+                _touch_scheduled_run(monitor_name=n)
     _touch_scheduled_run()
     append_ui_log("automation | run-scheduled-now | completed")
     return output
