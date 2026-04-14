@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0043"
+VERSION = "1.6.0-0044"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -7096,9 +7096,9 @@ def _render_setup_html(
           if (dnw) {{ dnw.style.display = showDns ? "block" : "none"; var inp = dnw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
           if (dsw) {{ dsw.style.display = showDns ? "block" : "none"; var inp = dsw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
           if (nameEl) {{
-            var cur = (nameEl.value || "").trim();
-            var autoNames = ["smart-unix-check","storage-unix-check","ping-unix-check","port-unix-check","dns-unix-check","backup-unix-check","unix-main"];
-            if (!cur || autoNames.indexOf(cur) >= 0) {{
+            var cur = (nameEl.value || "").trim().toLowerCase();
+            var autoPattern = /^(smart|storage|ping|port|dns|backup|service)-unix-check$/;
+            if (!cur || autoPattern.test(cur) || cur === "unix-main") {{
               nameEl.value = (modeEl.value || "smart") + "-unix-check";
             }}
           }}
@@ -7443,14 +7443,11 @@ def _render_setup_html(
           }}
         }}
         function restoreOpenServerPanel() {{
-          var key = getOpenServerPanelKey();
-          if (!key) return;
-          var panel = document.querySelector(".server-action-panel[data-server-panel='" + key + "']");
-          if (!panel) return;
+          // Default UX: keep server action panel collapsed on fresh page load.
+          setOpenServerPanelKey("");
           document.querySelectorAll(".server-action-panel.open").forEach(function(p) {{
-            if (p !== panel) p.classList.remove("open");
+            p.classList.remove("open");
           }});
-          panel.classList.add("open");
         }}
         restoreOpenServerPanel();
         // Ensure source chips (Local, agent names) navigate reliably when clicked (handles subpath + edge cases)

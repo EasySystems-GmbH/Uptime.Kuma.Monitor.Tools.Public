@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0043"
+VERSION = "1.6.0-0044"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6407,9 +6407,9 @@ def _render_setup_html(
           if (dnw) {{ dnw.style.display = showDns ? "block" : "none"; var inp = dnw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
           if (dsw) {{ dsw.style.display = showDns ? "block" : "none"; var inp = dsw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
           if (nameEl) {{
-            var cur = (nameEl.value || "").trim();
-            var autoNames = ["smart-synology-check","storage-synology-check","ping-synology-check","port-synology-check","dns-synology-check","backup-synology-check","synology-main"];
-            if (!cur || autoNames.indexOf(cur) >= 0) {{
+            var cur = (nameEl.value || "").trim().toLowerCase();
+            var autoPattern = /^(smart|storage|ping|port|dns|backup|service)-synology-check$/;
+            if (!cur || autoPattern.test(cur) || cur === "synology-main") {{
               nameEl.value = (modeEl.value || "smart") + "-synology-check";
             }}
           }}
