@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0042"
+VERSION = "1.6.0-0043"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -3836,11 +3836,16 @@ def _severity(status: str) -> int:
     return {"up": 0, "warning": 1, "down": 2}.get(status, 2)
 
 
-def _has_synology_tools() -> Tuple[bool, str]:
-    rc, _ = _run_cmd(["synospace", "--help"], timeout_sec=6)
+def _has_native_storage_probe() -> Tuple[bool, str]:
+    rc, out = _run_cmd(["synospace", "--help"], timeout_sec=6)
+    if rc == 0:
+        return True, ""
     if rc == 127:
-        return False, "synospace not found (run this on a Unix host)"
-    return True, ""
+        return False, "native storage probe unavailable on this host; using Unix fallback checks"
+    if rc == 124:
+        return False, "native storage probe timed out; using Unix fallback checks"
+    detail = out.strip() or f"exit code {rc}"
+    return False, f"native storage probe unavailable ({detail}); using Unix fallback checks"
 
 
 def _check_storage_fallback(debug: bool = False) -> Tuple[str, List[str]]:
@@ -3848,8 +3853,14 @@ def _check_storage_fallback(debug: bool = False) -> Tuple[str, List[str]]:
     lines: List[str] = []
     fs_stats: List[Tuple[int, str, str]] = []
 
-    rc, out = _run_cmd(["df", "-P"], timeout_sec=10)
+    df_scope = "local filesystems"
+    rc, out = _run_cmd(["df", "-P", "-l"], timeout_sec=8)
     if rc != 0:
+        df_scope = "all filesystems"
+        rc, out = _run_cmd(["df", "-P"], timeout_sec=12)
+    if rc != 0:
+        if rc == 124:
+            return "warning", ["Fallback df timed out while collecting storage usage"]
         return "down", [f"Fallback df failed: {out.strip()}"]
 
     for line in out.splitlines()[1:]:
@@ -3887,7 +3898,7 @@ def _check_storage_fallback(debug: bool = False) -> Tuple[str, List[str]]:
     fs_count = len(fs_stats)
     if fs_stats:
         top_pct, top_mp, top_fs = sorted(fs_stats, reverse=True)[0]
-        lines.insert(0, f"Fallback probe: scanned {fs_count} filesystems, max usage {top_pct}% on {top_mp} ({top_fs})")
+        lines.insert(0, f"Fallback probe ({df_scope}): scanned {fs_count} filesystems, max usage {top_pct}% on {top_mp} ({top_fs})")
         nas_volumes = sorted([(pct, mpoint, fs) for (pct, mpoint, fs) in fs_stats if NAS_VOLUME_PATTERN.match(mpoint)], key=lambda x: x[1])
         other_mounts = sorted([(pct, mpoint, fs) for (pct, mpoint, fs) in fs_stats if not NAS_VOLUME_PATTERN.match(mpoint)], key=lambda x: x[1])
 
@@ -4661,11 +4672,11 @@ def _probe_backup(source_platform: str = "unix") -> Tuple[str, List[str], float]
 
 def check_storage(debug: bool = False) -> Tuple[str, List[str], float]:
     t0 = time.perf_counter()
-    ok_tools, err = _has_synology_tools()
+    ok_tools, err = _has_native_storage_probe()
     if not ok_tools:
-        append_ui_log(f"storage-check | synospace unavailable | reason={err}")
+        append_ui_log(f"storage-check | native probe unavailable | reason={err}")
         fb_status, fb_lines = _check_storage_fallback(debug=debug)
-        fb_lines.insert(0, f"Unix storage command unavailable: {err}")
+        fb_lines.insert(0, err)
         return fb_status, fb_lines, _latency_ms(t0)
 
     rc, out = _run_cmd(["synospace", "--enum"], timeout_sec=20)
@@ -4674,7 +4685,7 @@ def check_storage(debug: bool = False) -> Tuple[str, List[str], float]:
         if "PermissionError" in err_text or "Permission denied" in err_text:
             append_ui_log(f"storage-check | synospace permission denied | rc={rc} | detail={err_text}")
             fb_status, fb_lines = _check_storage_fallback(debug=debug)
-            fb_lines.insert(0, "synospace permission denied; using fallback storage checks")
+            fb_lines.insert(0, "Native storage probe permission denied; using Unix fallback checks")
             return fb_status, fb_lines, _latency_ms(t0)
         append_ui_log(f"storage-check | synospace failed | rc={rc} | detail={err_text}")
         return "down", [f"Failed to retrieve storage status: {err_text}"], _latency_ms(t0)
@@ -6689,10 +6700,19 @@ def _render_setup_html(
           <label>Change password</label>
           <div class="muted">Unused recovery codes: {recovery_unused}</div>
           <div class="row">
-            <div><input name="current_password" type="password" autocomplete="current-password" placeholder="Current password" required></div>
-            <div><input name="new_password" type="password" autocomplete="new-password" minlength="10" placeholder="New password" required></div>
+            <div class="input-with-action">
+              <input id="security-current-password" name="current_password" type="password" autocomplete="current-password" placeholder="Current password" required>
+              <button type="button" class="btn-icon toggle-password-btn" data-target="security-current-password" aria-label="Show password">Show</button>
+            </div>
+            <div class="input-with-action">
+              <input id="security-new-password" name="new_password" type="password" autocomplete="new-password" minlength="10" placeholder="New password" required>
+              <button type="button" class="btn-icon toggle-password-btn" data-target="security-new-password" aria-label="Show password">Show</button>
+            </div>
           </div>
-          <input name="new_password_confirm" type="password" autocomplete="new-password" minlength="10" placeholder="Confirm new password" required>
+          <div class="input-with-action">
+            <input id="security-confirm-password" name="new_password_confirm" type="password" autocomplete="new-password" minlength="10" placeholder="Confirm new password" required>
+            <button type="button" class="btn-icon toggle-password-btn" data-target="security-confirm-password" aria-label="Show password">Show</button>
+          </div>
           <div class="button-row"><button type="submit">Update password</button></div>
         </form>
         <div class="button-row">
@@ -6715,7 +6735,10 @@ def _render_setup_html(
           <div class="muted" style="margin-top:4px;">Full encrypted backup or public-only settings.</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;">
             <form method="post" action="/auth/export-backup" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0;">
-              <input name="backup_key" id="backup_key" type="password" placeholder="Encryption key (min 12 chars)" style="min-width:200px;" minlength="12" required>
+              <div class="input-with-action" style="min-width:200px;">
+                <input name="backup_key" id="backup_key" type="password" placeholder="Encryption key (min 12 chars)" minlength="12" required>
+                <button type="button" class="btn-icon toggle-password-btn" data-target="backup_key" aria-label="Show password">Show</button>
+              </div>
               <button type="button" onclick="var k=document.getElementById('backup_key');k.value=Array.from(crypto.getRandomValues(new Uint8Array(24))).map(b=>b.toString(16).padStart(2,'0')).join('');k.type='text';k.select();">Generate key</button>
               <button type="submit">Export Encrypted Backup</button>
             </form>
@@ -6729,7 +6752,10 @@ def _render_setup_html(
           <label>Import settings backup</label>
           <div class="muted" style="margin-top:4px;">Encrypted backups require the decryption key. Paste JSON or choose file.</div>
           <label>Decryption key <span class="muted">(required for encrypted backups)</span></label>
-          <input name="backup_key" type="password" placeholder="Enter the key you saved during export" style="margin-top:4px;">
+          <div class="input-with-action">
+            <input id="backup-import-key" name="backup_key" type="password" placeholder="Enter the key you saved during export" style="margin-top:4px;">
+            <button type="button" class="btn-icon toggle-password-btn" data-target="backup-import-key" aria-label="Show password">Show</button>
+          </div>
           <label>Backup JSON</label>
           <textarea name="import_payload" rows="5" style="width:100%;margin-top:6px;box-sizing:border-box;border:1px solid #30405b;border-radius:8px;background:#0f1726;color:#d7e2f0;padding:8px;" placeholder="Paste backup JSON or use file below"></textarea>
           <label>Or import from file</label>
@@ -6782,6 +6808,9 @@ def _render_setup_html(
     label {{ display: block; margin-top: 10px; font-weight: 600; color: #c8d8ee; }}
     input, select {{ width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; border: 1px solid #30405b; border-radius: 6px; background: #0f1726; color: var(--text); }}
     .row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .input-with-action {{ display:flex; align-items:center; gap:8px; }}
+    .input-with-action > input {{ flex:1 1 auto; min-width:0; }}
+    .btn-icon {{ padding: 8px 12px; white-space: nowrap; flex: 0 0 auto; }}
     .button-row {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; margin-bottom: 12px; }}
     .button-row:last-child {{ margin-bottom: 0; }}
     form {{ margin: 0; }}
@@ -6973,6 +7002,7 @@ def _render_setup_html(
       .row {{ grid-template-columns: 1fr; }}
       .button-row {{ flex-direction: column; align-items: stretch; }}
       button {{ width: 100%; }}
+      .input-with-action .btn-icon {{ width: auto; }}
     }}
   </style>
 </head>
@@ -7198,6 +7228,18 @@ def _render_setup_html(
     </div>
     <script>
       (function () {{
+        document.addEventListener("click", function (ev) {{
+          var btn = ev && ev.target && ev.target.closest ? ev.target.closest(".toggle-password-btn[data-target]") : null;
+          if (!btn) return;
+          var targetId = btn.getAttribute("data-target") || "";
+          var input = targetId ? document.getElementById(targetId) : null;
+          if (!input) return;
+          var show = input.type === "password";
+          input.type = show ? "text" : "password";
+          btn.textContent = show ? "Hide" : "Show";
+          btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+        }});
+
         var bodyMeta = document.body || null;
         var uiView = bodyMeta ? (bodyMeta.getAttribute("data-ui-view") || "overview") : "overview";
         var diagView = bodyMeta ? (bodyMeta.getAttribute("data-diag-view") || "logs") : "logs";
@@ -8206,6 +8248,9 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
     h3 {{ margin:0 0 8px 0; }}
     label {{ display:block; margin-top:10px; font-weight:600; }}
     input {{ width:100%; box-sizing:border-box; margin-top:4px; padding:9px; border:1px solid #334861; border-radius:6px; background:#0d1524; color:#e6eef8; }}
+    .input-with-action {{ display:flex; align-items:center; gap:8px; }}
+    .input-with-action > input {{ flex:1 1 auto; min-width:0; }}
+    .btn-icon {{ padding:8px 12px; white-space: nowrap; flex: 0 0 auto; }}
     .button-row {{ margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }}
     button, .btn {{ border:1px solid #36517a; border-radius:8px; padding:9px 14px; background:transparent; color:#c8dbf8; font-weight:600; font-size:13px; cursor:pointer; text-decoration:none; }}
     button:hover, .btn:hover {{ background:rgba(54,81,122,.25); }}
@@ -8250,6 +8295,18 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
   </div>
   <script>
   (function () {{
+    document.addEventListener("click", function (ev) {{
+      var btn = ev && ev.target && ev.target.closest ? ev.target.closest(".toggle-password-btn[data-target]") : null;
+      if (!btn) return;
+      var targetId = btn.getAttribute("data-target") || "";
+      var input = targetId ? document.getElementById(targetId) : null;
+      if (!input) return;
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.textContent = show ? "Hide" : "Show";
+      btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+    }});
+
     function focusAuthPrimary() {{
       var el = document.getElementById("auth-password")
         || document.getElementById("auth-totp-token")
@@ -8350,9 +8407,15 @@ def _render_auth_setup_page(
         <form method="post" action="/auth/setup">
           <input type="hidden" name="username" value="admin" autocomplete="username">
           <label>Create admin password</label>
-          <input id="auth-setup-password" name="password" type="password" autocomplete="new-password" minlength="10" required autofocus>
+          <div class="input-with-action">
+            <input id="auth-setup-password" name="password" type="password" autocomplete="new-password" minlength="10" required autofocus>
+            <button type="button" class="btn-icon toggle-password-btn" data-target="auth-setup-password" aria-label="Show password">Show</button>
+          </div>
           <label>Confirm password</label>
-          <input name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
+          <div class="input-with-action">
+            <input id="auth-setup-password2" name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
+            <button type="button" class="btn-icon toggle-password-btn" data-target="auth-setup-password2" aria-label="Show password">Show</button>
+          </div>
           <div class="button-row">
             <button type="submit">Initialize Security</button>
           </div>
@@ -8368,7 +8431,10 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
     <form method="post" action="/auth/login">
       <input type="hidden" name="username" value="admin" autocomplete="username">
       <label>Admin password</label>
-      <input id="auth-password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <div class="input-with-action">
+        <input id="auth-password" name="password" type="password" autocomplete="current-password" required autofocus>
+        <button type="button" class="btn-icon toggle-password-btn" data-target="auth-password" aria-label="Show password">Show</button>
+      </div>
       <div class="button-row">
         <button type="submit">Continue</button>
       </div>
