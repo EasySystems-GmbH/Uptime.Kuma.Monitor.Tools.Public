@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0044"
+VERSION = "1.6.0-0045"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -457,6 +457,41 @@ def _list_system_ips() -> List[str]:
     except Exception:
         pass
     return ips
+
+
+def _normalize_ui_bind_host(host: Any, known_ips: Optional[List[str]] = None) -> str:
+    raw = str(host or "").strip()
+    if raw in ("", "*", "all"):
+        return "0.0.0.0"
+    if raw in ("localhost", "loopback"):
+        return "127.0.0.1"
+    if raw in ("0.0.0.0", "127.0.0.1"):
+        return raw
+    if known_ips and raw in known_ips:
+        return raw
+    try:
+        socket.inet_aton(raw)
+        return raw
+    except OSError:
+        return "0.0.0.0"
+
+
+def _normalize_ui_bind_port(port: Any, default: int = 8787) -> int:
+    try:
+        parsed = int(port if port is not None else default)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, 65535))
+
+
+def _ui_bind_host_options(all_ips: List[str]) -> List[str]:
+    opts = ["0.0.0.0", "127.0.0.1"]
+    for ip in all_ips:
+        if "." not in ip:
+            continue
+        if ip not in opts:
+            opts.append(ip)
+    return opts
 
 
 def _ntp_sync_details() -> Dict[str, str]:
@@ -3694,6 +3729,25 @@ def load_config() -> Dict[str, Any]:
         return {"monitors": []}
 
     changed = False
+    if "ui_bind_host" not in cfg:
+        cfg["ui_bind_host"] = "0.0.0.0"
+        changed = True
+    if "ui_bind_port" not in cfg:
+        cfg["ui_bind_port"] = 8787
+        changed = True
+    norm_ui_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"))
+    if norm_ui_host != str(cfg.get("ui_bind_host", "0.0.0.0")):
+        cfg["ui_bind_host"] = norm_ui_host
+        changed = True
+    old_ui_port_raw = cfg.get("ui_bind_port", 8787)
+    try:
+        old_ui_port = int(old_ui_port_raw if old_ui_port_raw is not None else 8787)
+    except (TypeError, ValueError):
+        old_ui_port = 8787
+    norm_ui_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
+    if norm_ui_port != old_ui_port:
+        cfg["ui_bind_port"] = norm_ui_port
+        changed = True
     monitors = [m for m in cfg.get("monitors", []) if isinstance(m, dict)]
     for monitor in monitors:
         cleaned = normalize_kuma_url(monitor.get("kuma_url", ""))
@@ -5952,6 +6006,18 @@ def _render_setup_html(
     request_interface = _request_interface_host()
     server_ip = request_interface or _detect_primary_server_ip()
     all_ips = _list_system_ips()
+    ui_bind_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"), all_ips)
+    ui_bind_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
+    bind_host_options = _ui_bind_host_options(all_ips)
+    bind_scope_text = (
+        "All interfaces (0.0.0.0)"
+        if ui_bind_host == "0.0.0.0"
+        else ("Localhost only (127.0.0.1)" if ui_bind_host == "127.0.0.1" else f"Specific interface ({ui_bind_host})")
+    )
+    bind_options_html = "".join(
+        f"<option value='{html.escape(ip)}'{' selected' if ip == ui_bind_host else ''}>{html.escape('All interfaces (0.0.0.0)' if ip == '0.0.0.0' else ('Localhost only (127.0.0.1)' if ip == '127.0.0.1' else ip))}</option>"
+        for ip in bind_host_options
+    )
     ntp_info = _ntp_sync_details()
     peer_last_sync = int(cfg.get("last_peer_sync", 0) or 0)
     peer_last_sync_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(peer_last_sync)) if peer_last_sync else "never"
@@ -6630,7 +6696,7 @@ def _render_setup_html(
         "</div>"
         "<div class='server-action-panels'>"
         f"<div class='card server-action-panel' data-server-panel='name'><h4>Change server name</h4><form method='post' action='/settings/save-instance-name'><label>Instance Name</label><input name='instance_name' value='{html.escape(str(cfg.get('instance_name', '') or ''))}' placeholder='e.g. HQ-NAS'><div class='button-row'><button type='submit'>Save name</button></div></form></div>"
-        f"<div class='card server-action-panel' data-server-panel='ip'><h4>System IP addresses</h4><pre>{html.escape(ip_list_text)}</pre></div>"
+        f"<div class='card server-action-panel' data-server-panel='ip'><h4>System IP addresses</h4><div class='muted'>Current web UI bind: {html.escape(bind_scope_text)} on port {ui_bind_port}</div><pre>{html.escape(ip_list_text)}</pre></div>"
         f"<div class='card server-action-panel' data-server-panel='time'><h4>Time sync details</h4><pre>Current time: {html.escape(now_text)}\nLast peer sync: {html.escape(peer_last_sync_text)}\nNTP synced: {html.escape(ntp_info.get('synced', 'unknown'))}\nNTP service: {html.escape(ntp_info.get('service', 'unknown'))}\nNTP source: {html.escape(ntp_info.get('source', 'unknown'))}\n\n{html.escape(ntp_info.get('detail', ''))}</pre></div>"
         + package_panel_html
         + f"<div class='card server-action-panel' data-server-panel='login'><h4>Recent login events (IP + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
@@ -6694,6 +6760,14 @@ def _render_setup_html(
           <label>Instance Name</label>
           <input name="instance_name" value="{html.escape(str(cfg.get('instance_name', '') or ''))}" placeholder="e.g. HQ-NAS">
           <div class="button-row"><button type="submit">Save instance name</button></div>
+        </form>
+        <form method="post" action="/settings/save-ui-bind">
+          <label>Web UI bind interface/IP</label>
+          <select name="ui_bind_host">{bind_options_html}</select>
+          <label>Web UI port</label>
+          <input name="ui_bind_port" type="number" min="1" max="65535" value="{ui_bind_port}">
+          <div class="muted">Applies after restarting the Unix monitor UI/service.</div>
+          <div class="button-row"><button type="submit">Save web UI binding</button></div>
         </form>
         <form method="post" action="/auth/change-password">
           <input type="hidden" name="username" value="admin" autocomplete="username">
@@ -10583,6 +10657,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 return
             if self.path not in (
                 "/settings/save-instance-name",
+                "/settings/save-ui-bind",
                 "/settings/save-autoupdate",
                 "/settings/save-update-from-main",
                 "/settings/request-autoupdate-on-logout",
@@ -10627,6 +10702,28 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     append_ui_log(f"settings | instance name saved: {instance_name or '-'}")
                     self._reply_html(_render_setup_html(
                         security_message="Instance name saved.",
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
+                if self.path == "/settings/save-ui-bind":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    cfg = load_config()
+                    selected_host = _normalize_ui_bind_host(form.get("ui_bind_host", [cfg.get("ui_bind_host", "0.0.0.0")])[0], _list_system_ips())
+                    selected_port = _normalize_ui_bind_port(form.get("ui_bind_port", [cfg.get("ui_bind_port", 8787)])[0])
+                    cfg["ui_bind_host"] = selected_host
+                    cfg["ui_bind_port"] = selected_port
+                    save_config(cfg, reapply_cron=False)
+                    bind_desc = (
+                        "all interfaces (0.0.0.0)"
+                        if selected_host == "0.0.0.0"
+                        else ("localhost only (127.0.0.1)" if selected_host == "127.0.0.1" else selected_host)
+                    )
+                    append_ui_log(f"settings | web ui bind saved host={selected_host} port={selected_port}")
+                    self._reply_html(_render_setup_html(
+                        security_message=f"Web UI binding saved: {bind_desc}:{selected_port}. Restart UI/service to apply.",
                         ui_view="settings",
                         ssl_warning=ssl_warning,
                     ))
@@ -11778,17 +11875,17 @@ if __name__ == "__main__":
         if not bool(cfg.get("web_enabled", True)):
             print("Webserver is disabled in config (agent-only installation).")
             sys.exit(2)
-        ui_host = "0.0.0.0"
-        ui_port = 8787
+        ui_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"))
+        ui_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
         if "--host" in sys.argv:
             try:
-                ui_host = sys.argv[sys.argv.index("--host") + 1]
+                ui_host = _normalize_ui_bind_host(sys.argv[sys.argv.index("--host") + 1])
             except (ValueError, IndexError):
                 print("Invalid --host usage. Example: --host 0.0.0.0")
                 sys.exit(1)
         if "--port" in sys.argv:
             try:
-                ui_port = int(sys.argv[sys.argv.index("--port") + 1])
+                ui_port = _normalize_ui_bind_port(int(sys.argv[sys.argv.index("--port") + 1]))
             except (ValueError, IndexError):
                 print("Invalid --port usage. Example: --port 8787")
                 sys.exit(1)
