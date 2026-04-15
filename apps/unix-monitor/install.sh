@@ -38,6 +38,20 @@ SYSTEMD_SERVICE_BACKUP_HELPER="unix-monitor-backup-helper.service"
 SYSTEMD_TIMER_BACKUP_HELPER="unix-monitor-backup-helper.timer"
 SYSTEMD_SERVICE_SYSLOG_HELPER="unix-monitor-system-log-helper.service"
 SYSTEMD_TIMER_SYSLOG_HELPER="unix-monitor-system-log-helper.timer"
+RUN_DIAGNOSTICS=0
+
+for arg in "$@"; do
+    case "${arg}" in
+        --diagnose|--diagnostics|--doctor|-d)
+            RUN_DIAGNOSTICS=1
+            ;;
+        --help|-h)
+            echo "Usage: bash install.sh [--diagnose]"
+            echo "  --diagnose   Run installer diagnostics only (no install changes)"
+            exit 0
+            ;;
+    esac
+done
 
 read_input() {
     read -r "$@" </dev/tty
@@ -59,6 +73,187 @@ err()   { echo -e "${RED}[✗]${NC} $*"; }
 
 SYSTEM_LABEL="$(uname -s 2>/dev/null || echo Unix)"
 APP_LABEL="${SYSTEM_LABEL} Kuma Monitor Addon"
+
+run_diagnostics_session() {
+    local install_dir="${UNIX_MONITOR_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
+    local runtime_dir="/var/lib/unix-monitor"
+    local config_path="${install_dir}/unix-monitor.json"
+    local ts
+    ts="$(date -u +%Y%m%d-%H%M%S)"
+    local out_dir="${runtime_dir}/diagnostics"
+    local report_file="${out_dir}/installer-diagnostics-${ts}.txt"
+    local tmp_report
+    tmp_report="$(mktemp)"
+
+    log() {
+        echo "$*" | tee -a "${tmp_report}"
+    }
+
+    log "=== ${APP_LABEL} installer diagnostics ==="
+    log "timestamp_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    log "host: $(hostname 2>/dev/null || echo unknown)"
+    log "kernel: $(uname -a 2>/dev/null || echo unknown)"
+    log "user: $(id -un 2>/dev/null || echo unknown) uid=$(id -u 2>/dev/null || echo unknown)"
+    log ""
+
+    log "[os-release]"
+    if [ -f /etc/os-release ]; then
+        cat /etc/os-release 2>/dev/null | tee -a "${tmp_report}" >/dev/null
+    else
+        log "no /etc/os-release"
+    fi
+    log ""
+
+    log "[python]"
+    if command -v python3 >/dev/null 2>&1; then
+        log "python3: $(command -v python3)"
+        log "python3_version: $(python3 --version 2>&1)"
+    else
+        log "python3: not found"
+    fi
+    log ""
+
+    log "[paths]"
+    log "install_dir: ${install_dir} (exists=$([ -d "${install_dir}" ] && echo yes || echo no))"
+    log "runtime_dir: ${runtime_dir} (exists=$([ -d "${runtime_dir}" ] && echo yes || echo no))"
+    log "config_path: ${config_path} (exists=$([ -f "${config_path}" ] && echo yes || echo no))"
+    log ""
+
+    local ui_host="127.0.0.1"
+    local ui_port="8787"
+    local web_enabled="true"
+
+    log "[config]"
+    if [ -f "${config_path}" ]; then
+        cat "${config_path}" 2>/dev/null | tee -a "${tmp_report}" >/dev/null || log "unable to read config"
+        if command -v python3 >/dev/null 2>&1; then
+            local cfg_triplet
+            cfg_triplet="$(python3 - <<'PY' "${config_path}" 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+host, port, web = "127.0.0.1", "8787", "true"
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    host = str(data.get("ui_host", host) or host)
+    port = str(int(data.get("ui_port", int(port))))
+    web = "true" if bool(data.get("web_enabled", True)) else "false"
+except Exception:
+    pass
+print(f"{host}|{port}|{web}")
+PY
+)"
+            if [ -n "${cfg_triplet}" ]; then
+                IFS='|' read -r ui_host ui_port web_enabled <<EOF
+${cfg_triplet}
+EOF
+            fi
+        fi
+    else
+        log "no config file found"
+    fi
+    log "effective_ui_host: ${ui_host}"
+    log "effective_ui_port: ${ui_port}"
+    log "effective_web_enabled: ${web_enabled}"
+    log ""
+
+    if command -v systemctl >/dev/null 2>&1; then
+        log "[systemd units]"
+        local units=(
+            "${SYSTEMD_SERVICE_UI}"
+            "${SYSTEMD_SERVICE_SCHED}"
+            "${SYSTEMD_TIMER_SCHED}"
+            "${SYSTEMD_SERVICE_SMART_HELPER}"
+            "${SYSTEMD_TIMER_SMART_HELPER}"
+            "${SYSTEMD_SERVICE_BACKUP_HELPER}"
+            "${SYSTEMD_TIMER_BACKUP_HELPER}"
+            "${SYSTEMD_SERVICE_SYSLOG_HELPER}"
+            "${SYSTEMD_TIMER_SYSLOG_HELPER}"
+        )
+        local unit
+        for unit in "${units[@]}"; do
+            local enabled active
+            enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
+            active="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+            [ -z "${enabled}" ] && enabled="unknown"
+            [ -z "${active}" ] && active="unknown"
+            log "${unit}: enabled=${enabled} active=${active}"
+        done
+        log ""
+    else
+        log "[systemd units]"
+        log "systemctl not found"
+        log ""
+    fi
+
+    log "[listeners:${ui_port}]"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn "sport = :${ui_port}" 2>/dev/null | tee -a "${tmp_report}" >/dev/null || log "ss probe failed"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | awk '$4 ~ /:'"${ui_port}"'$/ {print}' | tee -a "${tmp_report}" >/dev/null || log "netstat probe failed"
+    else
+        log "no ss/netstat available"
+    fi
+    log ""
+
+    log "[http probes]"
+    if command -v curl >/dev/null 2>&1; then
+        local probe_urls=(
+            "http://127.0.0.1:${ui_port}/health"
+            "http://localhost:${ui_port}/health"
+            "http://${ui_host}:${ui_port}/health"
+            "http://127.0.0.1:${ui_port}/"
+            "http://localhost:${ui_port}/"
+            "http://${ui_host}:${ui_port}/"
+        )
+        local seen=""
+        local url
+        for url in "${probe_urls[@]}"; do
+            if printf '%s\n' "${seen}" | awk -v u="${url}" '$0==u{found=1} END{exit(found?0:1)}'; then
+                continue
+            fi
+            seen="${seen}
+${url}"
+            local code
+            code="$(curl -sS -m 4 -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "ERR")"
+            log "${url} -> ${code}"
+        done
+    else
+        log "curl not available"
+    fi
+    log ""
+
+    log "[recent logs]"
+    local log_files=(
+        "${runtime_dir}/unix-monitor-ui.log"
+        "${runtime_dir}/monitor-scheduler.log"
+        "${runtime_dir}/smart-helper.log"
+        "${runtime_dir}/backup-helper.log"
+    )
+    local lf
+    for lf in "${log_files[@]}"; do
+        if [ -f "${lf}" ]; then
+            log "--- tail ${lf} ---"
+            tail -n 20 "${lf}" 2>/dev/null | tee -a "${tmp_report}" >/dev/null || log "could not tail ${lf}"
+        else
+            log "--- missing ${lf} ---"
+        fi
+    done
+    log ""
+
+    if mkdir -p "${out_dir}" 2>/dev/null && cp "${tmp_report}" "${report_file}" 2>/dev/null; then
+        info "Diagnostics report saved: ${report_file}"
+    elif sudo mkdir -p "${out_dir}" 2>/dev/null && sudo cp "${tmp_report}" "${report_file}" 2>/dev/null; then
+        info "Diagnostics report saved: ${report_file}"
+    else
+        local fallback="/tmp/unix-monitor-installer-diagnostics-${ts}.txt"
+        cp "${tmp_report}" "${fallback}" 2>/dev/null || true
+        warn "Could not write report under ${out_dir}; fallback: ${fallback}"
+    fi
+
+    rm -f "${tmp_report}" 2>/dev/null || true
+    info "Diagnostics session complete."
+}
 
 install_python() {
     if [ -f /etc/os-release ]; then
@@ -333,6 +528,11 @@ echo -e "${BOLD}${APP_LABEL} — Installer${NC}"
 echo "mount + unix storage checks + peer master/agent mode"
 echo "------------------------------------------------------"
 echo ""
+
+if [ "${RUN_DIAGNOSTICS}" = "1" ]; then
+    run_diagnostics_session
+    exit 0
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
     warn "python3 not found."

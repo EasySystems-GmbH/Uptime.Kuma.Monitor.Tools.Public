@@ -32,6 +32,17 @@ curl -fsSL "https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monit
 
 `-f` stops the download on HTTP errors so a failed fetch is not piped silently into `bash`.
 
+## Installer Diagnostics (Unix only)
+
+To run a diagnostics-only session (no install changes), save the installer and pass `--diagnose`:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/main/apps/unix-monitor/install.sh" -o install-unix-monitor.sh
+sudo bash install-unix-monitor.sh --diagnose
+```
+
+The report is written to `/var/lib/unix-monitor/diagnostics/installer-diagnostics-<timestamp>.txt` (fallback: `/tmp/...`).
+
 ## Architecture
 
 - Architecture document: `apps/unix-monitor/ARCHITECTURE.md`
