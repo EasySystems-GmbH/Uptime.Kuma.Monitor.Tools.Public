@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0046"
+VERSION = "1.6.0-0047"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -7573,6 +7573,21 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
     h3 {{ margin:0 0 8px 0; }}
     label {{ display:block; margin-top:10px; font-weight:600; }}
     input {{ width:100%; box-sizing:border-box; margin-top:4px; padding:9px; border:1px solid #334861; border-radius:6px; background:#0d1524; color:#e6eef8; }}
+    .input-with-action {{ display:flex; align-items:center; gap:8px; }}
+    .input-with-action input {{ flex:1; }}
+    .btn-icon {{
+      border:1px solid #36517a;
+      border-radius:8px;
+      padding:7px 10px;
+      background:transparent;
+      color:#c8dbf8;
+      font-weight:600;
+      font-size:12px;
+      cursor:pointer;
+      margin-top:4px;
+      white-space:nowrap;
+    }}
+    .btn-icon:hover {{ background:rgba(54,81,122,.25); }}
     .button-row {{ margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }}
     button, .btn {{ border:1px solid #36517a; border-radius:8px; padding:9px 14px; background:transparent; color:#c8dbf8; font-weight:600; font-size:13px; cursor:pointer; text-decoration:none; }}
     button:hover, .btn:hover {{ background:rgba(54,81,122,.25); }}
@@ -7625,6 +7640,18 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
       if (!el || !el.focus) return;
       try {{ el.focus({{ preventScroll: true }}); }} catch (e) {{ el.focus(); }}
     }}
+    document.addEventListener("click", function (ev) {{
+      var btn = ev.target && ev.target.closest ? ev.target.closest(".toggle-password-btn") : null;
+      if (!btn) return;
+      var targetId = btn.getAttribute("data-target") || "";
+      if (!targetId) return;
+      var input = document.getElementById(targetId);
+      if (!input) return;
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.textContent = show ? "Hide" : "Show";
+      btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+    }});
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", focusAuthPrimary);
     else focusAuthPrimary();
   }})();
@@ -7689,9 +7716,15 @@ def _render_auth_setup_page(
         <form method="post" action="/auth/setup">
           <input type="hidden" name="username" value="admin" autocomplete="username">
           <label>Create admin password</label>
-          <input id="auth-setup-password" name="password" type="password" autocomplete="new-password" minlength="10" required autofocus>
+          <div class="input-with-action">
+            <input id="auth-setup-password" name="password" type="password" autocomplete="new-password" minlength="10" required autofocus>
+            <button type="button" class="btn-icon toggle-password-btn" data-target="auth-setup-password" aria-label="Show password">Show</button>
+          </div>
           <label>Confirm password</label>
-          <input name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
+          <div class="input-with-action">
+            <input id="auth-setup-password-confirm" name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
+            <button type="button" class="btn-icon toggle-password-btn" data-target="auth-setup-password-confirm" aria-label="Show password">Show</button>
+          </div>
           <div class="button-row">
             <button type="submit">Initialize Security</button>
           </div>
@@ -7707,7 +7740,10 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
     <form method="post" action="/auth/login">
       <input type="hidden" name="username" value="admin" autocomplete="username">
       <label>Admin password</label>
-      <input id="auth-password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <div class="input-with-action">
+        <input id="auth-password" name="password" type="password" autocomplete="current-password" required autofocus>
+        <button type="button" class="btn-icon toggle-password-btn" data-target="auth-password" aria-label="Show password">Show</button>
+      </div>
       <div class="button-row">
         <button type="submit">Continue</button>
       </div>
