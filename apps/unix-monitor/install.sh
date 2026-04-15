@@ -255,6 +255,26 @@ ${url}"
     info "Diagnostics session complete."
 }
 
+prompt_diagnostics_next_action() {
+    if [ ! -r /dev/tty ]; then
+        echo "exit"
+        return
+    fi
+    echo ""
+    echo "Next step:"
+    echo "  1) Rerun diagnostics"
+    echo "  2) Continue with installer flow"
+    echo "  3) Exit"
+    echo -e "Choose next step [3]: \c"
+    local choice
+    read_input choice || true
+    case "${choice:-3}" in
+        1) echo "rerun" ;;
+        2) echo "continue" ;;
+        *) echo "exit" ;;
+    esac
+}
+
 install_python() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -530,8 +550,22 @@ echo "------------------------------------------------------"
 echo ""
 
 if [ "${RUN_DIAGNOSTICS}" = "1" ]; then
-    run_diagnostics_session
-    exit 0
+    while true; do
+        run_diagnostics_session
+        NEXT_ACTION="$(prompt_diagnostics_next_action)"
+        case "${NEXT_ACTION}" in
+            rerun)
+                continue
+                ;;
+            continue)
+                RUN_DIAGNOSTICS=0
+                break
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
+    done
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
