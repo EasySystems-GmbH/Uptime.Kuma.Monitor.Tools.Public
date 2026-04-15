@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0050"
+VERSION = "1.6.0-0051"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -331,6 +331,35 @@ def _register_auth_failure(auth: Dict[str, Any]) -> None:
         auth["lockout_until"] = int(time.time()) + AUTH_LOCKOUT_DURATION_SEC
         auth["failed_attempts"] = 0
     _save_auth_state(auth)
+
+
+def _format_lock_wait(wait_sec: int) -> str:
+    total = max(0, int(wait_sec or 0))
+    mins, secs = divmod(total, 60)
+    return f"{mins}m {secs}s" if mins > 0 else f"{max(1, secs)}s"
+
+
+def _lockout_message(wait_sec: int) -> str:
+    until_ts = int(time.time()) + max(0, int(wait_sec or 0))
+    until_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until_ts))
+    return (
+        f"Account temporarily locked after repeated failed sign-in attempts. "
+        f"Try again in {_format_lock_wait(wait_sec)} (until about {until_text})."
+    )
+
+
+def _invalid_password_message(auth: Dict[str, Any]) -> str:
+    attempts = int(auth.get("failed_attempts", 0) or 0)
+    remaining = max(0, int(AUTH_MAX_LOGIN_ATTEMPTS) - attempts)
+    if remaining <= 0:
+        locked, wait_sec = _is_locked(auth)
+        if locked:
+            return _lockout_message(wait_sec)
+        return "Account temporarily locked after repeated failed sign-in attempts."
+    return (
+        f"Invalid password. {remaining} attempt(s) remaining before a "
+        f"{int(AUTH_LOCKOUT_DURATION_SEC // 60)}-minute lock."
+    )
 
 
 def _register_auth_success(auth: Dict[str, Any]) -> None:
@@ -823,10 +852,16 @@ def _collect_system_specs() -> Dict[str, str]:
                     if ":" not in ln:
                         continue
                     k, v = ln.split(":", 1)
-                    if k.strip().lower() in {"model name", "hardware", "processor"}:
-                        cpu = v.strip()
-                        if cpu:
-                            break
+                    key = k.strip().lower()
+                    val = v.strip()
+                    if key not in {"model name", "hardware", "processor"}:
+                        continue
+                    # Skip "processor: 0/1/2..." index lines and prefer real model/hardware names.
+                    if key == "processor" and re.fullmatch(r"\d+", val):
+                        continue
+                    cpu = val
+                    if cpu:
+                        break
         except OSError:
             pass
     if not cpu:
@@ -6862,6 +6897,26 @@ def _render_setup_html(
     spec_ram = "n/a (remote source)" if source_is_remote else local_specs.get("ram", "n/a")
     spec_disk = "n/a (remote source)" if source_is_remote else local_specs.get("disk", "n/a")
     spec_uptime = "n/a (remote source)" if source_is_remote else local_specs.get("uptime", "n/a")
+    cpu_detail_text = (
+        f"CPU: {spec_cpu}\nSource: /proc/cpuinfo model/hardware\n{source_scope_text}"
+        if not source_is_remote
+        else f"CPU: {spec_cpu}\nDetails are available on the selected remote source UI."
+    )
+    ram_detail_text = (
+        f"RAM (Total): {spec_ram}\nSource: /proc/meminfo MemTotal\n{source_scope_text}"
+        if not source_is_remote
+        else f"RAM (Total): {spec_ram}\nDetails are available on the selected remote source UI."
+    )
+    disk_detail_text = (
+        f"Disk (Total / Free): {spec_disk}\nSource: statvfs('/')\n{source_scope_text}"
+        if not source_is_remote
+        else f"Disk (Total / Free): {spec_disk}\nDetails are available on the selected remote source UI."
+    )
+    uptime_detail_text = (
+        f"Uptime: {spec_uptime}\nSource: /proc/uptime\n{source_scope_text}"
+        if not source_is_remote
+        else f"Uptime: {spec_uptime}\nDetails are available on the selected remote source UI."
+    )
     package_panel_open = " open" if open_server_panel == "package" else ""
     package_panel_html = (
         "<div class='card server-action-panel" + package_panel_open + "' data-server-panel='package'>"
@@ -6881,10 +6936,10 @@ def _render_setup_html(
         f"<button type='button' class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(display_source_name)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(display_server_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(display_now_text)}</strong></button>"
-        f"<div class='server-info-item'><span class='muted'>CPU</span><strong>{html.escape(spec_cpu)}</strong></div>"
-        f"<div class='server-info-item'><span class='muted'>RAM (Total)</span><strong>{html.escape(spec_ram)}</strong></div>"
-        f"<div class='server-info-item'><span class='muted'>Disk (Total / Free)</span><strong>{html.escape(spec_disk)}</strong></div>"
-        f"<div class='server-info-item'><span class='muted'>Uptime</span><strong>{html.escape(spec_uptime)}</strong></div>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='cpu'><span class='muted'>CPU</span><strong>{html.escape(spec_cpu)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='ram'><span class='muted'>RAM (Total)</span><strong>{html.escape(spec_ram)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='disk'><span class='muted'>Disk (Total / Free)</span><strong>{html.escape(spec_disk)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='uptime'><span class='muted'>Uptime</span><strong>{html.escape(spec_uptime)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong>{html.escape(display_runtime_version)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(display_last_login_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(display_last_login_at_text)}</strong></button>"
@@ -6893,6 +6948,10 @@ def _render_setup_html(
         f"<div class='card server-action-panel' data-server-panel='name'><h4>Change server name</h4><form method='post' action='/settings/save-instance-name'><label>Instance Name</label><input name='instance_name' value='{html.escape(str(cfg.get('instance_name', '') or ''))}' placeholder='e.g. HQ-NAS'><div class='button-row'><button type='submit'>Save name</button></div></form></div>"
         f"<div class='card server-action-panel' data-server-panel='ip'><h4>System IP addresses</h4><div class='muted'>Current web UI bind: {html.escape(bind_scope_text)} on port {ui_bind_port}</div><pre>{html.escape(ip_list_text)}</pre></div>"
         f"<div class='card server-action-panel' data-server-panel='time'><h4>Time sync details</h4><pre>Current time: {html.escape(now_text)}\nLast peer sync: {html.escape(peer_last_sync_text)}\nNTP synced: {html.escape(ntp_info.get('synced', 'unknown'))}\nNTP service: {html.escape(ntp_info.get('service', 'unknown'))}\nNTP source: {html.escape(ntp_info.get('source', 'unknown'))}\n\n{html.escape(ntp_info.get('detail', ''))}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='cpu'><h4>CPU details</h4><pre>{html.escape(cpu_detail_text)}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='ram'><h4>RAM details</h4><pre>{html.escape(ram_detail_text)}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='disk'><h4>Disk details</h4><pre>{html.escape(disk_detail_text)}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='uptime'><h4>Uptime details</h4><pre>{html.escape(uptime_detail_text)}</pre></div>"
         + package_panel_html
         + f"<div class='card server-action-panel' data-server-panel='login'><h4>Recent login events (IP + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
         + f"<div class='card server-action-panel' data-server-panel='login-time'><h4>Recent login events (time + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
@@ -9521,7 +9580,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     self._redirect("/")
                     return
                 locked, wait_sec = _is_locked(auth)
-                msg = f"Login temporarily locked. Try again in {wait_sec}s." if locked else ""
+                msg = _lockout_message(wait_sec) if locked else ""
                 self._reply_html(_render_auth_login_page(info=msg, ssl_warning=ssl_warning))
                 return
             if parsed.path == "/auth/verify-2fa":
@@ -10638,14 +10697,14 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         return
                     locked, wait_sec = _is_locked(auth)
                     if locked:
-                        self._reply_html(_render_auth_login_page(error=f"Locked. Try again in {wait_sec}s.", ssl_warning=ssl_warning))
+                        self._reply_html(_render_auth_login_page(error=_lockout_message(wait_sec), ssl_warning=ssl_warning))
                         return
                     pwd = (form.get("password", [""])[0] or "").strip()
                     if not check_password_hash(str(auth.get("password_hash", "")), pwd):
                         _register_auth_failure(auth)
                         _append_login_event(auth, self._client_source_ip(), "failed-password")
                         _save_auth_state(auth)
-                        self._reply_html(_render_auth_login_page(error="Invalid password.", ssl_warning=ssl_warning))
+                        self._reply_html(_render_auth_login_page(error=_invalid_password_message(auth), ssl_warning=ssl_warning))
                         return
                     _register_auth_success(auth)
                     challenge = _sign_payload(
