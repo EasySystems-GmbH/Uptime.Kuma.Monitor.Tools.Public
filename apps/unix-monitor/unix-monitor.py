@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0048"
+VERSION = "1.6.0-0049"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -777,6 +777,95 @@ def _fmt_ui_log_size(num_bytes: int) -> str:
     if num_bytes < 1024 * 1024:
         return f"{num_bytes / 1024:.1f} KiB"
     return f"{num_bytes / (1024 * 1024):.1f} MiB"
+
+
+def _fmt_bytes(num_bytes: Optional[float]) -> str:
+    try:
+        n = float(num_bytes or 0)
+    except (TypeError, ValueError):
+        return "n/a"
+    if n <= 0:
+        return "n/a"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    idx = 0
+    while n >= 1024 and idx < len(units) - 1:
+        n /= 1024.0
+        idx += 1
+    precision = 0 if n >= 10 or idx == 0 else 1
+    return f"{n:.{precision}f} {units[idx]}"
+
+
+def _fmt_uptime(seconds: Optional[float]) -> str:
+    try:
+        total = int(float(seconds or 0))
+    except (TypeError, ValueError):
+        return "n/a"
+    if total < 0:
+        return "n/a"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _collect_system_specs() -> Dict[str, str]:
+    cpu = os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+    if not cpu:
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    if ":" not in ln:
+                        continue
+                    k, v = ln.split(":", 1)
+                    if k.strip().lower() in {"model name", "hardware", "processor"}:
+                        cpu = v.strip()
+                        if cpu:
+                            break
+        except OSError:
+            pass
+    if not cpu:
+        cpu = platform.machine() or "unknown"
+
+    mem_total_bytes = 0.0
+    try:
+        with open("/proc/meminfo", encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                if ln.startswith("MemTotal:"):
+                    parts = ln.split()
+                    if len(parts) >= 2:
+                        mem_total_bytes = float(parts[1]) * 1024.0
+                    break
+    except OSError:
+        pass
+
+    disk_text = "n/a"
+    try:
+        st = os.statvfs("/")
+        total = float(st.f_blocks) * float(st.f_frsize)
+        free = float(st.f_bavail) * float(st.f_frsize)
+        disk_text = f"{_fmt_bytes(total)} / {_fmt_bytes(free)}"
+    except OSError:
+        pass
+
+    uptime_seconds = 0.0
+    try:
+        with open("/proc/uptime", encoding="utf-8", errors="ignore") as f:
+            uptime_seconds = float((f.read().strip().split() or ["0"])[0])
+    except (OSError, ValueError):
+        pass
+
+    return {
+        "cpu": cpu or "n/a",
+        "ram": _fmt_bytes(mem_total_bytes),
+        "disk": disk_text,
+        "uptime": _fmt_uptime(uptime_seconds),
+    }
 
 
 def read_ui_log(
@@ -6590,7 +6679,7 @@ def _render_setup_html(
     source_scope_text = (
         f"Viewing remote source: {source_name} (gauges and diagnostics are scoped to this source)."
         if source_is_remote
-        else ("" if peer_role == "agent" else f"Viewing local source: {source_name}.")
+        else (f"Viewing local source: {source_name}." if peer_role == "master" else "")
     )
     update_channel = "main" if bool(cfg.get("update_from_main", False)) else "latest"
     update_curl_cmd = (
@@ -6671,6 +6760,11 @@ def _render_setup_html(
             package_update_btns += "</div>"
     ip_list_text = "\n".join(all_ips) if all_ips else "No IP addresses detected."
     login_history_text = "\n".join(login_lines)
+    local_specs = _collect_system_specs()
+    spec_cpu = "n/a (remote source)" if source_is_remote else local_specs.get("cpu", "n/a")
+    spec_ram = "n/a (remote source)" if source_is_remote else local_specs.get("ram", "n/a")
+    spec_disk = "n/a (remote source)" if source_is_remote else local_specs.get("disk", "n/a")
+    spec_uptime = "n/a (remote source)" if source_is_remote else local_specs.get("uptime", "n/a")
     package_panel_open = " open" if open_server_panel == "package" else ""
     package_panel_html = (
         "<div class='card server-action-panel" + package_panel_open + "' data-server-panel='package'>"
@@ -6690,6 +6784,10 @@ def _render_setup_html(
         f"<button type='button' class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(display_source_name)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(display_server_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(display_now_text)}</strong></button>"
+        f"<div class='server-info-item'><span class='muted'>CPU</span><strong>{html.escape(spec_cpu)}</strong></div>"
+        f"<div class='server-info-item'><span class='muted'>RAM (Total)</span><strong>{html.escape(spec_ram)}</strong></div>"
+        f"<div class='server-info-item'><span class='muted'>Disk (Total / Free)</span><strong>{html.escape(spec_disk)}</strong></div>"
+        f"<div class='server-info-item'><span class='muted'>Uptime</span><strong>{html.escape(spec_uptime)}</strong></div>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong>{html.escape(display_runtime_version)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(display_last_login_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(display_last_login_at_text)}</strong></button>"
