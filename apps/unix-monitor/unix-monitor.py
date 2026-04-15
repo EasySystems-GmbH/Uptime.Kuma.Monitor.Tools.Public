@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0049"
+VERSION = "1.6.0-0050"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -3024,7 +3024,7 @@ def _systemd_timer_status(timer_unit: str) -> Dict[str, str]:
     }
 
 
-def _scheduler_status_text(cfg: Dict[str, Any]) -> str:
+def _scheduler_status_data(cfg: Dict[str, Any]) -> Dict[str, Any]:
     interval = int(cfg.get("cron_interval_minutes", 60) or 60)
     cron_enabled = bool(cfg.get("cron_enabled", False))
     backend = str(cfg.get("scheduler_backend", "cron")).strip().lower()
@@ -3038,21 +3038,28 @@ def _scheduler_status_text(cfg: Dict[str, Any]) -> str:
     due_text = "yes" if _is_scheduled_due(interval) else "no"
     helper_ok, helper_msg = get_smart_helper_status()
     lines: List[str]
+    scheduler_process = "n/a"
+    scheduler_timer = "n/a"
+    timer_next = "n/a"
+    timer_last = "n/a"
+    pid_text = "missing"
     if backend == "systemd":
         t = _systemd_timer_status("unix-monitor-scheduler.timer")
         timer_running = t.get("active_state") == "active"
+        scheduler_timer = (
+            f"{'active' if timer_running else 'inactive'} "
+            f"(state={t.get('active_state')}/{t.get('sub_state')}, unit={t.get('unit_file_state')})"
+        )
+        timer_next = str(t.get("next", "n/a"))
+        timer_last = str(t.get("last", "n/a"))
         lines = [
             f"Scheduler backend: {backend}",
-            (
-                "Scheduler timer: "
-                f"{'active' if timer_running else 'inactive'} "
-                f"(state={t.get('active_state')}/{t.get('sub_state')}, unit={t.get('unit_file_state')})"
-            ),
+            f"Scheduler timer: {scheduler_timer}",
             "Scheduler service mode: systemd oneshot (no persistent PID expected)",
             f"Automatic checks enabled (global): {'yes' if cron_enabled else 'no'}",
             f"Configured scheduler interval: {interval} minute(s)",
-            f"Timer next trigger: {t.get('next', 'n/a')}",
-            f"Timer last trigger: {t.get('last', 'n/a')}",
+            f"Timer next trigger: {timer_next}",
+            f"Timer last trigger: {timer_last}",
             f"Last scheduled run (state file): {last_text}",
             f"SMART elevated cache: {'active' if helper_ok else 'inactive'} | {helper_msg}",
             f"Config file: {cfg_path}",
@@ -3061,7 +3068,6 @@ def _scheduler_status_text(cfg: Dict[str, Any]) -> str:
         ]
     else:
         pid_path = _scheduler_pid_path()
-        pid_text = "missing"
         running = False
         if pid_path.exists():
             try:
@@ -3075,9 +3081,10 @@ def _scheduler_status_text(cfg: Dict[str, Any]) -> str:
                         running = False
             except (OSError, ValueError):
                 pid_text = "invalid"
+        scheduler_process = f"{'running' if running else 'not running'} (pid={pid_text})"
         lines = [
             f"Scheduler backend: {backend}",
-            f"Scheduler process: {'running' if running else 'not running'} (pid={pid_text})",
+            f"Scheduler process: {scheduler_process}",
             f"Automatic checks enabled (global): {'yes' if cron_enabled else 'no'}",
             f"Configured scheduler interval: {interval} minute(s)",
             f"Last scheduled run: {last_text}",
@@ -3091,6 +3098,8 @@ def _scheduler_status_text(cfg: Dict[str, Any]) -> str:
     if monitors:
         lines.append("")
         lines.append("Per-monitor schedule:")
+    per_monitor_rows: List[Dict[str, Any]] = []
+    if monitors:
         for m in monitors:
             mn = str(m.get("name", "?"))
             mi = int(m.get("interval", interval) or interval)
@@ -3099,7 +3108,35 @@ def _scheduler_status_text(cfg: Dict[str, Any]) -> str:
             mlr_text = time.strftime("%H:%M:%S", time.localtime(mlr)) if mlr else "never"
             due = "yes" if _is_scheduled_due(mi, mn) else "no"
             lines.append(f"  {mn}: {mi}m | cron={'on' if mc else 'off'} | last={mlr_text} | due={due}")
-    return "\n".join(lines)
+            per_monitor_rows.append({
+                "name": mn,
+                "interval_minutes": mi,
+                "enabled": mc,
+                "last_run": mlr_text,
+                "due": due,
+            })
+    return {
+        "backend": backend,
+        "global_enabled": cron_enabled,
+        "global_interval_minutes": interval,
+        "last_scheduled_run": last_text,
+        "is_due": due_text,
+        "scheduler_process": scheduler_process if backend != "systemd" else "systemd oneshot",
+        "scheduler_timer": scheduler_timer,
+        "timer_next": timer_next,
+        "timer_last": timer_last,
+        "smart_cache_active": helper_ok,
+        "smart_cache_message": helper_msg,
+        "config_path": cfg_path,
+        "runtime_dir": runtime_dir,
+        "service_script": str(_scheduler_service_path()),
+        "monitor_rows": per_monitor_rows,
+        "raw_text": "\n".join(lines),
+    }
+
+
+def _scheduler_status_text(cfg: Dict[str, Any]) -> str:
+    return str(_scheduler_status_data(cfg).get("raw_text", ""))
 
 
 def _load_history() -> List[Dict[str, Any]]:
@@ -5074,7 +5111,8 @@ def push_to_kuma(url: str, status: str, message: str, ping_ms: float, debug: boo
     We map 'warning' -> 'up' so degraded-but-not-down shows green; the message conveys the warning."""
     kuma_status = "up" if status == "warning" else status
     base = normalize_kuma_url(url)
-    full = f"{base}?status={kuma_status}&msg={quote(message)}&ping={ping_ms}"
+    compact_msg = _compact_kuma_message(message)
+    full = f"{base}?status={kuma_status}&msg={quote(compact_msg)}&ping={ping_ms}"
     if debug:
         print(f"    [push] GET {base}?status=...&msg=...&ping={ping_ms}")
     try:
@@ -5097,6 +5135,64 @@ def push_to_kuma(url: str, status: str, message: str, ping_ms: float, debug: boo
         if debug:
             print(f"    [push] error: {type(e).__name__}: {e}")
         return False
+
+
+def _compact_kuma_message(message: str, max_len: int = 600) -> str:
+    raw = str(message or "").replace("\r", "\n")
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    if not lines:
+        return "monitor: unknown"
+
+    header = lines[0]
+    mode_match = re.search(r"\(([^)]+)\)", header)
+    mode = (mode_match.group(1).strip().lower() if mode_match else "monitor")
+    status_match = re.search(r"\)\s*=\s*([a-z]+)\s*@", header, flags=re.IGNORECASE)
+    status = (status_match.group(1).strip().lower() if status_match else "unknown")
+
+    details: List[str] = []
+    for ln in lines[1:]:
+        if ln.endswith(":"):
+            continue
+        cleaned = ln.lstrip("- ").strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        details.append(cleaned)
+
+    reason = ""
+    if mode == "storage":
+        reasons = [d for d in details if "native storage probe unavailable" in d.lower() or "fallback probe" in d.lower()]
+        reason = reasons[0] if reasons else (details[0] if details else "")
+        facts = details[:3]
+    elif mode == "smart":
+        reason = details[0] if details else ""
+        facts = details[:4]
+    elif mode == "backup":
+        reason = details[0] if details else ""
+        facts = details[:3]
+    elif mode == "service":
+        down_items = [d for d in details if "not_found" in d.lower() or "stopped" in d.lower() or "paused" in d.lower()]
+        reason = down_items[0] if down_items else (details[0] if details else "")
+        facts = down_items[:3] if down_items else details[:3]
+    elif mode in {"ping", "port", "dns"}:
+        reason = details[0] if details else ""
+        facts = details[:2]
+    else:
+        reason = details[0] if details else ""
+        facts = details[:2]
+
+    if details and len(facts) < len(details):
+        facts.append(f"+{len(details) - len(facts)} more")
+
+    parts = [f"{mode}: {status}"]
+    if reason:
+        parts.append(reason)
+    if facts:
+        parts.append("; ".join(facts))
+    compact = " | ".join(parts)
+    if len(compact) > max_len:
+        compact = compact[: max_len - 3] + "..."
+    return compact
 
 
 def prompt(text: str, default: Optional[str] = None) -> str:
@@ -6089,7 +6185,8 @@ def _render_setup_html(
             log_time_from=log_time_from_norm,
             log_time_to=log_time_to_norm,
         )
-    automation_status = _scheduler_status_text(cfg)
+    automation_data = _scheduler_status_data(cfg)
+    automation_status = str(automation_data.get("raw_text", ""))
     auth_state = _load_auth_state()
     recovery_unused = _count_unused_recovery(auth_state)
     request_interface = _request_interface_host()
@@ -6826,13 +6923,48 @@ def _render_setup_html(
         <pre id="log-diag-pre"{_log_pre_attrs}>{html.escape(log_text)}</pre>
       </div>
     """
+    auto_rows = [
+        ("Scheduler backend", str(automation_data.get("backend", "n/a") or "n/a")),
+        ("Automatic checks (global)", "yes" if automation_data.get("global_enabled") else "no"),
+        ("Global interval", f"{int(automation_data.get('global_interval_minutes', 60) or 60)} minute(s)"),
+        ("Last scheduled run", str(automation_data.get("last_scheduled_run", "never") or "never")),
+        ("Due now", str(automation_data.get("is_due", "n/a") or "n/a")),
+        ("Scheduler process", str(automation_data.get("scheduler_process", "n/a") or "n/a")),
+        ("Scheduler timer", str(automation_data.get("scheduler_timer", "n/a") or "n/a")),
+        ("Timer next trigger", str(automation_data.get("timer_next", "n/a") or "n/a")),
+        ("SMART elevated cache", ("active" if automation_data.get("smart_cache_active") else "inactive") + " | " + str(automation_data.get("smart_cache_message", "n/a") or "n/a")),
+    ]
+    automation_summary_html = (
+        "<div class='server-info-grid'>"
+        + "".join(
+            f"<div class='server-info-item'><span class='muted'>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>"
+            for label, value in auto_rows
+        )
+        + "</div>"
+    )
+    automation_mon_rows = automation_data.get("monitor_rows", []) if isinstance(automation_data.get("monitor_rows"), list) else []
+    automation_monitors_html = "".join(
+        (
+            "<div class='monitor-card'>"
+            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(str(row.get('name', '?')))}</div>"
+            + (f"<span class='badge st-up'>enabled</span>" if row.get("enabled") else f"<span class='badge st-warning'>disabled</span>")
+            + "</div>"
+            + f"<div class='monitor-meta'>Interval: {html.escape(str(row.get('interval_minutes', '?')))}m | Due: {html.escape(str(row.get('due', 'n/a')))}</div>"
+            + f"<div class='monitor-meta'>Last scheduled run: {html.escape(str(row.get('last_run', 'never')))}</div>"
+            + "</div>"
+        )
+        for row in automation_mon_rows
+        if isinstance(row, dict)
+    )
     setup_view_html = f"""
       {setup_card}
       <div class="card">
         <h3>Automation</h3>
         {"<div class='ok'>" + html.escape(automation_message) + "</div>" if automation_message else ""}
-        {"<pre>" + html.escape(automation_output) + "</pre>" if automation_output else ""}
-        <pre>{html.escape(automation_status)}</pre>
+        {automation_summary_html}
+        {("<div class='monitor-grid' style='margin-top:10px;'>" + automation_monitors_html + "</div>") if automation_monitors_html else "<div class='muted' style='margin-top:10px;'>No per-monitor schedule entries yet.</div>"}
+        {"<details style='margin-top:10px;'><summary style='cursor:pointer;'>Automation command output</summary><pre>" + html.escape(automation_output) + "</pre></details>" if automation_output else ""}
+        <details style="margin-top:10px;"><summary style="cursor:pointer;">Raw automation diagnostics (debug)</summary><pre>{html.escape(automation_status)}</pre></details>
         <div class="button-row">
           <form method="post" action="/run-scheduled-now"><button type="submit">Run scheduled now</button></form>
           <form method="post" action="/repair-automation"><button type="submit">Repair automation</button></form>
@@ -6855,15 +6987,21 @@ def _render_setup_html(
         {"<div class='ok'>" + html.escape(security_message) + "</div>" if security_message else ""}
         {"<pre>" + html.escape(security_output) + "</pre>" if security_output else ""}
         <form method="post" action="/settings/save-instance-name">
-          <label>Instance Name</label>
-          <input name="instance_name" value="{html.escape(str(cfg.get('instance_name', '') or ''))}" placeholder="e.g. HQ-NAS">
+          <div class="field">
+            <label>Instance Name</label>
+            <input name="instance_name" value="{html.escape(str(cfg.get('instance_name', '') or ''))}" placeholder="e.g. HQ-NAS">
+          </div>
           <div class="button-row"><button type="submit">Save instance name</button></div>
         </form>
         <form method="post" action="/settings/save-ui-bind">
-          <label>Web UI bind interface/IP</label>
-          <select name="ui_bind_host">{bind_options_html}</select>
-          <label>Web UI port</label>
-          <input name="ui_bind_port" type="number" min="1" max="65535" value="{ui_bind_port}">
+          <div class="field">
+            <label>Web UI bind interface/IP</label>
+            <select name="ui_bind_host">{bind_options_html}</select>
+          </div>
+          <div class="field">
+            <label>Web UI port</label>
+            <input name="ui_bind_port" type="number" min="1" max="65535" value="{ui_bind_port}">
+          </div>
           <div class="muted">Applies after restarting the Unix monitor UI/service.</div>
           <div class="button-row"><button type="submit">Save web UI binding</button></div>
         </form>
