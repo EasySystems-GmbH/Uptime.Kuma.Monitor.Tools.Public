@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0078"
+VERSION = "1.6.0-0079"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5033,7 +5033,7 @@ def toggle_debug() -> None:
     print(f"\n  Debug mode: {'ON' if cfg['debug'] else 'OFF'}")
 
 
-def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
+def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering_diagnostics: str = "") -> str:
     instance_id = _get_instance_id(cfg)
     instance_name = str(cfg.get("instance_name", "") or "")
     role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
@@ -5531,6 +5531,10 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
         </div>
         """
 
+    peering_diagnostics_text = (peering_diagnostics or "").strip() or (
+        "Run 'Test connection to master' or 'Sync now' to capture diagnostics."
+    )
+
     return f"""
       <div class="card" id="peering-card">
         <h3>Multi-Instance Peering</h3>
@@ -5548,6 +5552,8 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "") -> str:
           {master_peer_actions_html}
           {token_section}
           {agent_fields}
+        <div class="muted" style="margin-top:10px;">Peering diagnostics</div>
+        <pre class="code" style="margin-top:6px;max-height:14rem;overflow:auto;">{html.escape(peering_diagnostics_text)}</pre>
         {peer_cleanup_html}
         {live_panel_html}
       </div>
@@ -5578,6 +5584,7 @@ def _render_setup_html(
     security_message: str = "",
     security_output: str = "",
     peering_message: str = "",
+    peering_diagnostics: str = "",
     ssl_warning: str = "",
     ui_view: str = "overview",
     highlight_channel: str = "",
@@ -6505,7 +6512,7 @@ def _render_setup_html(
           </div>
         </form>
       </div>
-      {_render_peering_card(cfg, peering_message=peering_message)}
+      {_render_peering_card(cfg, peering_message=peering_message, peering_diagnostics=peering_diagnostics)}
       <div class="card">
         <h3>Danger Zone</h3>
         <div class="muted">Restart package services from UI (web UI + scheduler loop).</div>
@@ -9493,10 +9500,23 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 test_token = (form.get("peer_token", [""])[0] or "").strip()
                 test_url = _resolve_peer_url_from_stored(test_url_raw, test_token, timeout=8) if test_url_raw and test_token else test_url_raw
                 result = _peer_test_connection(test_url, test_token) if test_url else "Missing host or token."
+                ok = str(result).strip().lower().startswith("ok")
+                diag_lines = [
+                    "Action: Test connection to master",
+                    f"Result: {'OK' if ok else 'FAILED'}",
+                    "Role: agent (form action)",
+                    f"Master target (input): {test_url_raw or '(empty)'}",
+                    f"Resolved target URL: {test_url or '(none)'}",
+                    f"Token provided: {'yes' if bool(test_token) else 'no'}",
+                    f"Result detail: {result}",
+                    ("Next action: Run 'Sync now' to push an agent snapshot."
+                     if ok else "Next action: Verify host/port/token and retry test.")
+                ]
                 ssl_warning = self._ssl_warning_text()
                 ui_view = self._view_from_referer()
                 self._reply_html(_render_setup_html(
                     peering_message=f"Peer test: {result}",
+                    peering_diagnostics="\n".join(diag_lines),
                     ui_view="settings",
                     ssl_warning=ssl_warning,
                 ))
@@ -9573,9 +9593,20 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         cr = _agent_request_cert(cfg)
                         _extra_msg = f" Cert request: {cr}"
                 append_ui_log(f"peer-settings | saved | role={role} | name={cfg.get('instance_name', '')}")
+                diag_lines = [
+                    "Action: Save peering settings",
+                    "Result: OK",
+                    f"Role: {role}",
+                    f"Master host: {str(cfg.get('peer_master_url', '') or '(empty)')}",
+                    f"Peer port: {int(cfg.get('peer_port', PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)}",
+                    f"Token configured: {'yes' if bool(str(cfg.get('peering_token', '') or '').strip()) else 'no'}",
+                    f"Agent callback host: {str(cfg.get('agent_callback_url', '') or '(empty)')}",
+                    "Next action: Run 'Test connection to master' and then 'Sync now'."
+                ]
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
                     peering_message=f"Peering settings saved.{_extra_msg}",
+                    peering_diagnostics="\n".join(diag_lines),
                     ui_view="settings",
                     ssl_warning=ssl_warning,
                 ))
@@ -9748,9 +9779,22 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     append_ui_log(f"peer-sync | manual master sync: {result}")
                 else:
                     result = "Standalone mode - no sync needed."
+                diag_lines = [
+                    "Action: Sync now",
+                    f"Result: {'OK' if 'failed' not in str(result).lower() and 'error' not in str(result).lower() else 'FAILED'}",
+                    f"Role: {role}",
+                    f"Master host: {str(cfg.get('peer_master_url', '') or '(empty)')}",
+                    f"Peer port: {int(cfg.get('peer_port', PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)}",
+                    f"Token configured: {'yes' if bool(str(cfg.get('peering_token', '') or '').strip()) else 'no'}",
+                    f"Agent callback host: {str(cfg.get('agent_callback_url', '') or '(empty)')}",
+                    f"Result detail: {result}",
+                    ("Next action: Open master overview and verify this agent snapshot appears."
+                     if role == "agent" else "Next action: Verify role and use the matching peering action.")
+                ]
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
                     peering_message=f"Sync result: {result}",
+                    peering_diagnostics="\n".join(diag_lines),
                     ui_view="settings",
                     ssl_warning=ssl_warning,
                 ))
