@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0065"
+VERSION = "1.6.0-0068"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6284,21 +6284,17 @@ def _render_setup_html(
     internet_ok = bool(internet_probe.get("reachable"))
     internet_detail = str(internet_probe.get("detail", "n/a") or "n/a")
     internet_required = peer_role != "standalone"
-    internet_status_cls = "ok" if internet_ok else ("err" if internet_required else "muted")
-    internet_status_text = (
-        f"Internet reachable. {internet_detail}"
+    internet_badge_cls = "st-up" if internet_ok else ("st-warning" if internet_required else "muted-badge")
+    internet_badge_text = (
+        "Online"
         if internet_ok
-        else (
-            f"Internet not reachable. {internet_detail}"
-            if internet_required
-            else f"Internet not reachable (standalone mode). {internet_detail}"
-        )
+        else ("Offline" if internet_required else "Offline (standalone)")
     )
     internet_importance_text = (
-        "Internet is recommended for Uptime Kuma push endpoints, peering sync, and update workflows. "
-        "Standalone-only local checks can run without internet."
+        "If internet connectivity is unavailable, push to Kuma and sync to other servers may fail until the connection is restored. "
+        "Local-only checks can still run in standalone mode."
         if internet_required
-        else "Standalone mode: local monitoring works without internet. Internet is needed only when remote push, peering, or update workflows are used."
+        else "Standalone mode supports local monitoring without internet. Internet is only required when remote push to Kuma, server sync, or update workflows are used."
     )
     overview_view_html = f"""
       <div class="card">
@@ -6312,8 +6308,21 @@ def _render_setup_html(
       </div>
       <div class="card">
         <h3>Internet Check</h3>
-        <div class="{internet_status_cls}">{html.escape(internet_status_text)}</div>
-        <div class="muted" style="margin-top:8px;">{html.escape(internet_importance_text)}</div>
+        <div class="server-info-grid">
+          <div class="server-info-item">
+            <span class="muted">Connectivity</span>
+            <details style="width:100%;">
+              <summary style="list-style:none;cursor:pointer;text-align:center;">
+                <span class="badge {internet_badge_cls}">{html.escape(internet_badge_text)}</span>
+              </summary>
+              <div class="muted" style="margin-top:6px;">{html.escape(internet_detail)}</div>
+            </details>
+          </div>
+          <div class="server-info-item">
+            <span class="muted">Why this matters</span>
+            <strong>{html.escape(internet_importance_text)}</strong>
+          </div>
+        </div>
       </div>
       <div class="card">
         <h3>Logs & Diagnostics</h3>
@@ -6348,16 +6357,6 @@ def _render_setup_html(
         ("State note", str(automation_data.get("state_note", "n/a") or "n/a")),
         ("Monitor state entries", str(len(automation_mon_rows))),
     ]
-    for row in automation_mon_rows:
-        if not isinstance(row, dict):
-            continue
-        name = str(row.get("name", "?") or "?")
-        details = (
-            f"Interval: {row.get('interval_minutes', '?')}m"
-            + f" | Due: {row.get('due', 'n/a')}"
-            + f" | Last scheduled run: {row.get('last_run', 'never')}"
-        )
-        automation_state_rows.append((f"Entry: {name}", details))
     automation_state_html = (
         "<div class='server-info-grid' style='margin-top:10px;'>"
         + "".join(
@@ -8083,7 +8082,17 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
         <input id="auth-password" name="password" type="password" autocomplete="current-password" required autofocus>
         <button type="button" class="btn-icon toggle-password-btn" data-target="auth-password" aria-label="Show password">Show</button>
       </div>
-      <div id="auth-internet-msg" class="muted" style="margin-top:10px;">Checking internet connectivity…</div>
+      <div id="auth-internet-msg" class="muted" style="margin-top:10px;padding:8px 10px;border-radius:8px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span id="auth-internet-chip" class="badge st-unknown">…</span>
+          <button type="button" id="auth-internet-info-toggle" style="width:22px;height:22px;border-radius:999px;padding:0;font-size:12px;line-height:20px;text-align:center;" aria-label="Why this status matters">i</button>
+        </div>
+        <div id="auth-internet-info" style="display:none;margin-top:6px;font-size:12px;line-height:1.4;"></div>
+        <label id="auth-internet-ignore-wrap" style="display:none;align-items:center;gap:6px;margin-top:8px;font-size:12px;color:#cddbf0;">
+          <input id="auth-internet-ignore" type="checkbox" style="width:auto;margin:0;">
+          Ignore this warning on this browser
+        </label>
+      </div>
       <div class="button-row">
         <button type="submit">Continue</button>
       </div>
@@ -8091,26 +8100,63 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
     <script>
       (function () {
         var msg = document.getElementById("auth-internet-msg");
-        if (!msg) return;
+        var chip = document.getElementById("auth-internet-chip");
+        var info = document.getElementById("auth-internet-info");
+        var infoToggle = document.getElementById("auth-internet-info-toggle");
+        var ignoreWrap = document.getElementById("auth-internet-ignore-wrap");
+        var ignore = document.getElementById("auth-internet-ignore");
+        var ignoreStorageKey = "synology-monitor-auth-ignore-internet-warning";
+        if (!msg || !chip || !info) return;
+        function getIgnored() {
+          try { return window.localStorage && localStorage.getItem(ignoreStorageKey) === "1"; }
+          catch (e) { return false; }
+        }
+        function setIgnored(val) {
+          try {
+            if (!window.localStorage) return;
+            if (val) localStorage.setItem(ignoreStorageKey, "1");
+            else localStorage.removeItem(ignoreStorageKey);
+          } catch (e) {}
+        }
+        if (infoToggle) {
+          infoToggle.addEventListener("click", function () {
+            info.style.display = info.style.display === "none" ? "block" : "none";
+          });
+        }
+        if (ignore) {
+          ignore.checked = getIgnored();
+          ignore.addEventListener("change", function () { setIgnored(!!ignore.checked); refreshInternetStatus(); });
+        }
         async function refreshInternetStatus() {
           try {
             var r = await fetch("/api/public/internet", { cache: "no-store" });
             var data = await r.json().catch(function () { return {}; });
             if (!r.ok) throw new Error(data.detail || data.error || ("HTTP " + r.status));
             var ok = !!data.reachable;
-            var required = !!data.internet_required;
+            var required = !!(data.internet_required ?? data.internetRequired);
             var detail = String(data.detail || (ok ? "Internet reachable." : "Internet not reachable."));
-            msg.className = ok ? "ok" : (required ? "err" : "muted");
-            if (ok) {
-              msg.textContent = "Internet check: reachable. " + detail;
-            } else if (required) {
-              msg.textContent = "Internet check: not reachable. Uptime Kuma push, updates, and peering can fail until internet is available. " + detail;
+            var ignored = getIgnored();
+            msg.className = ok ? "ok" : (required && !ignored ? "err" : "muted");
+            chip.className = ok ? "badge st-up" : (required ? "badge st-warning" : "badge st-unknown");
+            chip.textContent = ok ? "UP" : "DOWN";
+            if (required) {
+              info.textContent = ok
+                ? ("Internet is available. Push to Kuma and sync to other servers should work normally. " + detail)
+                : ("No internet connectivity detected. Push to Kuma and sync to other servers may fail until connectivity is restored. Local-only standalone checks can still run. " + detail);
             } else {
-              msg.textContent = "Internet check: not reachable. Standalone mode can still run local checks. " + detail;
+              info.textContent = "Standalone mode can run local checks without internet. External push/sync features are optional. " + detail;
+            }
+            if (ignoreWrap) {
+              ignoreWrap.style.display = (!ok && required) ? "flex" : "none";
             }
           } catch (e) {
             msg.className = "muted";
-            msg.textContent = "Internet check unavailable right now.";
+            chip.className = "badge st-unknown";
+            chip.textContent = "?";
+            info.textContent = "Internet check unavailable right now. If internet is down, push to Kuma and server sync may fail; local-only checks can still continue.";
+            if (ignoreWrap) {
+              ignoreWrap.style.display = "none";
+            }
           }
         }
         refreshInternetStatus();
