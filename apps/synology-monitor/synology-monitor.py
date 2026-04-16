@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0080"
+VERSION = "1.6.0-0081"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5637,6 +5637,11 @@ def _render_setup_html(
     modal_ph_display = "block" if _cm in ("ping", "port") else "none"
     modal_pp_display = "block" if _cm == "port" else "none"
     modal_dns_display = "block" if _cm == "dns" else "none"
+    internet_check_message = ""
+    top_security_message = security_message
+    if top_security_message.startswith("Internet check settings saved:"):
+        internet_check_message = top_security_message
+        top_security_message = ""
 
     status_html = ""
     # Elevated check result: only show in Setup & Elevated Access section, not at top
@@ -6451,7 +6456,7 @@ def _render_setup_html(
     settings_view_html = f"""
       <div class="card" id="settings">
         <h3>Application Settings & Security</h3>
-        {"<div class='ok'>" + html.escape(security_message) + "</div>" if security_message else ""}
+        {"<div class='ok'>" + html.escape(top_security_message) + "</div>" if top_security_message else ""}
         {"<pre>" + html.escape(security_output) + "</pre>" if security_output else ""}
         <form method="post" action="/settings/save-instance-name">
           <div class="field">
@@ -6488,6 +6493,7 @@ def _render_setup_html(
             <input name="internet_check_timeout_ms" type="number" min="250" max="15000" value="{int(internet_settings.get("timeout_ms", 1500))}">
           </div>
           <div class="muted">Used by the Internet Check card and login connectivity probe API.</div>
+          {"<div class='ok'>" + html.escape(internet_check_message) + "</div>" if internet_check_message else ""}
           <div class="button-row"><button type="submit">Save internet check settings</button></div>
         </form>
         <form method="post" action="/auth/change-password">
