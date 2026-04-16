@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0077"
+VERSION = "1.6.0-0078"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -98,6 +98,7 @@ LOG_LINE_TS_PREFIX = re.compile(r"^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|
 NAS_VOLUME_PATTERN = re.compile(r"^/volume[0-9]+$")
 SMART_CACHE_MAX_AGE_SEC = 20 * 60
 BACKUP_CACHE_MAX_AGE_SEC = 20 * 60
+DEFAULT_INTERNET_CHECK_TARGETS: List[Tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]
 TASK_STATUS_MAX_DETAIL = 2000
 HISTORY_MAX_ENTRIES = 500
 AUTH_FILE_MODE = 0o600
@@ -3475,6 +3476,23 @@ def load_config() -> Dict[str, Any]:
     if norm_ui_port != old_ui_port:
         cfg["ui_bind_port"] = norm_ui_port
         changed = True
+    internet_mode = _normalize_internet_check_mode(cfg.get("internet_check_mode", "tcp-connect"))
+    if internet_mode != str(cfg.get("internet_check_mode", "tcp-connect") or "tcp-connect").strip().lower():
+        cfg["internet_check_mode"] = internet_mode
+        changed = True
+    internet_timeout_ms = _normalize_internet_check_timeout_ms(cfg.get("internet_check_timeout_ms", 1500))
+    old_internet_timeout_raw = cfg.get("internet_check_timeout_ms", 1500)
+    try:
+        old_internet_timeout = int(old_internet_timeout_raw if old_internet_timeout_raw is not None else 1500)
+    except (TypeError, ValueError):
+        old_internet_timeout = 1500
+    if internet_timeout_ms != old_internet_timeout:
+        cfg["internet_check_timeout_ms"] = internet_timeout_ms
+        changed = True
+    internet_targets = _internet_check_targets_display(_parse_internet_check_targets(cfg.get("internet_check_targets", "")))
+    if internet_targets != str(cfg.get("internet_check_targets", "") or "").strip():
+        cfg["internet_check_targets"] = internet_targets
+        changed = True
     if "update_from_main" not in cfg:
         cfg["update_from_main"] = False
         changed = True
@@ -5817,6 +5835,7 @@ def _render_setup_html(
     all_ips = _list_system_ips()
     ui_bind_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"), all_ips)
     ui_bind_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
+    internet_settings = _internet_check_settings_from_cfg(cfg)
     bind_host_options = _ui_bind_host_options(all_ips)
     bind_scope_text = (
         "All interfaces (0.0.0.0)"
@@ -6310,7 +6329,7 @@ def _render_setup_html(
                 "<button type='submit' onclick=\"return confirm('Clear logs on the selected remote agent?');\" "
                 "style='border-color:#ef4444;color:#ef4444;'>Clear selected agent logs</button></form>"
             )
-    internet_probe = _probe_internet_connectivity()
+    internet_probe = _probe_internet_connectivity(internet_settings)
     internet_ok = bool(internet_probe.get("reachable"))
     internet_detail = str(internet_probe.get("detail", "n/a") or "n/a")
     internet_required = peer_role != "standalone"
@@ -6347,6 +6366,7 @@ def _render_setup_html(
               </summary>
               <div class="muted" style="margin-top:6px;">{html.escape(internet_detail)}</div>
             </details>
+            <div class="muted" style="margin-top:6px;">Settings used: mode={html.escape(str(internet_settings.get('mode', 'tcp-connect')))} | timeout={int(internet_settings.get('timeout_ms', 1500))}ms | targets={html.escape(str(internet_settings.get('targets_text', '')))}</div>
           </div>
           <div class="server-info-item">
             <span class="muted">Why this matters</span>
@@ -6444,6 +6464,24 @@ def _render_setup_html(
           </div>
           <div class="muted">Applies after restarting the Synology monitor UI/service.</div>
           <div class="button-row"><button type="submit">Save web UI binding</button></div>
+        </form>
+        <form method="post" action="/settings/save-internet-check">
+          <div class="field">
+            <label>Internet check mode</label>
+            <select name="internet_check_mode">
+              <option value="tcp-connect"{" selected" if str(internet_settings.get("mode", "tcp-connect")) == "tcp-connect" else ""}>TCP connect (host:port targets)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Internet check targets (comma or newline separated host:port)</label>
+            <textarea name="internet_check_targets" style="min-height:72px;">{html.escape(str(internet_settings.get("targets_text", "")))}</textarea>
+          </div>
+          <div class="field">
+            <label>Internet check timeout per target (ms)</label>
+            <input name="internet_check_timeout_ms" type="number" min="250" max="15000" value="{int(internet_settings.get("timeout_ms", 1500))}">
+          </div>
+          <div class="muted">Used by the Internet Check card and login connectivity probe API.</div>
+          <div class="button-row"><button type="submit">Save internet check settings</button></div>
         </form>
         <form method="post" action="/auth/change-password">
           <input type="hidden" name="username" value="admin" autocomplete="username">
@@ -7887,8 +7925,84 @@ def _render_setup_html(
 </html>
 """
 
-def _probe_internet_connectivity(timeout_sec: float = 1.5) -> Dict[str, Any]:
-    targets = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]
+def _normalize_internet_check_mode(raw: Any) -> str:
+    mode = str(raw or "tcp-connect").strip().lower()
+    if mode in ("tcp", "tcp-connect"):
+        return "tcp-connect"
+    return "tcp-connect"
+
+
+def _normalize_internet_check_timeout_ms(raw: Any) -> int:
+    try:
+        parsed = int(raw)
+    except Exception:
+        parsed = 1500
+    return max(250, min(15000, parsed))
+
+
+def _parse_internet_check_targets(raw: Any) -> List[Tuple[str, int]]:
+    if isinstance(raw, list):
+        tokens = [str(x or "").strip() for x in raw]
+    else:
+        tokens = [p.strip() for p in re.split(r"[\s,;]+", str(raw or ""))]
+    pairs: List[Tuple[str, int]] = []
+    seen: set[Tuple[str, int]] = set()
+    for part in tokens:
+        if not part:
+            continue
+        host = ""
+        port_text = ""
+        if part.startswith("[") and "]:" in part:
+            close_idx = part.find("]:")
+            host = part[1:close_idx].strip()
+            port_text = part[close_idx + 2 :].strip()
+        elif ":" in part:
+            host, port_text = part.rsplit(":", 1)
+            host = host.strip()
+            port_text = port_text.strip()
+        else:
+            continue
+        if not host:
+            continue
+        try:
+            port = int(port_text)
+        except Exception:
+            continue
+        if port < 1 or port > 65535:
+            continue
+        pair = (host, port)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    if not pairs:
+        return list(DEFAULT_INTERNET_CHECK_TARGETS)
+    return pairs
+
+
+def _internet_check_targets_display(targets: List[Tuple[str, int]]) -> str:
+    if not targets:
+        targets = list(DEFAULT_INTERNET_CHECK_TARGETS)
+    return ", ".join(f"{host}:{port}" for host, port in targets)
+
+
+def _internet_check_settings_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    mode = _normalize_internet_check_mode(cfg.get("internet_check_mode", "tcp-connect"))
+    timeout_ms = _normalize_internet_check_timeout_ms(cfg.get("internet_check_timeout_ms", 1500))
+    targets = _parse_internet_check_targets(cfg.get("internet_check_targets", ""))
+    return {
+        "mode": mode,
+        "timeout_ms": timeout_ms,
+        "targets": targets,
+        "targets_text": _internet_check_targets_display(targets),
+    }
+
+
+def _probe_internet_connectivity(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = settings or {}
+    timeout_ms = _normalize_internet_check_timeout_ms(cfg.get("timeout_ms", 1500))
+    timeout_sec = max(0.25, float(timeout_ms) / 1000.0)
+    targets = _parse_internet_check_targets(cfg.get("targets", DEFAULT_INTERNET_CHECK_TARGETS))
     errors: List[str] = []
     checked_at = int(time.time())
     for host, port in targets:
@@ -8115,9 +8229,10 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
       <div class="button-row">
         <button type="submit">Continue</button>
       </div>
+      <div class="muted" style="margin-top:8px;">Recommendation: publish this UI behind a reverse proxy with HTTPS.</div>
       <div id="auth-internet-msg" class="err hidden" style="margin-top:10px;padding:8px 10px;border-radius:8px;">
         <div style="display:flex;align-items:center;gap:8px;">
-          <span id="auth-internet-chip" class="badge st-warning">DOWN</span>
+          <strong id="auth-internet-status-text">No Internet Connectivity</strong>
           <button type="button" id="auth-internet-info-toggle" style="width:22px;height:22px;border-radius:999px;padding:0;font-size:12px;line-height:20px;text-align:center;" aria-label="Why this status matters">i</button>
         </div>
         <div id="auth-internet-info" style="display:none;margin-top:6px;font-size:12px;line-height:1.4;"></div>
@@ -8130,13 +8245,13 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
     <script>
       (function () {
         var msg = document.getElementById("auth-internet-msg");
-        var chip = document.getElementById("auth-internet-chip");
+        var statusText = document.getElementById("auth-internet-status-text");
         var info = document.getElementById("auth-internet-info");
         var infoToggle = document.getElementById("auth-internet-info-toggle");
         var ignoreWrap = document.getElementById("auth-internet-ignore-wrap");
         var ignore = document.getElementById("auth-internet-ignore");
         var ignoreStorageKey = "synology-monitor-auth-ignore-internet-warning";
-        if (!msg || !chip || !info) return;
+        if (!msg || !statusText || !info) return;
         function getIgnored() {
           try { return window.localStorage && localStorage.getItem(ignoreStorageKey) === "1"; }
           catch (e) { return false; }
@@ -8151,9 +8266,8 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
         function showWarning(text) {
           msg.className = getIgnored() ? "muted" : "err";
           msg.classList.remove("hidden");
-          chip.className = "badge st-warning";
-          chip.textContent = "DOWN";
-          info.textContent = String(text || "No internet connectivity detected.");
+          statusText.textContent = "No Internet Connectivity";
+          info.textContent = String(text || "Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode.");
           if (ignoreWrap) { ignoreWrap.style.display = "flex"; }
         }
         function hideWarning() {
@@ -8183,10 +8297,10 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
             if (ok) {
               hideWarning();
             } else {
-              showWarning("No internet connectivity detected. Push/sync features may fail until connectivity is restored. " + detail);
+              showWarning("Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode. " + detail);
             }
           } catch (e) {
-            showWarning("Internet check unavailable right now. If internet is down, push/sync features may fail.");
+            showWarning("Internet check unavailable right now. Internet is required for push to Kuma, peering/sync, and update checks; local standalone checks can still run.");
           }
         }
         refreshInternetStatus();
@@ -8195,7 +8309,7 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
       })();
     </script>
     """
-    return _render_auth_shell("Login", body, info=info, error=error, ssl_warning=ssl_warning)
+    return _render_auth_shell("Login", body, info=info, error=error, ssl_warning="")
 
 
 def _render_auth_verify_page(info: str = "", error: str = "", ssl_warning: str = "") -> str:
@@ -8890,13 +9004,19 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             if parsed.path == "/api/public/internet":
                 cfg = load_config()
                 role = str(cfg.get("peer_role", "standalone") or "standalone").strip().lower()
-                probe = _probe_internet_connectivity()
+                internet_settings = _internet_check_settings_from_cfg(cfg)
+                probe = _probe_internet_connectivity(internet_settings)
                 self._reply_json({
                     "reachable": bool(probe.get("reachable")),
                     "detail": str(probe.get("detail", "") or ""),
                     "checked_at": int(probe.get("checked_at", int(time.time()))),
                     "peer_role": role,
                     "internet_required": role != "standalone",
+                    "settings_used": {
+                        "mode": str(internet_settings.get("mode", "tcp-connect")),
+                        "timeout_ms": int(internet_settings.get("timeout_ms", 1500)),
+                        "targets": str(internet_settings.get("targets_text", "")),
+                    },
                 }, 200)
                 return
             auth = _load_auth_state()
@@ -10267,6 +10387,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             if self.path not in (
                 "/settings/save-instance-name",
                 "/settings/save-ui-bind",
+                "/settings/save-internet-check",
                 "/settings/save-update-from-main",
                 "/settings/recheck-updates",
                 "/save",
@@ -10373,6 +10494,33 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     append_ui_log(f"settings | web ui bind saved host={selected_host} port={selected_port}")
                     self._reply_html(_render_setup_html(
                         security_message=f"Web UI binding saved: {bind_desc}:{selected_port}. Restart UI/service to apply.",
+                        ui_view="settings",
+                        diag_view=diag_view,
+                        log_filter=log_filter,
+                        log_source=log_source,
+                        log_date=log_date,
+                        log_time_scope=log_time_scope,
+                        log_time_from=log_time_from,
+                        log_time_to=log_time_to,
+                        server_panel=server_panel,
+                    ))
+                    return
+                if self.path == "/settings/save-internet-check":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
+                    cfg = load_config()
+                    mode = _normalize_internet_check_mode(form.get("internet_check_mode", [cfg.get("internet_check_mode", "tcp-connect")])[0])
+                    timeout_ms = _normalize_internet_check_timeout_ms(form.get("internet_check_timeout_ms", [cfg.get("internet_check_timeout_ms", 1500)])[0])
+                    targets = _internet_check_targets_display(_parse_internet_check_targets(form.get("internet_check_targets", [cfg.get("internet_check_targets", "")])[0]))
+                    cfg["internet_check_mode"] = mode
+                    cfg["internet_check_timeout_ms"] = timeout_ms
+                    cfg["internet_check_targets"] = targets
+                    save_config(cfg, reapply_cron=False)
+                    append_ui_log(f"settings | internet check saved mode={mode} timeout_ms={timeout_ms} targets={targets}")
+                    self._reply_html(_render_setup_html(
+                        security_message=f"Internet check settings saved: mode={mode}, timeout={timeout_ms}ms, targets={targets}.",
                         ui_view="settings",
                         diag_view=diag_view,
                         log_filter=log_filter,
