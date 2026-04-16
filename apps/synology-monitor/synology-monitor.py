@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0069"
+VERSION = "1.6.0-0070"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1023,6 +1023,10 @@ def _fmt_uptime(seconds: Optional[float]) -> str:
 
 def _collect_system_specs() -> Dict[str, str]:
     cpu = os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+    if cpu and re.fullmatch(r"\d+", cpu):
+        cpu = ""
+    cpu_core_count: Optional[int] = None
+    proc_cpu_count = 0
     if not cpu:
         try:
             with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
@@ -1032,10 +1036,23 @@ def _collect_system_specs() -> Dict[str, str]:
                     k, v = ln.split(":", 1)
                     key = k.strip().lower()
                     val = v.strip()
-                    if key not in {"model name", "hardware", "processor"}:
+                    if key == "processor":
+                        if re.fullmatch(r"\d+", val):
+                            proc_cpu_count += 1
+                            continue
+                        # Some environments report model text in "processor".
+                        if val and not re.fullmatch(r"\d+", val):
+                            cpu = val
+                            continue
+                    if key == "cpu cores":
+                        try:
+                            parsed_cores = int(val)
+                            if parsed_cores > 0:
+                                cpu_core_count = parsed_cores
+                        except ValueError:
+                            pass
                         continue
-                    # Skip "processor: 0/1/2..." index lines and prefer real model/hardware names.
-                    if key == "processor" and re.fullmatch(r"\d+", val):
+                    if key not in {"model name", "hardware", "processor"}:
                         continue
                     cpu = val
                     if cpu:
@@ -1044,6 +1061,18 @@ def _collect_system_specs() -> Dict[str, str]:
             pass
     if not cpu:
         cpu = os.uname().machine if hasattr(os, "uname") else "unknown"
+    if not cpu_core_count:
+        try:
+            detected = int(os.cpu_count() or 0)
+            if detected > 0:
+                cpu_core_count = detected
+        except (TypeError, ValueError):
+            cpu_core_count = None
+    if (not cpu_core_count) and proc_cpu_count > 0:
+        cpu_core_count = proc_cpu_count
+    cpu = (cpu or "n/a").strip() or "n/a"
+    if cpu_core_count and cpu_core_count > 0 and f"{cpu_core_count} core" not in cpu.lower():
+        cpu = f"{cpu} ({cpu_core_count} cores)"
 
     mem_total_bytes = 0.0
     try:
@@ -1074,7 +1103,8 @@ def _collect_system_specs() -> Dict[str, str]:
         pass
 
     return {
-        "cpu": cpu or "n/a",
+        "cpu": cpu,
+        "cpu_cores": str(cpu_core_count or ""),
         "ram": _fmt_bytes(mem_total_bytes),
         "disk": disk_text,
         "uptime": _fmt_uptime(uptime_seconds),
@@ -6014,7 +6044,7 @@ def _render_setup_html(
         )
         local_cards.append(
             f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == str(mode).lower()) else ''}' data-monitor='{html.escape(name)}' data-mode='{html.escape(str(mode).lower())}'>"
-            + f"<div class='monitor-head'><div style='display:flex;align-items:center;gap:6px;'>{auto_badge}<div class='monitor-title'>{html.escape(name)}</div></div><span class='badge {status_class(st)}'>{status_label(st)}</span></div>"
+            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(name)}</div><div style='display:flex;align-items:center;gap:6px;justify-content:flex-end;text-align:right;'>{auto_badge}<span class='badge {status_class(st)}'>{status_label(st)}</span></div></div>"
             + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(mode)} | Interval: {m.get('interval', cfg.get('cron_interval_minutes', 5))}m | Last ping: {html.escape(str(ping))} ms | Last run: {html.escape(ts_text)}</div>"
             + f"<div class='monitor-meta token-row'>Token: <code>{html.escape(token_label)}</code></div>"
             + f"<div data-role='monitor-live'>{monitor_action_html}</div>"

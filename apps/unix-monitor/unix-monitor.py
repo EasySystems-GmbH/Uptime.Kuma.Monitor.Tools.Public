@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0069"
+VERSION = "1.6.0-0070"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6447,7 +6447,7 @@ def _render_setup_html(
         )
         local_cards.append(
             f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == str(mode).lower()) else ''}' data-monitor='{html.escape(name)}' data-mode='{html.escape(str(mode).lower())}'>"
-            + f"<div class='monitor-head'><div style='display:flex;align-items:center;gap:6px;'>{auto_badge}<div class='monitor-title'>{html.escape(name)}</div></div><span class='badge {status_class(st)}'>{status_label(st)}</span></div>"
+            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(name)}</div><div style='display:flex;align-items:center;gap:6px;justify-content:flex-end;text-align:right;'>{auto_badge}<span class='badge {status_class(st)}'>{status_label(st)}</span></div></div>"
             + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(mode)} | Interval: {m.get('interval', cfg.get('cron_interval_minutes', 5))}m | Last ping: {html.escape(str(ping))} ms | Last run: {html.escape(ts_text)}</div>"
             + f"<div class='monitor-meta token-row'>Token: <code>{html.escape(token_label)}</code></div>"
             + f"<div data-role='monitor-live'>{monitor_action_html}</div>"
