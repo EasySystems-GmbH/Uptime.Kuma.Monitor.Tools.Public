@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0079"
+VERSION = "1.6.0-0080"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6480,8 +6480,8 @@ def _render_setup_html(
             </select>
           </div>
           <div class="field">
-            <label>Internet check targets (comma or newline separated host:port)</label>
-            <textarea name="internet_check_targets" style="min-height:72px;">{html.escape(str(internet_settings.get("targets_text", "")))}</textarea>
+            <label>Internet check targets (comma separated IPs)</label>
+            <input name="internet_check_targets" value="{html.escape(str(internet_settings.get("targets_text", "")))}" placeholder="1.1.1.1, 8.8.8.8, 9.9.9.9">
           </div>
           <div class="field">
             <label>Internet check timeout per target (ms)</label>
