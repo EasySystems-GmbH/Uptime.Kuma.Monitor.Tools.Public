@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0064"
+VERSION = "1.6.0-0065"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6429,6 +6429,8 @@ def _render_setup_html(
         ping = latest.get("ping_ms", "n/a")
         tsv = int(latest.get("ts", 0) or 0)
         ts_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(tsv)) if tsv else "never"
+        auto_enabled = bool(m.get("cron_enabled", cfg.get("cron_enabled", False)))
+        auto_badge = f"<span class='badge {'st-up' if auto_enabled else 'st-warning'}'>auto {'ON' if auto_enabled else 'OFF'}</span>"
         action_payload = monitor_state.get(name, {})
         action_banner = str(action_payload.get("banner", "") or "")
         action_output = str(action_payload.get("output", "") or "")
@@ -6445,7 +6447,7 @@ def _render_setup_html(
         )
         local_cards.append(
             f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == str(mode).lower()) else ''}' data-monitor='{html.escape(name)}' data-mode='{html.escape(str(mode).lower())}'>"
-            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(name)}</div><span class='badge {status_class(st)}'>{status_label(st)}</span></div>"
+            + f"<div class='monitor-head'><div style='display:flex;align-items:center;gap:6px;'>{auto_badge}<div class='monitor-title'>{html.escape(name)}</div></div><span class='badge {status_class(st)}'>{status_label(st)}</span></div>"
             + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(mode)} | Interval: {m.get('interval', cfg.get('cron_interval_minutes', 5))}m | Last ping: {html.escape(str(ping))} ms | Last run: {html.escape(ts_text)}</div>"
             + f"<div class='monitor-meta token-row'>Token: <code>{html.escape(token_label)}</code></div>"
             + f"<div data-role='monitor-live'>{monitor_action_html}</div>"
@@ -7027,18 +7029,29 @@ def _render_setup_html(
         + "</div>"
     )
     automation_mon_rows = automation_data.get("monitor_rows", []) if isinstance(automation_data.get("monitor_rows"), list) else []
-    automation_monitors_html = "".join(
-        (
-            "<div class='monitor-card'>"
-            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(str(row.get('name', '?')))}</div>"
-            + (f"<span class='badge st-up'>enabled</span>" if row.get("enabled") else f"<span class='badge st-warning'>disabled</span>")
-            + "</div>"
-            + f"<div class='monitor-meta'>Interval: {html.escape(str(row.get('interval_minutes', '?')))}m | Due: {html.escape(str(row.get('due', 'n/a')))}</div>"
-            + f"<div class='monitor-meta'>Last scheduled run: {html.escape(str(row.get('last_run', 'never')))}</div>"
-            + "</div>"
+    automation_state_rows: List[Tuple[str, str]] = [
+        ("State source", str(automation_data.get("source", "n/a") or "n/a")),
+        ("State file", str(automation_data.get("state_file", "n/a") or "n/a")),
+        ("State note", str(automation_data.get("state_note", "n/a") or "n/a")),
+        ("Monitor state entries", str(len(automation_mon_rows))),
+    ]
+    for row in automation_mon_rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name", "?") or "?")
+        details = (
+            f"Interval: {row.get('interval_minutes', '?')}m"
+            + f" | Due: {row.get('due', 'n/a')}"
+            + f" | Last scheduled run: {row.get('last_run', 'never')}"
         )
-        for row in automation_mon_rows
-        if isinstance(row, dict)
+        automation_state_rows.append((f"Entry: {name}", details))
+    automation_state_html = (
+        "<div class='server-info-grid' style='margin-top:10px;'>"
+        + "".join(
+            f"<div class='server-info-item'><span class='muted'>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>"
+            for label, value in automation_state_rows
+        )
+        + "</div>"
     )
     setup_view_html = f"""
       {setup_card}
@@ -7046,7 +7059,7 @@ def _render_setup_html(
         <h3>Automation</h3>
         {"<div class='ok'>" + html.escape(automation_message) + "</div>" if automation_message else ""}
         {automation_summary_html}
-        {("<div class='monitor-grid' style='margin-top:10px;'>" + automation_monitors_html + "</div>") if automation_monitors_html else "<div class='muted' style='margin-top:10px;'>No per-monitor schedule entries yet.</div>"}
+        {automation_state_html}
         {"<details style='margin-top:10px;'><summary style='cursor:pointer;'>Automation command output</summary><pre>" + html.escape(automation_output) + "</pre></details>" if automation_output else ""}
         <details style="margin-top:10px;"><summary style="cursor:pointer;">Raw automation diagnostics (debug)</summary><pre>{html.escape(automation_status)}</pre></details>
         <div class="button-row">
