@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0075"
+VERSION = "1.6.0-0076"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -8112,88 +8112,10 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
         <input id="auth-password" name="password" type="password" autocomplete="current-password" required autofocus>
         <button type="button" class="btn-icon toggle-password-btn" data-target="auth-password" aria-label="Show password">Show</button>
       </div>
-      <div id="auth-internet-msg" class="muted" style="margin-top:10px;padding:8px 10px;border-radius:8px;">
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span id="auth-internet-chip" class="badge st-unknown">…</span>
-          <button type="button" id="auth-internet-info-toggle" style="width:22px;height:22px;border-radius:999px;padding:0;font-size:12px;line-height:20px;text-align:center;" aria-label="Why this status matters">i</button>
-        </div>
-        <div id="auth-internet-info" style="display:none;margin-top:6px;font-size:12px;line-height:1.4;"></div>
-        <label id="auth-internet-ignore-wrap" style="display:none;align-items:center;gap:6px;margin-top:8px;font-size:12px;color:#cddbf0;">
-          <input id="auth-internet-ignore" type="checkbox" style="width:auto;margin:0;">
-          Ignore this warning on this browser
-        </label>
-      </div>
       <div class="button-row">
         <button type="submit">Continue</button>
       </div>
     </form>
-    <script>
-      (function () {
-        var msg = document.getElementById("auth-internet-msg");
-        var chip = document.getElementById("auth-internet-chip");
-        var info = document.getElementById("auth-internet-info");
-        var infoToggle = document.getElementById("auth-internet-info-toggle");
-        var ignoreWrap = document.getElementById("auth-internet-ignore-wrap");
-        var ignore = document.getElementById("auth-internet-ignore");
-        var ignoreStorageKey = "synology-monitor-auth-ignore-internet-warning";
-        if (!msg || !chip || !info) return;
-        function getIgnored() {
-          try { return window.localStorage && localStorage.getItem(ignoreStorageKey) === "1"; }
-          catch (e) { return false; }
-        }
-        function setIgnored(val) {
-          try {
-            if (!window.localStorage) return;
-            if (val) localStorage.setItem(ignoreStorageKey, "1");
-            else localStorage.removeItem(ignoreStorageKey);
-          } catch (e) {}
-        }
-        if (infoToggle) {
-          infoToggle.addEventListener("click", function () {
-            info.style.display = info.style.display === "none" ? "block" : "none";
-          });
-        }
-        if (ignore) {
-          ignore.checked = getIgnored();
-          ignore.addEventListener("change", function () { setIgnored(!!ignore.checked); refreshInternetStatus(); });
-        }
-        async function refreshInternetStatus() {
-          try {
-            var r = await fetch("/api/public/internet", { cache: "no-store" });
-            var data = await r.json().catch(function () { return {}; });
-            if (!r.ok) throw new Error(data.detail || data.error || ("HTTP " + r.status));
-            var ok = !!data.reachable;
-            var required = !!(data.internet_required ?? data.internetRequired);
-            var detail = String(data.detail || (ok ? "Internet reachable." : "Internet not reachable."));
-            var ignored = getIgnored();
-            msg.className = ok ? "ok" : (required && !ignored ? "err" : "muted");
-            chip.className = ok ? "badge st-up" : (required ? "badge st-warning" : "badge st-unknown");
-            chip.textContent = ok ? "UP" : "DOWN";
-            if (required) {
-              info.textContent = ok
-                ? ("Internet is available. Push to Kuma and sync to other servers should work normally. " + detail)
-                : ("No internet connectivity detected. Push to Kuma and sync to other servers may fail until connectivity is restored. Local-only standalone checks can still run. " + detail);
-            } else {
-              info.textContent = "Standalone mode can run local checks without internet. External push/sync features are optional. " + detail;
-            }
-            if (ignoreWrap) {
-              ignoreWrap.style.display = (!ok && required) ? "flex" : "none";
-            }
-          } catch (e) {
-            msg.className = "muted";
-            chip.className = "badge st-unknown";
-            chip.textContent = "?";
-            info.textContent = "Internet check unavailable right now. If internet is down, push to Kuma and server sync may fail; local-only checks can still continue.";
-            if (ignoreWrap) {
-              ignoreWrap.style.display = "none";
-            }
-          }
-        }
-        refreshInternetStatus();
-        window.addEventListener("online", refreshInternetStatus);
-        window.addEventListener("offline", refreshInternetStatus);
-      })();
-    </script>
     """
     return _render_auth_shell("Login", body, info=info, error=error, ssl_warning=ssl_warning)
 
