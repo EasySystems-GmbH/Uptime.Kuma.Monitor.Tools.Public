@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0076"
+VERSION = "1.6.0-0077"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -8862,7 +8862,85 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
       <div class="button-row">
         <button type="submit">Continue</button>
       </div>
+      <div id="auth-internet-msg" class="err hidden" style="margin-top:10px;padding:8px 10px;border-radius:8px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span id="auth-internet-chip" class="badge st-warning">DOWN</span>
+          <button type="button" id="auth-internet-info-toggle" style="width:22px;height:22px;border-radius:999px;padding:0;font-size:12px;line-height:20px;text-align:center;" aria-label="Why this status matters">i</button>
+        </div>
+        <div id="auth-internet-info" style="display:none;margin-top:6px;font-size:12px;line-height:1.4;"></div>
+        <label id="auth-internet-ignore-wrap" style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px;color:#cddbf0;">
+          <input id="auth-internet-ignore" type="checkbox" style="width:auto;margin:0;">
+          Ignore this warning on this browser
+        </label>
+      </div>
     </form>
+    <script>
+      (function () {
+        var msg = document.getElementById("auth-internet-msg");
+        var chip = document.getElementById("auth-internet-chip");
+        var info = document.getElementById("auth-internet-info");
+        var infoToggle = document.getElementById("auth-internet-info-toggle");
+        var ignoreWrap = document.getElementById("auth-internet-ignore-wrap");
+        var ignore = document.getElementById("auth-internet-ignore");
+        var ignoreStorageKey = "unix-monitor-auth-ignore-internet-warning";
+        if (!msg || !chip || !info) return;
+        function getIgnored() {
+          try { return window.localStorage && localStorage.getItem(ignoreStorageKey) === "1"; }
+          catch (e) { return false; }
+        }
+        function setIgnored(val) {
+          try {
+            if (!window.localStorage) return;
+            if (val) localStorage.setItem(ignoreStorageKey, "1");
+            else localStorage.removeItem(ignoreStorageKey);
+          } catch (e) {}
+        }
+        function showWarning(text) {
+          msg.className = getIgnored() ? "muted" : "err";
+          msg.classList.remove("hidden");
+          chip.className = "badge st-warning";
+          chip.textContent = "DOWN";
+          info.textContent = String(text || "No internet connectivity detected.");
+          if (ignoreWrap) { ignoreWrap.style.display = "flex"; }
+        }
+        function hideWarning() {
+          msg.classList.add("hidden");
+        }
+        if (infoToggle) {
+          infoToggle.addEventListener("click", function () {
+            info.style.display = info.style.display === "none" ? "block" : "none";
+          });
+        }
+        if (ignore) {
+          ignore.checked = getIgnored();
+          ignore.addEventListener("change", function () {
+            setIgnored(!!ignore.checked);
+            if (!msg.classList.contains("hidden")) {
+              msg.className = ignore.checked ? "muted" : "err";
+            }
+          });
+        }
+        async function refreshInternetStatus() {
+          try {
+            var r = await fetch("/api/public/internet", { cache: "no-store" });
+            var data = await r.json().catch(function () { return {}; });
+            if (!r.ok) throw new Error(data.detail || data.error || ("HTTP " + r.status));
+            var ok = !!data.reachable;
+            var detail = String(data.detail || (ok ? "Internet reachable." : "Internet not reachable."));
+            if (ok) {
+              hideWarning();
+            } else {
+              showWarning("No internet connectivity detected. Push/sync features may fail until connectivity is restored. " + detail);
+            }
+          } catch (e) {
+            showWarning("Internet check unavailable right now. If internet is down, push/sync features may fail.");
+          }
+        }
+        refreshInternetStatus();
+        window.addEventListener("online", refreshInternetStatus);
+        window.addEventListener("offline", refreshInternetStatus);
+      })();
+    </script>
     """
     return _render_auth_shell("Login", body, info=info, error=error, ssl_warning=ssl_warning)
 
