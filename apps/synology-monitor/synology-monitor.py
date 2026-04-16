@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0070"
+VERSION = "1.6.0-0071"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -5833,6 +5833,11 @@ def _render_setup_html(
     spec_ram = "n/a (remote source)" if source_is_remote else local_specs.get("ram", "n/a")
     spec_disk = "n/a (remote source)" if source_is_remote else local_specs.get("disk", "n/a")
     spec_uptime = "n/a (remote source)" if source_is_remote else local_specs.get("uptime", "n/a")
+    source_scope_text = (
+        f"Viewing remote source: {selected_source_name} (overview and diagnostics scoped to this source)."
+        if source_is_remote
+        else (f"Viewing local source: {selected_source_name}." if peer_role == "master" else "")
+    )
     cpu_detail_text = (
         f"CPU: {spec_cpu}\nSource: /proc/cpuinfo model/hardware\n{source_scope_text}"
         if not source_is_remote
@@ -5852,11 +5857,6 @@ def _render_setup_html(
         f"Uptime: {spec_uptime}\nSource: /proc/uptime\n{source_scope_text}"
         if not source_is_remote
         else f"Uptime: {spec_uptime}\nDetails are available on the selected remote source UI."
-    )
-    source_scope_text = (
-        f"Viewing remote source: {selected_source_name} (overview and diagnostics scoped to this source)."
-        if source_is_remote
-        else (f"Viewing local source: {selected_source_name}." if peer_role == "master" else "")
     )
     repo_url = f"https://github.com/{GITHUB_REPO}"
     package_word = "SPK" if selected_source_platform == "synology" else "addon"
