@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0081"
+VERSION = "1.6.0-0083"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -105,6 +105,7 @@ NAS_VOLUME_PATTERN = re.compile(r"^/volume[0-9]+$")
 SMART_CACHE_MAX_AGE_SEC = 20 * 60
 BACKUP_CACHE_MAX_AGE_SEC = 20 * 60
 DEFAULT_INTERNET_CHECK_TARGETS: List[Tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]
+DEFAULT_INTERNET_CHECK_DNS_SERVERS: List[Tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53)]
 TASK_STATUS_MAX_DETAIL = 2000
 HISTORY_MAX_ENTRIES = 500
 AUTH_FILE_MODE = 0o600
@@ -3927,6 +3928,10 @@ def load_config() -> Dict[str, Any]:
     if internet_targets != str(cfg.get("internet_check_targets", "") or "").strip():
         cfg["internet_check_targets"] = internet_targets
         changed = True
+    internet_dns_servers = _internet_check_targets_display(_parse_internet_check_targets(cfg.get("internet_check_dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS)))
+    if internet_dns_servers != str(cfg.get("internet_check_dns_servers", "") or "").strip():
+        cfg["internet_check_dns_servers"] = internet_dns_servers
+        changed = True
     monitors = [m for m in cfg.get("monitors", []) if isinstance(m, dict)]
     for monitor in monitors:
         cleaned = normalize_kuma_url(monitor.get("kuma_url", ""))
@@ -7022,7 +7027,7 @@ def _render_setup_html(
               </summary>
               <div class="muted" style="margin-top:6px;">{html.escape(internet_detail)}</div>
             </details>
-            <div class="muted" style="margin-top:6px;">Settings used: mode={html.escape(str(internet_settings.get('mode', 'tcp-connect')))} | timeout={int(internet_settings.get('timeout_ms', 1500))}ms | targets={html.escape(str(internet_settings.get('targets_text', '')))}</div>
+            <div class="muted" style="margin-top:6px;">Settings used: mode={html.escape(str(internet_settings.get('mode', 'tcp-connect')))} | port={int(internet_settings.get('target_port', 53))} | timeout={int(internet_settings.get('timeout_ms', 1500))}ms | targets={html.escape(str(internet_settings.get('targets_text', '')))} | dnsServers={html.escape(str(internet_settings.get('dns_servers_text', '')))}</div>
           </div>
           <div class="server-info-item">
             <span class="muted">Why this matters</span>
@@ -7132,12 +7137,16 @@ def _render_setup_html(
           <div class="field">
             <label>Internet check mode</label>
             <select name="internet_check_mode">
-              <option value="tcp-connect"{" selected" if str(internet_settings.get("mode", "tcp-connect")) == "tcp-connect" else ""}>TCP connect (host:port targets)</option>
+              <option value="tcp-connect"{" selected" if str(internet_settings.get("mode", "tcp-connect")) == "tcp-connect" else ""}>TCP connect (IP targets on port 53)</option>
             </select>
           </div>
           <div class="field">
-            <label>Internet check targets (comma separated IPs)</label>
+            <label>Targets (comma separated IPs, implicit port 53)</label>
             <input name="internet_check_targets" value="{html.escape(str(internet_settings.get("targets_text", "")))}" placeholder="1.1.1.1, 8.8.8.8, 9.9.9.9">
+          </div>
+          <div class="field">
+            <label>DNS servers to use (comma separated IPs, implicit port 53)</label>
+            <input name="internet_check_dns_servers" value="{html.escape(str(internet_settings.get("dns_servers_text", "")))}" placeholder="1.1.1.1, 8.8.8.8">
           </div>
           <div class="field">
             <label>Internet check timeout per target (ms)</label>
@@ -8685,30 +8694,33 @@ def _parse_internet_check_targets(raw: Any) -> List[Tuple[str, int]]:
         tokens = [p.strip() for p in re.split(r"[\s,;]+", str(raw or ""))]
     pairs: List[Tuple[str, int]] = []
     seen: set[Tuple[str, int]] = set()
-    for part in tokens:
+
+    def _normalize_ipv4_token(token: str) -> str:
+        part = str(token or "").strip()
         if not part:
-            continue
-        host = ""
-        port_text = ""
-        if part.startswith("[") and "]:" in part:
-            close_idx = part.find("]:")
-            host = part[1:close_idx].strip()
-            port_text = part[close_idx + 2 :].strip()
-        elif ":" in part:
-            host, port_text = part.rsplit(":", 1)
-            host = host.strip()
-            port_text = port_text.strip()
-        else:
-            continue
+            return ""
+        if ":" in part:
+            host, sep, port_text = part.rpartition(":")
+            if sep and host.strip() and str(port_text or "").strip().isdigit():
+                part = host.strip()
+        octets = part.split(".")
+        if len(octets) != 4:
+            return ""
+        normalized: List[str] = []
+        for octet in octets:
+            if not octet.isdigit():
+                return ""
+            value = int(octet)
+            if value < 0 or value > 255:
+                return ""
+            normalized.append(str(value))
+        return ".".join(normalized)
+
+    for part in tokens:
+        host = _normalize_ipv4_token(part)
         if not host:
             continue
-        try:
-            port = int(port_text)
-        except Exception:
-            continue
-        if port < 1 or port > 65535:
-            continue
-        pair = (host, port)
+        pair = (host, 53)
         if pair in seen:
             continue
         seen.add(pair)
@@ -8728,11 +8740,15 @@ def _internet_check_settings_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     mode = _normalize_internet_check_mode(cfg.get("internet_check_mode", "tcp-connect"))
     timeout_ms = _normalize_internet_check_timeout_ms(cfg.get("internet_check_timeout_ms", 1500))
     targets = _parse_internet_check_targets(cfg.get("internet_check_targets", ""))
+    dns_servers = _parse_internet_check_targets(cfg.get("internet_check_dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS))
     return {
         "mode": mode,
+        "target_port": 53,
         "timeout_ms": timeout_ms,
         "targets": targets,
         "targets_text": _internet_check_targets_display(targets),
+        "dns_servers": dns_servers,
+        "dns_servers_text": _internet_check_targets_display(dns_servers),
     }
 
 
@@ -8741,9 +8757,14 @@ def _probe_internet_connectivity(settings: Optional[Dict[str, Any]] = None) -> D
     timeout_ms = _normalize_internet_check_timeout_ms(cfg.get("timeout_ms", 1500))
     timeout_sec = max(0.25, float(timeout_ms) / 1000.0)
     targets = _parse_internet_check_targets(cfg.get("targets", DEFAULT_INTERNET_CHECK_TARGETS))
+    dns_servers = _parse_internet_check_targets(cfg.get("dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS))
+    probe_targets: List[Tuple[str, int]] = list(targets)
+    for server in dns_servers:
+        if server not in probe_targets:
+            probe_targets.append(server)
     errors: List[str] = []
     checked_at = int(time.time())
-    for host, port in targets:
+    for host, port in probe_targets:
         try:
             with socket.create_connection((host, port), timeout=timeout_sec):
                 return {
@@ -9712,7 +9733,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 self.wfile.write(json.dumps(info).encode("utf-8"))
                 return
             if parsed.path == "/api/peer/health":
-                if not self._require_peer_mtls():
+                if not self._require_peer_mtls(allow_token_only=True):
                     return
                 if not self._verify_peer_token():
                     self._reply_json({"error": "unauthorized"}, 401)
@@ -9825,8 +9846,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     "internet_required": role != "standalone",
                     "settings_used": {
                         "mode": str(internet_settings.get("mode", "tcp-connect")),
+                        "target_port": int(internet_settings.get("target_port", 53)),
                         "timeout_ms": int(internet_settings.get("timeout_ms", 1500)),
                         "targets": str(internet_settings.get("targets_text", "")),
+                        "dns_servers": str(internet_settings.get("dns_servers_text", "")),
                     },
                 }, 200)
                 return
@@ -10029,7 +10052,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             if self._redirect_http_to_https():
                 return
             if self.path == "/api/peer/push":
-                if not self._require_peer_mtls():
+                if not self._require_peer_mtls(allow_token_only=True):
                     return
                 if not self._verify_peer_token():
                     self._reply_json({"error": "unauthorized"}, 401)
@@ -11344,13 +11367,15 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     mode = _normalize_internet_check_mode(form.get("internet_check_mode", [cfg.get("internet_check_mode", "tcp-connect")])[0])
                     timeout_ms = _normalize_internet_check_timeout_ms(form.get("internet_check_timeout_ms", [cfg.get("internet_check_timeout_ms", 1500)])[0])
                     targets = _internet_check_targets_display(_parse_internet_check_targets(form.get("internet_check_targets", [cfg.get("internet_check_targets", "")])[0]))
+                    dns_servers = _internet_check_targets_display(_parse_internet_check_targets(form.get("internet_check_dns_servers", [cfg.get("internet_check_dns_servers", "")])[0]))
                     cfg["internet_check_mode"] = mode
                     cfg["internet_check_timeout_ms"] = timeout_ms
                     cfg["internet_check_targets"] = targets
+                    cfg["internet_check_dns_servers"] = dns_servers
                     save_config(cfg, reapply_cron=False)
-                    append_ui_log(f"settings | internet check saved mode={mode} timeout_ms={timeout_ms} targets={targets}")
+                    append_ui_log(f"settings | internet check saved mode={mode} timeout_ms={timeout_ms} targets={targets} dns_servers={dns_servers}")
                     self._reply_html(_render_setup_html(
-                        security_message=f"Internet check settings saved: mode={mode}, timeout={timeout_ms}ms, targets={targets}.",
+                        security_message=f"Internet check settings saved: mode={mode}, timeout={timeout_ms}ms, targets={targets}, dns_servers={dns_servers}.",
                         ui_view="settings",
                         ssl_warning=ssl_warning,
                     ))
