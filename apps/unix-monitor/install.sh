@@ -279,7 +279,10 @@ install_python() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         case "${ID:-}${ID_LIKE:-}" in
-            *debian*|*ubuntu*) sudo apt-get update -qq && sudo apt-get install -y -qq python3 ;;
+            *debian*|*ubuntu*)
+                refresh_apt_index "for Python runtime"
+                sudo apt-get install -y -qq python3
+                ;;
             *) return 1 ;;
         esac
     else
@@ -295,6 +298,30 @@ apt_pkg_installed() {
 apt_pkg_version() {
     local pkg="$1"
     dpkg-query -W -f='${Version}' "${pkg}" 2>/dev/null || echo "unknown"
+}
+
+APT_UPDATE_TIMEOUT_SEC=10
+
+refresh_apt_index() {
+    local reason="${1:-}"
+    if [ -n "${reason}" ]; then
+        info "Refreshing apt package index ${reason}..."
+    else
+        info "Refreshing apt package index..."
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout "${APT_UPDATE_TIMEOUT_SEC}s" sudo apt-get update -qq >/dev/null 2>&1; then
+            return 0
+        fi
+        local rc=$?
+        if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 137 ]; then
+            warn "apt package index refresh exceeded ${APT_UPDATE_TIMEOUT_SEC}s; skipping refresh."
+            return 0
+        fi
+        warn "apt package index refresh failed (exit ${rc}); continuing."
+        return 0
+    fi
+    sudo apt-get update -qq >/dev/null 2>&1 || warn "apt package index refresh failed; continuing."
 }
 
 install_apt_packages() {
@@ -321,8 +348,7 @@ install_smartmontools() {
         . /etc/os-release
         case "${ID:-}${ID_LIKE:-}" in
             *debian*|*ubuntu*)
-                info "Refreshing apt package index..."
-                sudo apt-get update -qq || true
+                refresh_apt_index
                 install_apt_packages smartmontools
                 ;;
             *) return 1 ;;
@@ -355,8 +381,7 @@ PY
         . /etc/os-release
         case "${ID:-}${ID_LIKE:-}" in
             *debian*|*ubuntu*)
-                info "Refreshing apt package index for Python dependencies..."
-                sudo apt-get update -qq || true
+                refresh_apt_index "for Python dependencies"
                 local apt_pkgs=(
                     python3-pyotp
                     python3-qrcode
