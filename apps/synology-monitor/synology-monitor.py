@@ -44,7 +44,7 @@ from io import BytesIO
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
 try:
     import cgi  # type: ignore[import-not-found]
@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0093"
+VERSION = "1.6.0-0094"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -3691,6 +3691,51 @@ def _run_cmd(cmd: List[str], timeout_sec: int = 20) -> Tuple[int, str]:
         return 1, f"{type(e).__name__}: {e}"
 
 
+_RENDER_CACHE: Dict[str, Dict[str, Any]] = {}
+_RENDER_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_render_value(
+    key: str,
+    ttl_sec: int,
+    loader: Callable[[], Any],
+    default_value: Optional[Any] = None,
+) -> Any:
+    now = time.time()
+    with _RENDER_CACHE_LOCK:
+        entry = _RENDER_CACHE.get(key)
+        if not isinstance(entry, dict):
+            entry = {"ts": 0.0, "value": default_value, "refreshing": False}
+            _RENDER_CACHE[key] = entry
+
+        ts = float(entry.get("ts", 0.0) or 0.0)
+        if (now - ts) < float(max(1, ttl_sec)):
+            return entry.get("value")
+
+        if entry.get("refreshing"):
+            return entry.get("value")
+
+        entry["refreshing"] = True
+
+    def _refresh() -> None:
+        try:
+            value = loader()
+            with _RENDER_CACHE_LOCK:
+                cur = _RENDER_CACHE.get(key)
+                if isinstance(cur, dict):
+                    cur["value"] = value
+                    cur["ts"] = time.time()
+                    cur["refreshing"] = False
+        except Exception:
+            with _RENDER_CACHE_LOCK:
+                cur = _RENDER_CACHE.get(key)
+                if isinstance(cur, dict):
+                    cur["refreshing"] = False
+
+    threading.Thread(target=_refresh, daemon=True).start()
+    return entry.get("value")
+
+
 def _latency_ms(t0: float) -> float:
     return round((time.perf_counter() - t0) * 1000, 2)
 
@@ -6415,7 +6460,12 @@ def _render_setup_html(
                 "<button type='submit' onclick=\"return confirm('Clear logs on the selected remote agent?');\" "
                 "style='border-color:#ef4444;color:#ef4444;'>Clear selected agent logs</button></form>"
             )
-    internet_probe = _probe_internet_connectivity(internet_settings)
+    internet_probe = _get_cached_render_value(
+        "internet_probe",
+        ttl_sec=15,
+        loader=lambda: _probe_internet_connectivity(internet_settings),
+        default_value={"reachable": False, "detail": "Checking connectivity...", "checked_at": int(time.time())},
+    )
     internet_ok = bool(internet_probe.get("reachable"))
     internet_detail = str(internet_probe.get("detail", "n/a") or "n/a")
     internet_required = peer_role != "standalone"

@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0093"
+VERSION = "1.6.0-0094"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -7159,7 +7159,12 @@ def _render_setup_html(
         + f"<div class='card server-action-panel' data-server-panel='login-time'><h4>Recent login events (time + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
         + "</div>"
     )
-    internet_probe = _probe_internet_connectivity(internet_settings)
+    internet_probe = _get_cached_render_value(
+        "internet_probe",
+        ttl_sec=15,
+        loader=lambda: _probe_internet_connectivity(internet_settings),
+        default_value={"reachable": False, "detail": "Checking connectivity...", "checked_at": int(time.time())},
+    )
     internet_ok = bool(internet_probe.get("reachable"))
     internet_detail = str(internet_probe.get("detail", "n/a") or "n/a")
     internet_required = peer_role != "standalone"
