@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0085"
+VERSION = "1.6.0-0086"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6501,7 +6501,27 @@ def _render_setup_html(
                 continue
             snap_name = str(snap.get("instance_name", "") or str(snap.get("instance_id", ""))[:8])
             snap_history = snap.get("history", [])
-            snap_state = snap.get("state", {})
+            snap_state_raw = snap.get("state", {})
+            snap_state: Dict[str, Dict[str, Any]] = {}
+            if isinstance(snap_state_raw, dict):
+                for mk, mv in snap_state_raw.items():
+                    k = str(mk or "").strip()
+                    if not k:
+                        continue
+                    snap_state[k] = mv if isinstance(mv, dict) else {}
+            elif isinstance(snap_state_raw, list):
+                # Backward-compatible read path: older peers may serialize state as a list.
+                for item in snap_state_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    mk = (
+                        str(item.get("monitor", "") or "").strip()
+                        or str(item.get("name", "") or "").strip()
+                        or str(item.get("monitor_name", "") or "").strip()
+                    )
+                    if not mk:
+                        continue
+                    snap_state[mk] = item
             snap_ml: Dict[str, Dict[str, Any]] = {}
             for e in snap_history:
                 mn = str(e.get("monitor", ""))
