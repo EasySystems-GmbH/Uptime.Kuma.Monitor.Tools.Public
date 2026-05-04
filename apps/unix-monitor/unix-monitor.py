@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0091"
+VERSION = "1.6.0-0092"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -4146,18 +4146,48 @@ def _run_cmd(cmd: List[str], timeout_sec: int = 20, env: Optional[Dict[str, str]
 
 
 _RENDER_CACHE: Dict[str, Dict[str, Any]] = {}
+_RENDER_CACHE_LOCK = threading.Lock()
 
 
-def _get_cached_render_value(key: str, ttl_sec: int, loader: Callable[[], Any]) -> Any:
+def _get_cached_render_value(
+    key: str,
+    ttl_sec: int,
+    loader: Callable[[], Any],
+    default_value: Optional[Any] = None,
+) -> Any:
     now = time.time()
-    entry = _RENDER_CACHE.get(key)
-    if isinstance(entry, dict):
+    with _RENDER_CACHE_LOCK:
+        entry = _RENDER_CACHE.get(key)
+        if not isinstance(entry, dict):
+            entry = {"ts": 0.0, "value": default_value, "refreshing": False}
+            _RENDER_CACHE[key] = entry
+
         ts = float(entry.get("ts", 0.0) or 0.0)
         if (now - ts) < float(max(1, ttl_sec)):
             return entry.get("value")
-    value = loader()
-    _RENDER_CACHE[key] = {"ts": now, "value": value}
-    return value
+
+        if entry.get("refreshing"):
+            return entry.get("value")
+
+        entry["refreshing"] = True
+
+    def _refresh() -> None:
+        try:
+            value = loader()
+            with _RENDER_CACHE_LOCK:
+                cur = _RENDER_CACHE.get(key)
+                if isinstance(cur, dict):
+                    cur["value"] = value
+                    cur["ts"] = time.time()
+                    cur["refreshing"] = False
+        except Exception:
+            with _RENDER_CACHE_LOCK:
+                cur = _RENDER_CACHE.get(key)
+                if isinstance(cur, dict):
+                    cur["refreshing"] = False
+
+    threading.Thread(target=_refresh, daemon=True).start()
+    return entry.get("value")
 
 
 def _latency_ms(t0: float) -> float:
@@ -6345,6 +6375,13 @@ def _render_setup_html(
         scheduler_cache_key,
         ttl_sec=8,
         loader=lambda: _scheduler_status_data(cfg),
+        default_value={
+            "raw_text": "Loading scheduler status...",
+            "scheduler_process": "loading",
+            "scheduler_timer": "loading",
+            "timer_next": "loading",
+            "timer_last": "loading",
+        },
     )
     automation_status = str(automation_data.get("raw_text", ""))
     auth_state = _load_auth_state()
@@ -6354,11 +6391,13 @@ def _render_setup_html(
         "server_ip",
         ttl_sec=60,
         loader=lambda: _detect_primary_server_ip(),
+        default_value="n/a",
     )
     all_ips = _get_cached_render_value(
         "system_ips",
         ttl_sec=60,
         loader=lambda: _list_system_ips(),
+        default_value=[],
     )
     ui_bind_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"), all_ips)
     ui_bind_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
@@ -6377,6 +6416,7 @@ def _render_setup_html(
         "ntp_sync_details",
         ttl_sec=120,
         loader=lambda: _ntp_sync_details(),
+        default_value={"synced": "unknown", "service": "unknown", "source": "unknown", "detail": "Loading NTP details..."},
     )
     peer_last_sync = int(cfg.get("last_peer_sync", 0) or 0)
     peer_last_sync_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(peer_last_sync)) if peer_last_sync else "never"
