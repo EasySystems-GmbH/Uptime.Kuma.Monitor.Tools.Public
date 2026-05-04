@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0089"
+VERSION = "1.6.0-0090"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -905,6 +905,39 @@ def _collect_system_specs() -> Dict[str, str]:
     }
 
 
+def _read_tail_lines(path: Path, max_lines: int = 120, max_bytes: int = 262_144) -> List[str]:
+    """Read only the tail of a text file (bounded bytes + line count)."""
+    if max_lines <= 0:
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            if file_size <= 0:
+                return []
+
+            remaining = min(file_size, max_bytes)
+            chunk_size = 4096
+            chunks: List[bytes] = []
+            newline_count = 0
+            while remaining > 0 and newline_count <= max_lines:
+                to_read = min(chunk_size, remaining)
+                remaining -= to_read
+                f.seek(file_size - (remaining + to_read), os.SEEK_SET)
+                chunk = f.read(to_read)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+
+            data = b"".join(reversed(chunks))
+        text = data.decode("utf-8", errors="ignore")
+        lines = text.splitlines(keepends=True)
+        return lines[-max_lines:] if len(lines) > max_lines else lines
+    except OSError:
+        return []
+
+
 def read_ui_log(
     max_lines: int = UI_LOG_DISPLAY_LINES,
     log_filter: str = "all",
@@ -916,7 +949,20 @@ def read_ui_log(
     path = get_ui_log_path()
     if not path.exists():
         return "No log entries yet."
+    has_active_filter = (
+        (log_filter or "all").strip().lower() != "all"
+        or _normalize_log_date(log_date) != "all"
+        or _normalize_log_time_scope(log_time_scope) != "all"
+        or bool(_normalize_log_time_hhmm(log_time_from))
+        or bool(_normalize_log_time_hhmm(log_time_to))
+    )
     try:
+        if not has_active_filter and max_lines > 0:
+            tail_lines = _read_tail_lines(path, max_lines=max_lines)
+            text = "".join(tail_lines).strip()
+            if text:
+                return text
+            return "No log entries yet."
         with open(path, encoding="utf-8", errors="ignore") as f:
             all_lines = f.readlines()
         lines = _filter_log_lines(all_lines, log_filter, log_date, log_time_scope, log_time_from, log_time_to)
@@ -925,13 +971,6 @@ def read_ui_log(
         if text:
             return text
         has_any_logs = bool(all_lines)
-        has_active_filter = (
-            (log_filter or "all").strip().lower() != "all"
-            or _normalize_log_date(log_date) != "all"
-            or _normalize_log_time_scope(log_time_scope) != "all"
-            or bool(_normalize_log_time_hhmm(log_time_from))
-            or bool(_normalize_log_time_hhmm(log_time_to))
-        )
         if has_any_logs and has_active_filter:
             return "No data in the selected period."
         return "No log entries yet."
@@ -5732,18 +5771,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
             mc = int(p.get("monitor_count", 0) or 0)
             p_url = str(p.get("url", "") or "")
             p_latency = p.get("latency_ms")
-            if pstatus == "offline" and p_url and peering_token:
-                try:
-                    p_url_resolved = _resolve_peer_url_from_stored(p_url, peering_token, timeout=3)
-                    if p_url_resolved:
-                        t0 = time.time()
-                        hst, _ = _peer_http_request(p_url_resolved, peering_token, "GET", "/api/peer/health", timeout=3)
-                        if hst < 300:
-                            pstatus = "online"
-                            p_latency = round((time.time() - t0) * 1000)
-                            last_seen = now
-                except Exception:
-                    pass
+            # Keep initial page render non-blocking; status-json polling updates this live.
             p_open_url = _peer_url_for_open(p_url)
             pclass = "ok" if pstatus == "online" else "err"
             seen_short = time.strftime("%H:%M:%S", time.localtime(last_seen)) if last_seen else "never"
