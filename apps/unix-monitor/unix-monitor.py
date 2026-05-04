@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0088"
+VERSION = "1.6.0-0089"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -3711,7 +3711,27 @@ def _build_live_snapshot_for_source(source_id: str = "local") -> Dict[str, Any]:
     channels_order = ("smart", "storage", "ping", "port", "dns", "backup")
     peer_name = str(snap.get("instance_name", "") or sid[:8])
     peer_history = snap.get("history", [])
-    peer_state = snap.get("state", {})
+    peer_state_raw = snap.get("state", {})
+    peer_state: Dict[str, Dict[str, Any]] = {}
+    if isinstance(peer_state_raw, dict):
+        for mk, mv in peer_state_raw.items():
+            k = str(mk or "").strip()
+            if not k:
+                continue
+            peer_state[k] = mv if isinstance(mv, dict) else {}
+    elif isinstance(peer_state_raw, list):
+        # Backward-compatible read path: older peers may serialize state as a list.
+        for item in peer_state_raw:
+            if not isinstance(item, dict):
+                continue
+            mk = (
+                str(item.get("monitor", "") or "").strip()
+                or str(item.get("name", "") or "").strip()
+                or str(item.get("monitor_name", "") or "").strip()
+            )
+            if not mk:
+                continue
+            peer_state[mk] = item
     peer_monitors_cfg = snap.get("monitors", [])
 
     used_channels: List[str] = []
