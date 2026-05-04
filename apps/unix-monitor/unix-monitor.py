@@ -28,8 +28,10 @@ import html
 import json
 import os
 import base64
+import cProfile
 import hashlib
 import hmac
+import pstats
 import re
 import secrets
 import shutil
@@ -44,7 +46,7 @@ import traceback
 from datetime import datetime, timedelta
 import platform
 import warnings
-from io import BytesIO
+from io import BytesIO, StringIO
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -83,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0092"
+VERSION = "1.6.0-0093"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -10197,9 +10199,13 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             log_time_to = _normalize_log_time_hhmm((qs.get("log_time_to", [""])[0] or "").strip())
             if highlight not in ("smart", "storage", "ping", "port", "dns", "backup"):
                 highlight = ""
+            profile_render = (qs.get("render_profile", ["0"])[0] or "0").strip().lower() in ("1", "true", "yes")
             threading.Thread(target=_maybe_run_autoupdate, daemon=True).start()
-            self._reply_html(
-                _render_setup_html(
+            render_started = time.perf_counter()
+            if profile_render:
+                profiler = cProfile.Profile()
+                profiler.enable()
+            rendered_html = _render_setup_html(
                     log_filter=log_filter,
                     log_date=log_date,
                     log_time_scope=log_time_scope,
@@ -10212,7 +10218,26 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     diagnose_agent=diagnose,
                     ssl_warning=ssl_warning,
                 )
-            )
+            if profile_render:
+                profiler.disable()
+            render_ms = (time.perf_counter() - render_started) * 1000.0
+            extra_headers: List[Tuple[str, str]] = [("X-Render-Ms", f"{render_ms:.1f}")]
+            if profile_render:
+                extra_headers.append(("X-Render-Profile", "1"))
+                try:
+                    stats_out = StringIO()
+                    pstats.Stats(profiler, stream=stats_out).sort_stats("cumulative").print_stats(25)
+                    lines = [ln.strip() for ln in stats_out.getvalue().splitlines() if ln.strip()]
+                    append_ui_log(
+                        "render-prof | "
+                        f"view={ui_view} source={source_ctx or 'local'} diag={diag_view} "
+                        f"total_ms={render_ms:.1f}"
+                    )
+                    for ln in lines[:20]:
+                        append_ui_log(f"render-prof | {ln[:220]}")
+                except Exception as exc:
+                    append_ui_log(f"render-prof | failed to summarize: {type(exc).__name__}: {exc}")
+            self._reply_html(rendered_html, extra_headers=extra_headers)
 
         def do_POST(self) -> None:  # noqa: N802
             _set_request_display_host(self._connected_interface_host())
