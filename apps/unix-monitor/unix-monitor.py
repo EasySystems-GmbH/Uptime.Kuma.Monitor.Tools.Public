@@ -48,7 +48,7 @@ from io import BytesIO
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
 try:
     with warnings.catch_warnings():
@@ -83,7 +83,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0090"
+VERSION = "1.6.0-0091"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -4145,6 +4145,21 @@ def _run_cmd(cmd: List[str], timeout_sec: int = 20, env: Optional[Dict[str, str]
         return 1, f"{type(e).__name__}: {e}"
 
 
+_RENDER_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_cached_render_value(key: str, ttl_sec: int, loader: Callable[[], Any]) -> Any:
+    now = time.time()
+    entry = _RENDER_CACHE.get(key)
+    if isinstance(entry, dict):
+        ts = float(entry.get("ts", 0.0) or 0.0)
+        if (now - ts) < float(max(1, ttl_sec)):
+            return entry.get("value")
+    value = loader()
+    _RENDER_CACHE[key] = {"ts": now, "value": value}
+    return value
+
+
 def _latency_ms(t0: float) -> float:
     return round((time.perf_counter() - t0) * 1000, 2)
 
@@ -6318,13 +6333,33 @@ def _render_setup_html(
             log_time_from=log_time_from_norm,
             log_time_to=log_time_to_norm,
         )
-    automation_data = _scheduler_status_data(cfg)
+    scheduler_cache_key = (
+        "scheduler:"
+        + str(cfg.get("scheduler_backend", "cron"))
+        + ":"
+        + str(int(cfg.get("cron_interval_minutes", 60) or 60))
+        + ":"
+        + ("1" if bool(cfg.get("cron_enabled", False)) else "0")
+    )
+    automation_data = _get_cached_render_value(
+        scheduler_cache_key,
+        ttl_sec=8,
+        loader=lambda: _scheduler_status_data(cfg),
+    )
     automation_status = str(automation_data.get("raw_text", ""))
     auth_state = _load_auth_state()
     recovery_unused = _count_unused_recovery(auth_state)
     request_interface = _request_interface_host()
-    server_ip = request_interface or _detect_primary_server_ip()
-    all_ips = _list_system_ips()
+    server_ip = request_interface or _get_cached_render_value(
+        "server_ip",
+        ttl_sec=60,
+        loader=lambda: _detect_primary_server_ip(),
+    )
+    all_ips = _get_cached_render_value(
+        "system_ips",
+        ttl_sec=60,
+        loader=lambda: _list_system_ips(),
+    )
     ui_bind_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"), all_ips)
     ui_bind_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
     internet_settings = _internet_check_settings_from_cfg(cfg)
@@ -6338,7 +6373,11 @@ def _render_setup_html(
         f"<option value='{html.escape(ip)}'{' selected' if ip == ui_bind_host else ''}>{html.escape('All interfaces (0.0.0.0)' if ip == '0.0.0.0' else ('Localhost only (127.0.0.1)' if ip == '127.0.0.1' else ip))}</option>"
         for ip in bind_host_options
     )
-    ntp_info = _ntp_sync_details()
+    ntp_info = _get_cached_render_value(
+        "ntp_sync_details",
+        ttl_sec=120,
+        loader=lambda: _ntp_sync_details(),
+    )
     peer_last_sync = int(cfg.get("last_peer_sync", 0) or 0)
     peer_last_sync_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(peer_last_sync)) if peer_last_sync else "never"
     now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
