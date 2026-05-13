@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0097"
+VERSION = "1.6.0-0098"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -100,6 +100,7 @@ SMART_CACHE_MAX_AGE_SEC = 20 * 60
 BACKUP_CACHE_MAX_AGE_SEC = 20 * 60
 DEFAULT_INTERNET_CHECK_TARGETS: List[Tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]
 DEFAULT_INTERNET_CHECK_DNS_SERVERS: List[Tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53)]
+INTERNET_CHECK_PORT_PROFILES = ("dns", "http", "https", "custom", "from-target")
 TASK_STATUS_MAX_DETAIL = 2000
 HISTORY_MAX_ENTRIES = 500
 AUTH_FILE_MODE = 0o600
@@ -411,6 +412,14 @@ def _list_system_ips() -> List[str]:
                 ips.append(ip)
         if ips:
             return ips
+    rc_host, out_host = _run_cmd(["hostname", "-I"], timeout_sec=4)
+    if rc_host == 0 and out_host.strip():
+        for part in out_host.replace("\n", " ").split():
+            ip = str(part).strip()
+            if ip and ip not in ips:
+                ips.append(ip)
+        if ips:
+            return ips
     try:
         host = socket.gethostname()
         for info in socket.getaddrinfo(host, None):
@@ -421,6 +430,8 @@ def _list_system_ips() -> List[str]:
                 ips.append(ip)
     except Exception:
         pass
+    if "127.0.0.1" not in ips:
+        ips.append("127.0.0.1")
     return ips
 
 
@@ -1271,6 +1282,25 @@ def _is_valid_peer_instance_id(instance_id: str) -> bool:
     if iid.lower() in {"none", "null", "unknown", "-", "?"}:
         return False
     return bool(re.match(r"^[A-Za-z0-9_-]+$", iid))
+
+
+def _display_peer_instance_id(instance_id: str) -> str:
+    """Format Windows-style 32-hex IDs to UUID shape for UI display."""
+    iid = str(instance_id or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", iid):
+        lower = iid.lower()
+        return f"{lower[0:8]}-{lower[8:12]}-{lower[12:16]}-{lower[16:20]}-{lower[20:32]}"
+    return iid
+
+
+def _normalize_peer_instance_id_key(instance_id: str) -> str:
+    """Canonical key for matching UUID-like peer IDs across dashed/non-dashed forms."""
+    iid = str(instance_id or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", iid):
+        return iid.replace("-", "")
+    if re.fullmatch(r"[0-9a-f]{32}", iid):
+        return iid
+    return iid
 
 
 def _registered_peer_instance_ids(cfg: Dict[str, Any]) -> set[str]:
@@ -3582,11 +3612,36 @@ def load_config() -> Dict[str, Any]:
     if internet_timeout_ms != old_internet_timeout:
         cfg["internet_check_timeout_ms"] = internet_timeout_ms
         changed = True
-    internet_targets = _internet_check_targets_display(_parse_internet_check_targets(cfg.get("internet_check_targets", "")))
+    internet_port_profile = _normalize_internet_check_port_profile(cfg.get("internet_check_port_profile", "dns"))
+    if internet_port_profile != str(cfg.get("internet_check_port_profile", "dns") or "dns").strip().lower():
+        cfg["internet_check_port_profile"] = internet_port_profile
+        changed = True
+    internet_custom_port = _normalize_internet_check_custom_port(cfg.get("internet_check_custom_port", 53))
+    old_internet_custom_port_raw = cfg.get("internet_check_custom_port", 53)
+    try:
+        old_internet_custom_port = int(old_internet_custom_port_raw if old_internet_custom_port_raw is not None else 53)
+    except (TypeError, ValueError):
+        old_internet_custom_port = 53
+    if internet_custom_port != old_internet_custom_port:
+        cfg["internet_check_custom_port"] = internet_custom_port
+        changed = True
+    internet_targets = _internet_check_targets_display(
+        _parse_internet_check_targets(
+            cfg.get("internet_check_targets", ""),
+            port_profile=internet_port_profile,
+            custom_port=internet_custom_port,
+        )
+    )
     if internet_targets != str(cfg.get("internet_check_targets", "") or "").strip():
         cfg["internet_check_targets"] = internet_targets
         changed = True
-    internet_dns_servers = _internet_check_targets_display(_parse_internet_check_targets(cfg.get("internet_check_dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS)))
+    internet_dns_servers = _internet_check_targets_display(
+        _parse_internet_check_targets(
+            cfg.get("internet_check_dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS),
+            port_profile="dns",
+            custom_port=53,
+        )
+    )
     if internet_dns_servers != str(cfg.get("internet_check_dns_servers", "") or "").strip():
         cfg["internet_check_dns_servers"] = internet_dns_servers
         changed = True
@@ -5509,7 +5564,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
                         f"<div style='display:flex;align-items:flex-start;gap:8px;margin-top:8px;'>"
                         f"<div style='flex:1;min-width:0;'>"
                         f"<div class='muted' style='font-size:11px;word-break:break-all;'>"
-                        f"Instance ID: <code>{html.escape(a)}</code></div>"
+                        f"Instance ID: <code>{html.escape(_display_peer_instance_id(a))}</code></div>"
                         f"{lbl_html}"
                         f"</div>"
                         f"<form method='post' action='/peer/revoke-agent-cert' style='margin:0;flex-shrink:0;'>"
@@ -5622,7 +5677,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
                 f"<div style='display:flex;align-items:flex-start;gap:8px;margin-top:8px;'>"
                 f"<div style='flex:1;min-width:0;'>"
                 f"<div class='muted' style='font-size:11px;word-break:break-all;'>"
-                f"Instance ID: <code>{html.escape(pid)}</code></div>"
+                f"Instance ID: <code>{html.escape(_display_peer_instance_id(pid))}</code></div>"
                 f"{name_html}"
                 f"</div>"
                 f"<form method='post' action='/peer/remove' style='margin:0;flex-shrink:0;'>"
@@ -5671,7 +5726,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
       <div class="card" id="peering-card">
         <h3>Multi-Instance Peering</h3>
         <div class="muted">Connect multiple instances for cross-network monitoring. Agents push results to a master dashboard.</div>
-        <div class="muted" style="margin-top:6px;">Instance ID: <code>{html.escape(instance_id)}</code></div>
+        <div class="muted" style="margin-top:6px;">Instance ID: <code>{html.escape(_display_peer_instance_id(instance_id))}</code></div>
         {"<div class='ok' style='margin-top:8px;white-space:pre-wrap;'>" + html.escape(peering_message) + "</div>" if peering_message else ""}
         {security_panel}
         <form method="post" action="/peer/save-settings">
@@ -5990,7 +6045,18 @@ def _render_setup_html(
         f"<option value='{html.escape(ip)}'{' selected' if ip == ui_bind_host else ''}>{html.escape('All interfaces (0.0.0.0)' if ip == '0.0.0.0' else ('Localhost only (127.0.0.1)' if ip == '127.0.0.1' else ip))}</option>"
         for ip in bind_host_options
     )
-    ip_list_text = "\n".join(all_ips) if all_ips else "No IP addresses detected."
+    ip_lines: List[str] = []
+    if server_ip and server_ip not in ("n/a", "remote"):
+        ip_lines.append(server_ip)
+    for ip in all_ips:
+        if ip not in ip_lines:
+            ip_lines.append(ip)
+    if not source_is_remote and "127.0.0.1" not in ip_lines:
+        ip_lines.append("127.0.0.1")
+    if source_is_remote:
+        ip_list_text = "\n".join(ip_lines) if ip_lines else "No remote communication endpoint available."
+    else:
+        ip_list_text = "\n".join(ip_lines) if ip_lines else "No IP addresses detected."
     local_specs = _collect_system_specs()
     spec_cpu = "n/a (remote source)" if source_is_remote else local_specs.get("cpu", "n/a")
     spec_ram = "n/a (remote source)" if source_is_remote else local_specs.get("ram", "n/a")
@@ -6026,6 +6092,12 @@ def _render_setup_html(
     package_word_cap = "SPK" if selected_source_platform == "synology" else "Addon"
     package_label = "Synology SPK Version" if selected_source_platform == "synology" else "Unix Addon Version"
     package_title = "Synology SPK update" if selected_source_platform == "synology" else "Unix addon update"
+    viewed_spk_version_display = viewed_spk_version
+    if "+" in viewed_spk_version and len(viewed_spk_version) > 28:
+        base, meta = viewed_spk_version.split("+", 1)
+        viewed_spk_version_display = f"{base}+{meta[:8]}..."
+    elif len(viewed_spk_version) > 28:
+        viewed_spk_version_display = viewed_spk_version[:25] + "..."
     update_hint = (
         "This checker tracks Synology package (SPK) versions. Reinstall via Package Center, script, or download SPK from GitHub releases."
         if selected_source_platform == "synology"
@@ -6112,7 +6184,7 @@ def _render_setup_html(
         f"<button type='button' class='server-info-item server-info-action' data-server-action='ram'><span class='muted'>RAM (Total)</span><strong>{html.escape(spec_ram)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='disk'><span class='muted'>Disk (Total / Free)</span><strong>{html.escape(spec_disk)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='uptime'><span class='muted'>Uptime</span><strong>{html.escape(spec_uptime)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>{html.escape(package_label)}</span><strong>{html.escape(viewed_spk_version)}{package_badge}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>{html.escape(package_label)}</span><strong title='{html.escape(viewed_spk_version)}'>{html.escape(viewed_spk_version_display)}</strong>{package_badge}</button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(last_login_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(last_login_at_text)}</strong></button>"
         "</div>"
@@ -6536,7 +6608,7 @@ def _render_setup_html(
               </summary>
               <div class="muted" style="margin-top:6px;">{html.escape(internet_detail)}</div>
             </details>
-            <div class="muted" style="margin-top:6px;">Settings used: mode={html.escape(str(internet_settings.get('mode', 'tcp-connect')))} | port={int(internet_settings.get('target_port', 53))} | timeout={int(internet_settings.get('timeout_ms', 1500))}ms | targets={html.escape(str(internet_settings.get('targets_text', '')))} | dnsServers={html.escape(str(internet_settings.get('dns_servers_text', '')))}</div>
+            <div class="muted" style="margin-top:6px;">Settings used: mode={html.escape(str(internet_settings.get('mode', 'tcp-connect')))} | portProfile={html.escape(str(internet_settings.get('target_port_text', 'dns:53')))} | timeout={int(internet_settings.get('timeout_ms', 1500))}ms | targets={html.escape(str(internet_settings.get('targets_text', '')))} | dnsServers={html.escape(str(internet_settings.get('dns_servers_text', '')))}</div>
           </div>
           <div class="server-info-item">
             <span class="muted">Why this matters</span>
@@ -6639,16 +6711,30 @@ def _render_setup_html(
           <div class="field">
             <label>Internet check mode</label>
             <select name="internet_check_mode">
-              <option value="tcp-connect"{" selected" if str(internet_settings.get("mode", "tcp-connect")) == "tcp-connect" else ""}>TCP connect (IP targets on port 53)</option>
+              <option value="tcp-connect"{" selected" if str(internet_settings.get("mode", "tcp-connect")) == "tcp-connect" else ""}>TCP connect</option>
             </select>
           </div>
           <div class="field">
-            <label>Targets (comma separated IPs, implicit port 53)</label>
-            <input name="internet_check_targets" value="{html.escape(str(internet_settings.get("targets_text", "")))}" placeholder="1.1.1.1, 8.8.8.8, 9.9.9.9">
+            <label>Target port profile</label>
+            <select name="internet_check_port_profile">
+              <option value="dns"{" selected" if str(internet_settings.get("port_profile", "dns")) == "dns" else ""}>DNS (53)</option>
+              <option value="https"{" selected" if str(internet_settings.get("port_profile", "dns")) == "https" else ""}>HTTPS (443)</option>
+              <option value="http"{" selected" if str(internet_settings.get("port_profile", "dns")) == "http" else ""}>HTTP (80)</option>
+              <option value="custom"{" selected" if str(internet_settings.get("port_profile", "dns")) == "custom" else ""}>Custom port</option>
+              <option value="from-target"{" selected" if str(internet_settings.get("port_profile", "dns")) == "from-target" else ""}>From target/URL</option>
+            </select>
           </div>
           <div class="field">
-            <label>DNS servers to use (comma separated IPs, implicit port 53)</label>
-            <input name="internet_check_dns_servers" value="{html.escape(str(internet_settings.get("dns_servers_text", "")))}" placeholder="1.1.1.1, 8.8.8.8">
+            <label>Custom target port</label>
+            <input name="internet_check_custom_port" type="number" min="1" max="65535" value="{int(internet_settings.get("custom_port", 53))}">
+          </div>
+          <div class="field">
+            <label>Targets (comma separated FQDN/IP/URL; optional :port)</label>
+            <input name="internet_check_targets" value="{html.escape(str(internet_settings.get("targets_text", "")))}" placeholder="https://kuma.example.com, one.one.one.one, 1.1.1.1:53">
+          </div>
+          <div class="field">
+            <label>DNS servers to use (comma separated FQDN/IP, implicit port 53)</label>
+            <input name="internet_check_dns_servers" value="{html.escape(str(internet_settings.get("dns_servers_text", "")))}" placeholder="1.1.1.1, dns.google">
           </div>
           <div class="field">
             <label>Internet check timeout per target (ms)</label>
@@ -8115,40 +8201,121 @@ def _normalize_internet_check_timeout_ms(raw: Any) -> int:
     return max(250, min(15000, parsed))
 
 
-def _parse_internet_check_targets(raw: Any) -> List[Tuple[str, int]]:
+def _normalize_internet_check_port_profile(raw: Any) -> str:
+    profile = str(raw or "dns").strip().lower()
+    if profile in INTERNET_CHECK_PORT_PROFILES:
+        return profile
+    return "dns"
+
+
+def _normalize_internet_check_custom_port(raw: Any) -> int:
+    try:
+        parsed = int(raw)
+    except Exception:
+        parsed = 53
+    return max(1, min(65535, parsed))
+
+
+def _resolve_port_from_profile(
+    profile: str,
+    custom_port: int,
+    explicit_port: Optional[int],
+    scheme_hint: str,
+) -> int:
+    if profile == "custom":
+        return custom_port
+    if profile == "http":
+        return 80
+    if profile == "https":
+        return 443
+    if profile == "dns":
+        return 53
+    # from-target
+    if explicit_port and 1 <= explicit_port <= 65535:
+        return explicit_port
+    if scheme_hint == "https":
+        return 443
+    if scheme_hint == "http":
+        return 80
+    return 53
+
+
+def _parse_target_token(token: str) -> Optional[Tuple[str, Optional[int], str]]:
+    part = str(token or "").strip()
+    if not part:
+        return None
+    scheme_hint = ""
+    explicit_port: Optional[int] = None
+    host = ""
+    try:
+        if "://" in part:
+            parsed = urlparse(part)
+            host = str(parsed.hostname or "").strip().lower().rstrip(".")
+            scheme_hint = str(parsed.scheme or "").strip().lower()
+            explicit_port = parsed.port
+        else:
+            cleaned = part.split("/", 1)[0].strip()
+            if cleaned.startswith("["):
+                m = re.match(r"^\[([0-9a-fA-F:]+)\](?::(\d+))?$", cleaned)
+                if m:
+                    host = str(m.group(1) or "").strip().lower()
+                    if m.group(2):
+                        explicit_port = int(m.group(2))
+                else:
+                    host = cleaned.strip("[]").strip().lower()
+            elif cleaned.count(":") == 1:
+                left, right = cleaned.rsplit(":", 1)
+                if right.isdigit():
+                    host = left.strip().lower().rstrip(".")
+                    explicit_port = int(right)
+                else:
+                    host = cleaned.strip().lower().rstrip(".")
+            else:
+                host = cleaned.strip().lower().rstrip(".")
+    except Exception:
+        return None
+    if not host:
+        return None
+    return host, explicit_port, scheme_hint
+
+
+def _parse_internet_check_targets(
+    raw: Any,
+    port_profile: str = "dns",
+    custom_port: int = 53,
+) -> List[Tuple[str, int]]:
+    parsed_items: List[Tuple[str, Optional[int], str]] = []
     if isinstance(raw, list):
-        tokens = [str(x or "").strip() for x in raw]
+        for x in raw:
+            if isinstance(x, (tuple, list)) and len(x) >= 1:
+                host = str(x[0] or "").strip().lower().rstrip(".")
+                explicit_port: Optional[int] = None
+                if len(x) >= 2:
+                    try:
+                        explicit_port = int(x[1])
+                    except Exception:
+                        explicit_port = None
+                if host:
+                    parsed_items.append((host, explicit_port, ""))
+                continue
+            parsed = _parse_target_token(str(x or "").strip())
+            if parsed:
+                parsed_items.append(parsed)
     else:
         tokens = [p.strip() for p in re.split(r"[\s,;]+", str(raw or ""))]
+        for part in tokens:
+            parsed = _parse_target_token(part)
+            if parsed:
+                parsed_items.append(parsed)
     pairs: List[Tuple[str, int]] = []
     seen: set[Tuple[str, int]] = set()
 
-    def _normalize_ipv4_token(token: str) -> str:
-        part = str(token or "").strip()
-        if not part:
-            return ""
-        if ":" in part:
-            host, sep, port_text = part.rpartition(":")
-            if sep and host.strip() and str(port_text or "").strip().isdigit():
-                part = host.strip()
-        octets = part.split(".")
-        if len(octets) != 4:
-            return ""
-        normalized: List[str] = []
-        for octet in octets:
-            if not octet.isdigit():
-                return ""
-            value = int(octet)
-            if value < 0 or value > 255:
-                return ""
-            normalized.append(str(value))
-        return ".".join(normalized)
-
-    for part in tokens:
-        host = _normalize_ipv4_token(part)
-        if not host:
-            continue
-        pair = (host, 53)
+    profile = _normalize_internet_check_port_profile(port_profile)
+    cport = _normalize_internet_check_custom_port(custom_port)
+    for parsed in parsed_items:
+        host, explicit_port, scheme_hint = parsed
+        resolved_port = _resolve_port_from_profile(profile, cport, explicit_port, scheme_hint)
+        pair = (host, resolved_port)
         if pair in seen:
             continue
         seen.add(pair)
@@ -8167,11 +8334,25 @@ def _internet_check_targets_display(targets: List[Tuple[str, int]]) -> str:
 def _internet_check_settings_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     mode = _normalize_internet_check_mode(cfg.get("internet_check_mode", "tcp-connect"))
     timeout_ms = _normalize_internet_check_timeout_ms(cfg.get("internet_check_timeout_ms", 1500))
-    targets = _parse_internet_check_targets(cfg.get("internet_check_targets", ""))
-    dns_servers = _parse_internet_check_targets(cfg.get("internet_check_dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS))
+    port_profile = _normalize_internet_check_port_profile(cfg.get("internet_check_port_profile", "dns"))
+    custom_port = _normalize_internet_check_custom_port(cfg.get("internet_check_custom_port", 53))
+    targets = _parse_internet_check_targets(cfg.get("internet_check_targets", ""), port_profile=port_profile, custom_port=custom_port)
+    dns_servers = _parse_internet_check_targets(cfg.get("internet_check_dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS), port_profile="dns", custom_port=53)
+    if port_profile == "custom":
+        target_port = custom_port
+        target_port_text = f"custom:{custom_port}"
+    elif port_profile == "from-target":
+        target_port = int(targets[0][1]) if targets else 53
+        target_port_text = "from target/url"
+    else:
+        target_port = {"dns": 53, "http": 80, "https": 443}.get(port_profile, 53)
+        target_port_text = f"{port_profile}:{target_port}"
     return {
         "mode": mode,
-        "target_port": 53,
+        "port_profile": port_profile,
+        "custom_port": custom_port,
+        "target_port": target_port,
+        "target_port_text": target_port_text,
         "timeout_ms": timeout_ms,
         "targets": targets,
         "targets_text": _internet_check_targets_display(targets),
@@ -8458,10 +8639,11 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
             else localStorage.removeItem(ignoreStorageKey);
           } catch (e) {}
         }
-        function showWarning(text) {
-          msg.className = getIgnored() ? "muted" : "err";
+        function showWarning(title, text, level) {
+          var cls = (level === "muted") ? "muted" : (getIgnored() ? "muted" : "err");
+          msg.className = cls;
           msg.classList.remove("hidden");
-          statusText.textContent = "No Internet Connectivity";
+          statusText.textContent = String(title || "No Internet Connectivity");
           info.textContent = String(text || "Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode.");
           if (ignoreWrap) { ignoreWrap.style.display = "flex"; }
         }
@@ -8488,17 +8670,27 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
             var data = await r.json().catch(function () { return {}; });
             if (!r.ok) throw new Error(data.detail || data.error || ("HTTP " + r.status));
             var ok = !!data.reachable;
+            var required = !!data.internet_required;
             var detail = String(data.detail || (ok ? "Internet reachable." : "Internet not reachable."));
-            if (ok) {
+            if (ok || !required) {
               hideWarning();
             } else {
-              showWarning("Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode. " + detail);
+              showWarning(
+                "No Internet Connectivity",
+                "Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode. " + detail,
+                "err"
+              );
             }
           } catch (e) {
-            showWarning("Internet check unavailable right now. Internet is required for push to Kuma, peering/sync, and update checks; local standalone checks can still run.");
+            showWarning(
+              "Connectivity check unavailable",
+              "Internet probe could not be completed right now. This is often temporary; the page will retry automatically.",
+              "muted"
+            );
           }
         }
         refreshInternetStatus();
+        window.setInterval(refreshInternetStatus, 30000);
         window.addEventListener("online", refreshInternetStatus);
         window.addEventListener("offline", refreshInternetStatus);
       })();
@@ -9209,7 +9401,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     "internet_required": role != "standalone",
                     "settings_used": {
                         "mode": str(internet_settings.get("mode", "tcp-connect")),
+                        "port_profile": str(internet_settings.get("port_profile", "dns")),
                         "target_port": int(internet_settings.get("target_port", 53)),
+                        "target_port_text": str(internet_settings.get("target_port_text", "dns:53")),
+                        "custom_port": int(internet_settings.get("custom_port", 53)),
                         "timeout_ms": int(internet_settings.get("timeout_ms", 1500)),
                         "targets": str(internet_settings.get("targets_text", "")),
                         "dns_servers": str(internet_settings.get("dns_servers_text", "")),
@@ -9854,19 +10049,26 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         ssl_warning=ssl_warning,
                     ))
                     return
+                rm_key = _normalize_peer_instance_id_key(rm_id)
                 cfg = load_config()
-                peers = [p for p in cfg.get("peers", []) if str(p.get("instance_id", "")) != rm_id]
+                peers = [
+                    p for p in cfg.get("peers", [])
+                    if _normalize_peer_instance_id_key(str(p.get("instance_id", ""))) != rm_key
+                ]
                 cfg["peers"] = peers
                 raw_allow = cfg.get("allow_unknown_update_peers", [])
                 if isinstance(raw_allow, list):
                     cfg["allow_unknown_update_peers"] = sorted(
                         str(x or "").strip()
                         for x in raw_allow
-                        if str(x or "").strip() and str(x or "").strip() != rm_id
+                        if str(x or "").strip() and _normalize_peer_instance_id_key(str(x or "").strip()) != rm_key
                     )
                 save_config(cfg, reapply_cron=False)
-                snap_file = get_peer_data_dir() / f"{rm_id}.json"
-                _clear_file(snap_file)
+                snapshot_candidates = {rm_id}
+                if rm_key and rm_key != rm_id:
+                    snapshot_candidates.add(rm_key)
+                for snap_id in snapshot_candidates:
+                    _clear_file(get_peer_data_dir() / f"{snap_id}.json")
                 append_ui_log(f"peer-remove | removed peer {rm_id}")
                 self._reply_html(_render_setup_html(
                     peering_message="Peer removed.",
@@ -10746,17 +10948,39 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
                     cfg = load_config()
                     mode = _normalize_internet_check_mode(form.get("internet_check_mode", [cfg.get("internet_check_mode", "tcp-connect")])[0])
+                    port_profile = _normalize_internet_check_port_profile(form.get("internet_check_port_profile", [cfg.get("internet_check_port_profile", "dns")])[0])
+                    custom_port = _normalize_internet_check_custom_port(form.get("internet_check_custom_port", [cfg.get("internet_check_custom_port", 53)])[0])
                     timeout_ms = _normalize_internet_check_timeout_ms(form.get("internet_check_timeout_ms", [cfg.get("internet_check_timeout_ms", 1500)])[0])
-                    targets = _internet_check_targets_display(_parse_internet_check_targets(form.get("internet_check_targets", [cfg.get("internet_check_targets", "")])[0]))
-                    dns_servers = _internet_check_targets_display(_parse_internet_check_targets(form.get("internet_check_dns_servers", [cfg.get("internet_check_dns_servers", "")])[0]))
+                    targets = _internet_check_targets_display(
+                        _parse_internet_check_targets(
+                            form.get("internet_check_targets", [cfg.get("internet_check_targets", "")])[0],
+                            port_profile=port_profile,
+                            custom_port=custom_port,
+                        )
+                    )
+                    dns_servers = _internet_check_targets_display(
+                        _parse_internet_check_targets(
+                            form.get("internet_check_dns_servers", [cfg.get("internet_check_dns_servers", "")])[0],
+                            port_profile="dns",
+                            custom_port=53,
+                        )
+                    )
                     cfg["internet_check_mode"] = mode
+                    cfg["internet_check_port_profile"] = port_profile
+                    cfg["internet_check_custom_port"] = custom_port
                     cfg["internet_check_timeout_ms"] = timeout_ms
                     cfg["internet_check_targets"] = targets
                     cfg["internet_check_dns_servers"] = dns_servers
                     save_config(cfg, reapply_cron=False)
-                    append_ui_log(f"settings | internet check saved mode={mode} timeout_ms={timeout_ms} targets={targets} dns_servers={dns_servers}")
+                    append_ui_log(
+                        f"settings | internet check saved mode={mode} port_profile={port_profile} "
+                        f"custom_port={custom_port} timeout_ms={timeout_ms} targets={targets} dns_servers={dns_servers}"
+                    )
                     self._reply_html(_render_setup_html(
-                        security_message=f"Internet check settings saved: mode={mode}, timeout={timeout_ms}ms, targets={targets}, dns_servers={dns_servers}.",
+                        security_message=(
+                            f"Internet check settings saved: mode={mode}, port_profile={port_profile}, "
+                            f"custom_port={custom_port}, timeout={timeout_ms}ms, targets={targets}, dns_servers={dns_servers}."
+                        ),
                         ui_view="settings",
                         diag_view=diag_view,
                         log_filter=log_filter,
