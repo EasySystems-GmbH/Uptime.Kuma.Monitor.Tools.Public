@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0096"
+VERSION = "1.6.0-0097"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1077,6 +1077,39 @@ def _registered_peer_instance_ids(cfg: Dict[str, Any]) -> set[str]:
         if _is_valid_peer_instance_id(pid):
             out.add(pid)
     return out
+
+
+def _peer_monitor_name(pm: Dict[str, Any], fallback: str = "?") -> str:
+    if not isinstance(pm, dict):
+        return fallback
+    for key in ("name", "Name", "monitor", "Monitor", "monitor_name", "monitorName", "id", "Id", "monitor_id", "monitorId"):
+        value = str(pm.get(key, "") or "").strip()
+        if value:
+            return value
+    return fallback
+
+
+def _peer_monitor_mode(pm: Dict[str, Any]) -> str:
+    if not isinstance(pm, dict):
+        return "smart"
+    raw = pm.get(
+        "check_mode",
+        pm.get("checkMode", pm.get("mode", pm.get("Mode", pm.get("monitor_mode", pm.get("monitorMode", "smart"))))),
+    )
+    if isinstance(raw, (int, float)):
+        return {
+            0: "smart",
+            1: "storage",
+            2: "ping",
+            3: "service",
+            4: "backup",
+            5: "port",
+            6: "dns",
+        }.get(int(raw), "smart")
+    mode = str(raw or "smart").strip().lower()
+    if mode in ("smart", "storage", "ping", "port", "dns", "backup", "service"):
+        return mode
+    return "smart"
 
 
 def _peer_agent_bound_to_master(cfg: Dict[str, Any]) -> bool:
@@ -2522,6 +2555,16 @@ def _version_tuple(version: str) -> Tuple[int, ...]:
     return tuple(parts[:4])
 
 
+def _version_display_short(version: str, max_len: int = 24) -> str:
+    raw = str(version or "").strip()
+    if not raw:
+        return "unknown"
+    short = raw.split("+", 1)[0].strip() or raw
+    if len(short) <= max_len:
+        return short
+    return short[:max_len] + "..."
+
+
 def _selected_update_channel(cfg: Optional[Dict[str, Any]] = None) -> str:
     if cfg is None:
         cfg = load_config()
@@ -3690,8 +3733,8 @@ def _build_live_snapshot() -> Dict[str, Any]:
                 if mn:
                     peer_monitor_latest[mn] = e
             for pm in snap.get("monitors", []):
-                pname = str(pm.get("name", "?"))
-                pmode = str(pm.get("check_mode", "smart"))
+                pname = _peer_monitor_name(pm, "?")
+                pmode = _peer_monitor_mode(pm)
                 platest = peer_monitor_latest.get(pname, {})
                 pst = str(platest.get("status", "unknown"))
                 pping = platest.get("ping_ms", "n/a")
@@ -3808,8 +3851,8 @@ def _build_live_snapshot_for_source(source_id: str = "local") -> Dict[str, Any]:
 
     monitors: List[Dict[str, Any]] = []
     for pm in peer_monitors_cfg:
-        pname = str(pm.get("name", "?"))
-        pmode = str(pm.get("check_mode", "smart"))
+        pname = _peer_monitor_name(pm, "?")
+        pmode = _peer_monitor_mode(pm)
         platest = peer_monitor_latest.get(pname, {})
         pst = str(platest.get("status", "unknown"))
         pping = platest.get("ping_ms", "n/a")
@@ -6328,11 +6371,19 @@ def _render_setup_html(
     local_source_name = browser_instance_name or "Local"
     available_sources: List[Tuple[str, str]] = [("local", local_source_name)]
     if peer_role == "master":
+        peer_snapshot_name_by_id: Dict[str, str] = {}
+        for snap in _load_all_peer_snapshots():
+            snap_id = str(snap.get("instance_id", "") or "").strip()
+            if not _is_valid_peer_instance_id(snap_id):
+                continue
+            snap_name = str(snap.get("instance_name", "") or "").strip()
+            if snap_name:
+                peer_snapshot_name_by_id[snap_id] = snap_name
         for sp in (cfg.get("peers", []) or []):
             sp_id = str(sp.get("instance_id", "") or "").strip()
             if not _is_valid_peer_instance_id(sp_id):
                 continue
-            sp_name = str(sp.get("instance_name", "") or sp_id[:8])
+            sp_name = str(peer_snapshot_name_by_id.get(sp_id, "") or sp.get("instance_name", "") or sp_id[:8])
             available_sources.append((sp_id, sp_name))
 
     source_map = {sid: sname for sid, sname in available_sources}
@@ -6627,7 +6678,7 @@ def _render_setup_html(
         )
         local_cards.append(
             f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == str(mode).lower()) else ''}' data-monitor='{html.escape(name)}' data-mode='{html.escape(str(mode).lower())}'>"
-            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(name)}</div><div style='display:flex;align-items:center;gap:6px;justify-content:flex-end;text-align:right;'>{auto_badge}<span class='badge {status_class(st)}'>{status_label(st)}</span></div></div>"
+            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(name)}</div><div style='display:flex;align-items:center;gap:6px;justify-content:flex-end;text-align:right;'>{auto_badge}<span class='badge monitor-status-badge {status_class(st)}'>{status_label(st)}</span></div></div>"
             + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(mode)} | Interval: {m.get('interval', cfg.get('cron_interval_minutes', 5))}m | Last ping: {html.escape(str(ping))} ms | Last run: {html.escape(ts_text)}</div>"
             + f"<div class='monitor-meta token-row'>Token: <code>{html.escape(token_label)}</code></div>"
             + f"<div data-role='monitor-live'>{monitor_action_html}</div>"
@@ -6677,8 +6728,8 @@ def _render_setup_html(
                 if mn:
                     snap_ml[mn] = e
             for pm in snap.get("monitors", []):
-                pn = str(pm.get("name", "?"))
-                pm_mode = str(pm.get("check_mode", "smart"))
+                pn = _peer_monitor_name(pm, "?")
+                pm_mode = _peer_monitor_mode(pm)
                 pl = snap_ml.get(pn, {})
                 pst = str(pl.get("status", "unknown"))
                 pp = pl.get("ping_ms", "n/a")
@@ -6700,7 +6751,7 @@ def _render_setup_html(
                 card_html = (
                     f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == pm_mode.lower()) else ''}' data-monitor='{html.escape(pn)}' data-mode='{html.escape(pm_mode.lower())}' data-agent-host='{html.escape(snap_name)}'>"
                     + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(pn)}</div>"
-                    + f"<span class='badge {status_class(pst)}'>{status_label(pst)}</span></div>"
+                    + f"<span class='badge monitor-status-badge {status_class(pst)}'>{status_label(pst)}</span></div>"
                     + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(pm_mode)} | Last ping: {html.escape(str(pp))} ms | Last run: {html.escape(pt_text)} | Origin: {html.escape(snap_name)}</div>"
                     + r_token_html
                     + f"<div data-role='monitor-live'>{pa_html}</div>"
@@ -7035,6 +7086,8 @@ def _render_setup_html(
     channel_matches_cache = (cached_channel == selected_channel) or (not cached_channel and selected_channel == "latest")
     if update_check_stale or not channel_matches_cache:
         latest_version = ""
+    display_runtime_version_short = _version_display_short(display_runtime_version)
+    latest_version_short = _version_display_short(latest_version or "unknown")
     # Only show update available if cache says so AND current VERSION is actually older (stale cache fix after manual update)
     update_available = (not update_check_stale) and channel_matches_cache and bool(update_check_result.get("update_available")) and (
         latest_version and _version_tuple(VERSION) < _version_tuple(latest_version)
@@ -7092,7 +7145,18 @@ def _render_setup_html(
             package_update_btns += " <form method='post' action='/self-rollback' style='display:inline;' onsubmit='return confirm(\"Restore previous version?\");'><button type='submit' class='btn-inline' style='border-color:#ef4444;color:#ef4444;'>Rollback</button></form>"
         if "button-row" in package_update_btns:
             package_update_btns += "</div>"
-    ip_list_text = "\n".join(all_ips) if all_ips else "No IP addresses detected."
+    ip_lines: List[str] = []
+    if display_server_ip and display_server_ip not in ("n/a", "remote"):
+        ip_lines.append(display_server_ip)
+    if source_is_remote:
+        if display_server_ip and display_server_ip not in ("n/a", "remote"):
+            ip_lines.append("(communication endpoint used for this selected source)")
+        ip_list_text = "\n".join(ip_lines) if ip_lines else "No remote communication endpoint available."
+    else:
+        for ip in all_ips:
+            if ip not in ip_lines:
+                ip_lines.append(ip)
+        ip_list_text = "\n".join(ip_lines) if ip_lines else "No IP addresses detected."
     login_history_text = "\n".join(login_lines)
     local_specs = _collect_system_specs()
     spec_cpu = "n/a (remote source)" if source_is_remote else local_specs.get("cpu", "n/a")
@@ -7128,7 +7192,7 @@ def _render_setup_html(
         + "<a class='btn-inline' href='" + html.escape(REPO_URL) + "' target='_blank' rel='noopener noreferrer'>Open GitHub repository</a>"
         + (" <form method='post' action='/settings/recheck-updates' style='display:inline;'><button type='submit' class='btn-inline btn-inline-muted'>Recheck for updates</button></form>" if not source_is_remote else "")
         + "</div>"
-        + "<div class='muted'>Selected source: " + html.escape(selected_channel_label) + " | Current Unix runtime (" + html.escape(display_source_name) + "): " + html.escape(display_runtime_version) + " | Public Unix runtime (" + html.escape(public_label) + "): " + html.escape(latest_version or "unknown") + " | Status: " + html.escape(update_status_text) + "</div>"
+        + "<div class='muted'>Selected source: " + html.escape(selected_channel_label) + " | Current Unix runtime (" + html.escape(display_source_name) + "): <span title='" + html.escape(display_runtime_version) + "'>" + html.escape(display_runtime_version_short) + "</span> | Public Unix runtime (" + html.escape(public_label) + "): <span title='" + html.escape(latest_version or 'unknown') + "'>" + html.escape(latest_version_short) + "</span> | Status: " + html.escape(update_status_text) + "</div>"
         + "<pre>" + html.escape(update_curl_cmd) + "</pre>"
         + "<div class='muted'>Update: backs up, downloads latest, validates, replaces. On failure restores previous. Config and data preserved.</div>"
         + "<div class='muted'>" + html.escape(source_scope_text) + "</div></div>"
@@ -7142,7 +7206,7 @@ def _render_setup_html(
         f"<button type='button' class='server-info-item server-info-action' data-server-action='ram'><span class='muted'>RAM (Total)</span><strong>{html.escape(spec_ram)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='disk'><span class='muted'>Disk (Total / Free)</span><strong>{html.escape(spec_disk)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='uptime'><span class='muted'>Uptime</span><strong>{html.escape(spec_uptime)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong>{html.escape(display_runtime_version)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong title='{html.escape(display_runtime_version)}'>{html.escape(display_runtime_version_short)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(display_last_login_ip)}</strong></button>"
         f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(display_last_login_at_text)}</strong></button>"
         "</div>"
@@ -8688,7 +8752,7 @@ def _render_setup_html(
         data.monitors.forEach(function (m) {{
           var card = map[m.name];
           if (!card) return;
-          var badge = card.querySelector(".badge");
+          var badge = card.querySelector(".monitor-status-badge");
           var primary = card.querySelector("[data-role='monitor-primary']");
           var live = card.querySelector("[data-role='monitor-live']");
           if (badge) {{
@@ -8932,10 +8996,18 @@ def _probe_internet_connectivity(settings: Optional[Dict[str, Any]] = None) -> D
     timeout_sec = max(0.25, float(timeout_ms) / 1000.0)
     targets = _parse_internet_check_targets(cfg.get("targets", DEFAULT_INTERNET_CHECK_TARGETS))
     dns_servers = _parse_internet_check_targets(cfg.get("dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS))
-    probe_targets: List[Tuple[str, int]] = list(targets)
+    probe_targets_primary: List[Tuple[str, int]] = list(targets)
     for server in dns_servers:
-        if server not in probe_targets:
-            probe_targets.append(server)
+        if server not in probe_targets_primary:
+            probe_targets_primary.append(server)
+    # Some networks block outbound DNS (53) while internet still works.
+    # Add web ports as fallback probes to avoid false offline warnings.
+    probe_targets: List[Tuple[str, int]] = list(probe_targets_primary)
+    for host, _ in probe_targets_primary:
+        for fallback_port in (443, 80):
+            pair = (host, fallback_port)
+            if pair not in probe_targets:
+                probe_targets.append(pair)
     errors: List[str] = []
     checked_at = int(time.time())
     for host, port in probe_targets:

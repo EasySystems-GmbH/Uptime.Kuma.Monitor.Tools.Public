@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0096"
+VERSION = "1.6.0-0097"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1309,6 +1309,39 @@ def _dedupe_peers_by_instance_id(peers: Any) -> List[Dict[str, Any]]:
         seen.add(pid)
         out.append(p)
     return out
+
+
+def _peer_monitor_name(pm: Dict[str, Any], fallback: str = "?") -> str:
+    if not isinstance(pm, dict):
+        return fallback
+    for key in ("name", "Name", "monitor", "Monitor", "monitor_name", "monitorName", "id", "Id", "monitor_id", "monitorId"):
+        value = str(pm.get(key, "") or "").strip()
+        if value:
+            return value
+    return fallback
+
+
+def _peer_monitor_mode(pm: Dict[str, Any]) -> str:
+    if not isinstance(pm, dict):
+        return "smart"
+    raw = pm.get(
+        "check_mode",
+        pm.get("checkMode", pm.get("mode", pm.get("Mode", pm.get("monitor_mode", pm.get("monitorMode", "smart"))))),
+    )
+    if isinstance(raw, (int, float)):
+        return {
+            0: "smart",
+            1: "storage",
+            2: "ping",
+            3: "service",
+            4: "backup",
+            5: "port",
+            6: "dns",
+        }.get(int(raw), "smart")
+    mode = str(raw or "smart").strip().lower()
+    if mode in ("smart", "storage", "ping", "port", "dns", "backup", "service"):
+        return mode
+    return "smart"
 
 
 def get_peer_data_dir() -> Path:
@@ -3353,8 +3386,8 @@ def _build_live_snapshot() -> Dict[str, Any]:
                 if mn:
                     peer_monitor_latest[mn] = e
             for pm in snap.get("monitors", []):
-                pname = str(pm.get("name", "?"))
-                pmode = str(pm.get("check_mode", "smart"))
+                pname = _peer_monitor_name(pm, "?")
+                pmode = _peer_monitor_mode(pm)
                 platest = peer_monitor_latest.get(pname, {})
                 pst = str(platest.get("status", "unknown"))
                 pping = platest.get("ping_ms", "n/a")
@@ -6174,7 +6207,7 @@ def _render_setup_html(
         )
         local_cards.append(
             f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == str(mode).lower()) else ''}' data-monitor='{html.escape(name)}' data-mode='{html.escape(str(mode).lower())}'>"
-            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(name)}</div><div style='display:flex;align-items:center;gap:6px;justify-content:flex-end;text-align:right;'>{auto_badge}<span class='badge {status_class(st)}'>{status_label(st)}</span></div></div>"
+            + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(name)}</div><div style='display:flex;align-items:center;gap:6px;justify-content:flex-end;text-align:right;'>{auto_badge}<span class='badge monitor-status-badge {status_class(st)}'>{status_label(st)}</span></div></div>"
             + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(mode)} | Interval: {m.get('interval', cfg.get('cron_interval_minutes', 5))}m | Last ping: {html.escape(str(ping))} ms | Last run: {html.escape(ts_text)}</div>"
             + f"<div class='monitor-meta token-row'>Token: <code>{html.escape(token_label)}</code></div>"
             + f"<div data-role='monitor-live'>{monitor_action_html}</div>"
@@ -6220,8 +6253,8 @@ def _render_setup_html(
                 if mn:
                     snap_ml[mn] = e
             for pm in snap.get("monitors", []):
-                pn = str(pm.get("name", "?"))
-                pm_mode = str(pm.get("check_mode", "smart"))
+                pn = _peer_monitor_name(pm, "?")
+                pm_mode = _peer_monitor_mode(pm)
                 pl = snap_ml.get(pn, {})
                 pst = str(pl.get("status", "unknown"))
                 pp = pl.get("ping_ms", "n/a")
@@ -6243,7 +6276,7 @@ def _render_setup_html(
                 card_html = (
                     f"<div class='monitor-card {'hl-monitor' if (highlight_channel and highlight_channel == pm_mode.lower()) else ''}' data-monitor='{html.escape(pn)}' data-mode='{html.escape(pm_mode.lower())}' data-agent-host='{html.escape(snap_name)}'>"
                     + f"<div class='monitor-head'><div class='monitor-title'>{html.escape(pn)}</div>"
-                    + f"<span class='badge {status_class(pst)}'>{status_label(pst)}</span></div>"
+                    + f"<span class='badge monitor-status-badge {status_class(pst)}'>{status_label(pst)}</span></div>"
                     + f"<div class='monitor-meta' data-role='monitor-primary'>Mode: {html.escape(pm_mode)} | Last ping: {html.escape(str(pp))} ms | Last run: {html.escape(pt_text)} | Origin: {html.escape(snap_name)}</div>"
                     + r_token_html
                     + f"<div data-role='monitor-live'>{pa_html}</div>"
@@ -6348,7 +6381,8 @@ def _render_setup_html(
             sp_id = str(sp.get("instance_id", "") or "").strip()
             if not _is_valid_peer_instance_id(sp_id):
                 continue
-            sp_name = str(sp.get("instance_name", "") or sp_id[:8])
+            snap_name = str((snapshot_by_id.get(sp_id, {}) or {}).get("instance_name", "") or "").strip()
+            sp_name = snap_name or str(sp.get("instance_name", "") or sp_id[:8])
             src_chips.append(
                 f"<a class='chip {'active' if source_label==sp_id else ''}' "
                 f"href='?{q_base}&amp;log_source={html.escape(sp_id)}'>"
@@ -7910,7 +7944,7 @@ def _render_setup_html(
         data.monitors.forEach(function (m) {{
           var card = map[m.name];
           if (!card) return;
-          var badge = card.querySelector(".badge");
+          var badge = card.querySelector(".monitor-status-badge");
           var primary = card.querySelector("[data-role='monitor-primary']");
           var live = card.querySelector("[data-role='monitor-live']");
           if (badge) {{
@@ -8152,10 +8186,18 @@ def _probe_internet_connectivity(settings: Optional[Dict[str, Any]] = None) -> D
     timeout_sec = max(0.25, float(timeout_ms) / 1000.0)
     targets = _parse_internet_check_targets(cfg.get("targets", DEFAULT_INTERNET_CHECK_TARGETS))
     dns_servers = _parse_internet_check_targets(cfg.get("dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS))
-    probe_targets: List[Tuple[str, int]] = list(targets)
+    probe_targets_primary: List[Tuple[str, int]] = list(targets)
     for server in dns_servers:
-        if server not in probe_targets:
-            probe_targets.append(server)
+        if server not in probe_targets_primary:
+            probe_targets_primary.append(server)
+    # Some networks block outbound DNS (53) while internet still works.
+    # Add web ports as fallback probes to avoid false offline warnings.
+    probe_targets: List[Tuple[str, int]] = list(probe_targets_primary)
+    for host, _ in probe_targets_primary:
+        for fallback_port in (443, 80):
+            pair = (host, fallback_port)
+            if pair not in probe_targets:
+                probe_targets.append(pair)
     errors: List[str] = []
     checked_at = int(time.time())
     for host, port in probe_targets:
