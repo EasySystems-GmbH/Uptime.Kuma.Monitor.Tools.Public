@@ -5,7 +5,7 @@
       "name": "synology-monitor",
       "dname": "EasySystems GmbH - Kuma Monitor Addon",
       "displayname": "EasySystems GmbH - Kuma Monitor Addon",
-      "version": "1.6.0-0103",
+      "version": "1.6.0-0104",
       "arch": "noarch",
       "description": "EasySystems GmbH Kuma Monitor Addon for Synology DSM with SMART, storage, backup, ping, port, DNS checks, guided elevated-access setup, diagnostics views, per-monitor actions, multi-instance peering with mTLS security, and Uptime Kuma push integration. Proxy: Control Panel > Login Portal > Application. Add rule Source (FQDN/hostname) -> Destination http://localhost:8787 for HTTPS browser access. Do NOT use the proxy FQDN for peering (Master URL, Agent Callback URL); use internal hostname or IP:8787 so agents and master connect directly.",
       "desc": "EasySystems GmbH Kuma Monitor Addon for Synology DSM with SMART, storage, backup, ping, port, DNS checks, guided elevated-access setup, diagnostics views, per-monitor actions, multi-instance peering with mTLS security, and Uptime Kuma push integration. Proxy: Control Panel > Login Portal > Application. Add rule Source (FQDN/hostname) -> Destination http://localhost:8787 for HTTPS browser access. Do NOT use the proxy FQDN for peering (Master URL, Agent Callback URL); use internal hostname or IP:8787 so agents and master connect directly.",
@@ -20,7 +20,7 @@
       "beta": "no",
       "os_min_ver": "7.0-40000",
       "link": "https://github.com/EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public/releases/latest/download/synology-monitor-basic.spk",
-      "checksum_sha256": "ef44a49d1c239c55b2d00f2d210c74d364131e417e1dfc8b54e8441478074348",
+      "checksum_sha256": "640976dd3e52468fe89b2c4a44f5b7e154939bc3b4b8c714c3b1a48fcd2aeb57",
       "size": 337920
     }
   ]
