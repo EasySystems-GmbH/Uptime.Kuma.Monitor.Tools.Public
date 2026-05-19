@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0119"
+VERSION = "1.6.0-0120"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -8365,20 +8365,32 @@ def _probe_internet_connectivity(settings: Optional[Dict[str, Any]] = None) -> D
     cfg = settings or {}
     timeout_ms = _normalize_internet_check_timeout_ms(cfg.get("timeout_ms", 1500))
     timeout_sec = max(0.25, float(timeout_ms) / 1000.0)
-    targets = _parse_internet_check_targets(cfg.get("targets", DEFAULT_INTERNET_CHECK_TARGETS))
-    dns_servers = _parse_internet_check_targets(cfg.get("dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS))
+    port_profile = _normalize_internet_check_port_profile(cfg.get("port_profile", "dns"))
+    custom_port = _normalize_internet_check_custom_port(cfg.get("custom_port", 53))
+    targets = _parse_internet_check_targets(
+        cfg.get("targets", DEFAULT_INTERNET_CHECK_TARGETS),
+        port_profile=port_profile,
+        custom_port=custom_port,
+    )
+    dns_servers = _parse_internet_check_targets(
+        cfg.get("dns_servers", DEFAULT_INTERNET_CHECK_DNS_SERVERS),
+        port_profile="dns",
+        custom_port=53,
+    )
     probe_targets_primary: List[Tuple[str, int]] = list(targets)
     for server in dns_servers:
         if server not in probe_targets_primary:
             probe_targets_primary.append(server)
-    # Some networks block outbound DNS (53) while internet still works.
-    # Add web ports as fallback probes to avoid false offline warnings.
+
     probe_targets: List[Tuple[str, int]] = list(probe_targets_primary)
-    for host, _ in probe_targets_primary:
-        for fallback_port in (443, 80):
-            pair = (host, fallback_port)
-            if pair not in probe_targets:
-                probe_targets.append(pair)
+    if port_profile == "dns":
+        # DNS mode: add web ports as fallback to avoid false offline on networks
+        # that block outbound DNS while general internet connectivity still works.
+        for host, _ in probe_targets_primary:
+            for fallback_port in (443, 80):
+                pair = (host, fallback_port)
+                if pair not in probe_targets:
+                    probe_targets.append(pair)
     errors: List[str] = []
     checked_at = int(time.time())
     for host, port in probe_targets:
