@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0122"
+VERSION = "1.6.0-0123"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -139,10 +139,11 @@ PRODUCT_DESC = (
 
 
 def _brand_asset_data_uri(filename: str, mime: str) -> Optional[str]:
-    candidates = [
-        Path(__file__).resolve().parents[2] / "corporate identity" / filename,
-        Path(__file__).resolve().parents[3] / "dev" / "corporate identity" / filename,
-    ]
+    script_path = Path(__file__).resolve()
+    candidates: List[Path] = []
+    for root in [script_path.parent, *script_path.parents]:
+        candidates.append(root / "corporate identity" / filename)
+        candidates.append(root / "dev" / "corporate identity" / filename)
     payload: Optional[bytes] = None
     for asset_path in candidates:
         try:
