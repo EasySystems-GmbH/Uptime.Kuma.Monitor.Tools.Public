@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.6.0-0124"
+VERSION = "1.6.0-0125"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -157,10 +157,13 @@ def _brand_asset_data_uri(filename: str, mime: str) -> Optional[str]:
     return f"data:{mime};base64,{encoded}"
 
 
-_brand_logo_uri = _brand_asset_data_uri("logo-systems-c.svg", "image/svg+xml")
+_brand_logo_uri = _brand_asset_data_uri("rabbit.png", "image/png") or _brand_asset_data_uri("logo-systems-c.svg", "image/svg+xml")
 if _brand_logo_uri:
     BRAND_LOGO_URL = _brand_logo_uri
-    BRAND_FAVICON_URL = _brand_logo_uri
+
+_brand_favicon_uri = _brand_asset_data_uri("rabbit.png", "image/png") or _brand_asset_data_uri("logo-systems-c.svg", "image/svg+xml")
+if _brand_favicon_uri:
+    BRAND_FAVICON_URL = _brand_favicon_uri
 
 
 def _normalize_source_platform(value: str) -> str:
