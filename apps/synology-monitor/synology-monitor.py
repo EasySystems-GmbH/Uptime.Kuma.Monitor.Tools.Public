@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.8.0-0001"
+VERSION = "1.9.0-0001"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
