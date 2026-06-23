@@ -77,7 +77,7 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0003"
+VERSION = "1.11.0-0004"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1682,6 +1682,61 @@ def _peer_agent_release_master_binding(cfg: Dict[str, Any]) -> None:
     cfg["last_peer_sync"] = 0
     cfg["last_peer_sync_result"] = ""
     cfg["last_peer_sync_latency_ms"] = None
+    cfg.pop("peer_master_approval_status", None)
+
+
+def _peer_error_detail(body: str) -> Tuple[str, str]:
+    try:
+        data = json.loads(body)
+        detail = data.get("detail")
+        if isinstance(detail, dict):
+            return str(detail.get("errorCode", "") or ""), str(detail.get("message", "") or "")
+        if isinstance(detail, str):
+            return "", detail
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return "", str(body or "")[:300]
+
+
+def _peer_set_master_approval_status(cfg: Dict[str, Any], status_code: int, body: str) -> Optional[str]:
+    if status_code < 300:
+        cfg.pop("peer_master_approval_status", None)
+        return None
+    code, message = _peer_error_detail(body)
+    if code in ("pairing_not_approved", "pairing_required"):
+        cfg["peer_master_approval_status"] = "pending"
+        if code == "pairing_required":
+            return (
+                "Master requires modern pairing. "
+                "Ask the operator to create a pending pairing for this agent ID on the hosted master, then approve it."
+            )
+        return (
+            "Master has not approved this agent yet. "
+            "Ask the operator to approve pending pairing on the hosted master, then run Sync now again."
+        )
+    if code == "pairing_rejected":
+        cfg["peer_master_approval_status"] = "rejected"
+        return message or "Master rejected this agent pairing request."
+    cfg.pop("peer_master_approval_status", None)
+    return None
+
+
+def _peer_approval_banner_html(approval_status: str) -> str:
+    status = str(approval_status or "").strip()
+    if status == "pending":
+        return (
+            "<div style='padding:10px 12px;border:1px solid rgba(245,158,11,.45);border-radius:8px;"
+            "background:rgba(245,158,11,.10);font-size:12px;color:#fbbf24;margin-top:8px;'>"
+            "<strong>Waiting for master approval.</strong> Create/approve pending pairing on the hosted master, "
+            "then run Sync now again.</div>"
+        )
+    if status == "rejected":
+        return (
+            "<div style='padding:10px 12px;border:1px solid rgba(239,68,68,.45);border-radius:8px;"
+            "background:rgba(239,68,68,.10);font-size:12px;color:#f87171;margin-top:8px;'>"
+            "<strong>Pairing rejected by master.</strong> Create a new pending pairing or contact the operator.</div>"
+        )
+    return ""
 
 
 # --- Payload encryption (AES-GCM) for HTTP safety net ---
@@ -1892,6 +1947,10 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
         }
         status, body = _peer_http_request(master_url, token, "POST", "/api/peer/register", payload=payload, timeout=15)
         if status >= 300:
+            block = _peer_set_master_approval_status(cfg, status, body)
+            save_config(cfg, reapply_cron=False)
+            if block:
+                return block
             return f"Register failed (HTTP {status}): {body[:300]}"
         try:
             data = json.loads(body)
@@ -1956,10 +2015,14 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
         cfg["last_peer_sync_latency_ms"] = latency_ms
         if status < 300:
             cfg["last_peer_sync_result"] = f"OK ({latency_ms} ms)"
+            cfg.pop("peer_master_approval_status", None)
             save_config(cfg, reapply_cron=False)
             return f"Pushed to master ({master_url}): {status} ({latency_ms} ms)"
+        block = _peer_set_master_approval_status(cfg, status, body)
         cfg["last_peer_sync_result"] = f"HTTP {status}"
         save_config(cfg, reapply_cron=False)
+        if block:
+            return block
         return f"Master push failed ({master_url}): HTTP {status} - {body}"
     except Exception as e:
         cfg["last_peer_sync"] = int(time.time())
@@ -5756,6 +5819,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
         <h3>Multi-Instance Peering</h3>
         <div class="muted">Connect multiple instances for cross-network monitoring. Agents push results to a master dashboard.</div>
         <div class="muted" style="margin-top:6px;">Instance ID: <code>{html.escape(_display_peer_instance_id(instance_id))}</code></div>
+        {_peer_approval_banner_html(str(cfg.get("peer_master_approval_status", "") or ""))}
         {"<div class='ok' style='margin-top:8px;white-space:pre-wrap;'>" + html.escape(peering_message) + "</div>" if peering_message else ""}
         {security_panel}
         <form method="post" action="/peer/save-settings">

@@ -71,6 +71,36 @@ info()  { echo -e "${GREEN}[✓]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 err()   { echo -e "${RED}[✗]${NC} $*"; }
 
+normalize_master_base_url() {
+    local raw="$1"
+    raw="${raw%/}"
+    if [[ "${raw}" != *://* ]]; then
+        raw="http://${raw}"
+    fi
+    printf '%s' "${raw}"
+}
+
+test_master_connectivity() {
+    local master_url="$1"
+    local token="$2"
+    local base code
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl not available; skipping master connectivity check."
+        return 0
+    fi
+    base="$(normalize_master_base_url "${master_url}")"
+    info "Testing master connectivity (${base})..."
+    code="$(curl -sS -m 10 -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer ${token}" \
+        "${base}/api/peer/health" 2>/dev/null || echo "000")"
+    if [ "${code}" = "200" ] || [ "${code}" = "204" ]; then
+        info "Master connectivity OK (HTTP ${code})."
+        return 0
+    fi
+    warn "Master connectivity check failed (HTTP ${code}). Verify master URL, port, and peering token."
+    return 1
+}
+
 SYSTEM_LABEL="$(uname -s 2>/dev/null || echo Unix)"
 APP_LABEL="${SYSTEM_LABEL} Kuma Monitor Addon"
 
@@ -485,6 +515,93 @@ with open(path, 'w', encoding='utf-8') as f:
 PY
 }
 
+json_apply_install_settings() {
+    local file="$1"
+    python3 - <<'PY' "${file}" "${WEB_ENABLED}" "${PEER_ROLE}" "${MASTER_URL}" "${PEER_TOKEN}" "${SCHED_BACKEND}" "${SCHED_INTERVAL_MIN}"
+import json, sys
+path, web_enabled, peer_role, master_url, peer_token, sched_backend, sched_interval = sys.argv[1:8]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+data["web_enabled"] = web_enabled == "true"
+data["peer_role"] = peer_role
+data["peer_master_url"] = master_url
+if peer_token:
+    data["peering_token"] = peer_token
+data["scheduler_backend"] = sched_backend
+data["cron_interval_minutes"] = int(sched_interval)
+data["agent_only_notice_ack"] = True
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+}
+
+prompt_webserver_mode() {
+    local default_choice="${1:-1}"
+    echo ""
+    echo "Webserver mode:"
+    echo "  1) Webserver mode (UI + local management, master/agent capable)"
+    echo "  2) No-webserver mode (agent-only menu; master connection required)"
+    echo -e "Choose mode [${default_choice}]: \c"
+    read_input MODE_CHOICE || true
+    MODE_CHOICE="${MODE_CHOICE:-${default_choice}}"
+
+    if [ "${MODE_CHOICE}" = "2" ]; then
+        WEB_ENABLED="false"
+        PEER_ROLE="agent"
+        echo ""
+        warn "NO-WEBSERVER MODE SELECTED"
+        warn "Functionality is reduced to menu-based monitor creation in agent mode only."
+        warn "A master connection is required. Local UI is disabled."
+        if [ -z "${MASTER_URL}" ] || [ -z "${PEER_TOKEN}" ]; then
+            echo -e "Master URL (e.g. http://master-host:8787): \c"
+            read_input MASTER_URL || true
+            echo -e "Shared peering token: \c"
+            read_input PEER_TOKEN || true
+        else
+            info "Keeping configured master URL and peering token."
+        fi
+        if [ -z "${MASTER_URL}" ] || [ -z "${PEER_TOKEN}" ]; then
+            err "Master URL and peering token are required in no-webserver mode."
+            exit 1
+        fi
+        test_master_connectivity "${MASTER_URL}" "${PEER_TOKEN}" || true
+        return
+    fi
+
+    WEB_ENABLED="true"
+    if [ "${PEER_ROLE}" = "agent" ] && [ -z "${MASTER_URL}" ] && [ -z "${PEER_TOKEN}" ]; then
+        PEER_ROLE="standalone"
+    fi
+}
+
+prompt_scheduler_settings() {
+    if [ -n "${MIGRATE_FROM_LEGACY:-}" ]; then
+        return
+    fi
+    echo ""
+    echo "Scheduler backend:"
+    echo "  1) systemd (recommended)"
+    echo "  2) cron fallback"
+    local sched_default="1"
+    if [ "${SCHED_BACKEND}" = "cron" ]; then
+        sched_default="2"
+    fi
+    echo -e "Choose scheduler [${sched_default}]: \c"
+    read_input SCHED_CHOICE || true
+    SCHED_CHOICE="${SCHED_CHOICE:-${sched_default}}"
+    if [ "${SCHED_CHOICE}" = "2" ]; then
+        SCHED_BACKEND="cron"
+        SCHED_INTERVAL_MIN="5"
+    else
+        SCHED_BACKEND="systemd"
+    fi
+    echo -e "Scheduler interval in minutes [${SCHED_INTERVAL_MIN}]: \c"
+    read_input SCHED_INTERVAL_INPUT || true
+    if [ -n "${SCHED_INTERVAL_INPUT:-}" ]; then
+        SCHED_INTERVAL_MIN="$(normalize_interval "${SCHED_INTERVAL_INPUT}")"
+    fi
+}
+
 normalize_interval() {
     local raw="${1:-}"
     if ! [[ "${raw}" =~ ^[0-9]+$ ]]; then
@@ -880,7 +997,7 @@ MASTER_URL=""
 PEER_TOKEN=""
 SCHED_BACKEND="systemd"
 SCHED_INTERVAL_MIN="1"
-UPDATE_INTERVAL_ONLY=0
+PRESERVE_CONFIG_UPDATE=0
 
 if [ "${REINSTALL_MODE}" = "preserve" ] && [ -f "${CONFIG_PATH}" ]; then
     info "Preserving existing unix-monitor user data and configuration."
@@ -893,66 +1010,34 @@ if [ "${REINSTALL_MODE}" = "preserve" ] && [ -f "${CONFIG_PATH}" ]; then
     if [ "${SCHED_BACKEND}" != "cron" ]; then
         SCHED_BACKEND="systemd"
     fi
-    echo -e "Scheduler interval in minutes [${SCHED_INTERVAL_MIN}]: \c"
-    read_input KEEP_INTERVAL || true
-    if [ -n "${KEEP_INTERVAL:-}" ]; then
-        SCHED_INTERVAL_MIN="$(normalize_interval "${KEEP_INTERVAL}")"
-        UPDATE_INTERVAL_ONLY=1
+    DEFAULT_MODE_CHOICE="1"
+    if [ "${WEB_ENABLED}" != "true" ]; then
+        DEFAULT_MODE_CHOICE="2"
     fi
+    CURRENT_MODE_LABEL="webserver enabled"
+    if [ "${WEB_ENABLED}" != "true" ]; then
+        CURRENT_MODE_LABEL="webserver disabled (agent-only)"
+    fi
+    info "Current mode: ${CURRENT_MODE_LABEL}"
+    prompt_webserver_mode "${DEFAULT_MODE_CHOICE}"
+    prompt_scheduler_settings
+    PRESERVE_CONFIG_UPDATE=1
 else
     MIGRATE_FROM_LEGACY="${MIGRATE_FROM_LEGACY:-}"
     if [ -n "${MIGRATE_FROM_LEGACY}" ]; then
         info "Migration from ${MIGRATE_FROM_LEGACY}: using defaults (webserver + systemd)."
         MODE_CHOICE="1"
+    else
+        prompt_webserver_mode "1"
+    fi
+
+    if [ -z "${MIGRATE_FROM_LEGACY:-}" ]; then
+        prompt_scheduler_settings
+    else
         SCHED_CHOICE="1"
         SCHED_INTERVAL_INPUT=""
-    else
-        echo "  1) Webserver mode (UI + local management, master/agent capable)"
-        echo "  2) No webserver mode (agent-only menu; master connection required)"
-        echo -e "Choose mode [1]: \c"
-        read_input MODE_CHOICE || true
-        MODE_CHOICE="${MODE_CHOICE:-1}"
-    fi
-
-    if [ "${MODE_CHOICE}" = "2" ]; then
-        WEB_ENABLED="false"
-        PEER_ROLE="agent"
-        echo ""
-        warn "NO-WEBSERVER MODE SELECTED"
-        warn "Functionality is reduced to menu-based monitor creation in agent mode only."
-        warn "A master connection is required. Local UI is disabled."
-        echo -e "Master URL (e.g. http://master-host:8787): \c"
-        read_input MASTER_URL || true
-        echo -e "Shared peering token: \c"
-        read_input PEER_TOKEN || true
-        if [ -z "${MASTER_URL}" ] || [ -z "${PEER_TOKEN}" ]; then
-            err "Master URL and peering token are required in no-webserver mode."
-            exit 1
-        fi
-    fi
-
-    if [ -z "${MIGRATE_FROM_LEGACY:-}" ]; then
-        echo ""
-        echo "Scheduler backend:"
-        echo "  1) systemd (recommended)"
-        echo "  2) cron fallback"
-        echo -e "Choose scheduler [1]: \c"
-        read_input SCHED_CHOICE || true
-        SCHED_CHOICE="${SCHED_CHOICE:-1}"
-    fi
-    if [ "${SCHED_CHOICE:-1}" = "2" ]; then
-        SCHED_BACKEND="cron"
-        SCHED_INTERVAL_MIN="5"
-    else
         SCHED_BACKEND="systemd"
         SCHED_INTERVAL_MIN="1"
-    fi
-    if [ -z "${MIGRATE_FROM_LEGACY:-}" ]; then
-        echo -e "Scheduler interval in minutes [${SCHED_INTERVAL_MIN}]: \c"
-        read_input SCHED_INTERVAL_INPUT || true
-    fi
-    if [ -n "${SCHED_INTERVAL_INPUT:-}" ]; then
-        SCHED_INTERVAL_MIN="$(normalize_interval "${SCHED_INTERVAL_INPUT}")"
     fi
 
     cat > "${CONFIG_PATH}" <<EOF
@@ -997,9 +1082,9 @@ PY
     info "Merged migrated monitors from legacy addon."
 fi
 
-if [ "${UPDATE_INTERVAL_ONLY}" -eq 1 ] && [ -f "${CONFIG_PATH}" ]; then
-    json_set_number "${CONFIG_PATH}" "cron_interval_minutes" "${SCHED_INTERVAL_MIN}"
-    info "Updated preserved scheduler interval: ${SCHED_INTERVAL_MIN} minute(s)"
+if [ "${PRESERVE_CONFIG_UPDATE}" -eq 1 ] && [ -f "${CONFIG_PATH}" ]; then
+    json_apply_install_settings "${CONFIG_PATH}"
+    info "Updated preserved configuration (webserver mode, scheduler, peering)."
 fi
 
 if [ "${SCHED_BACKEND}" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
@@ -1142,6 +1227,8 @@ EOF
     sudo systemctl daemon-reload
     if [ "${WEB_ENABLED}" = "true" ]; then
         sudo systemctl enable --now "${SYSTEMD_SERVICE_UI}"
+    else
+        sudo systemctl disable --now "${SYSTEMD_SERVICE_UI}" 2>/dev/null || true
     fi
     sudo systemctl enable --now "${SYSTEMD_TIMER_SCHED}"
     sudo systemctl enable --now "${SYSTEMD_TIMER_SMART_HELPER}"

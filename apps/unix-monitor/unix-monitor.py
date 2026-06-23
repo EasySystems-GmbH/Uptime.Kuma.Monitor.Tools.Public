@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0003"
+VERSION = "1.11.0-0004"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1202,7 +1202,62 @@ def _peer_agent_release_master_binding(cfg: Dict[str, Any]) -> None:
     (d / "master.crt").unlink(missing_ok=True)
     cfg["last_peer_sync"] = 0
     cfg["last_peer_sync_result"] = ""
-    cfg["last_peer_sync_latency_ms"] = None
+    cfg.pop("peer_master_approval_status", None)
+
+
+def _peer_error_detail(body: str) -> Tuple[str, str]:
+    try:
+        data = json.loads(body)
+        detail = data.get("detail")
+        if isinstance(detail, dict):
+            return str(detail.get("errorCode", "") or ""), str(detail.get("message", "") or "")
+        if isinstance(detail, str):
+            return "", detail
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return "", str(body or "")[:300]
+
+
+def _peer_set_master_approval_status(cfg: Dict[str, Any], status_code: int, body: str) -> Optional[str]:
+    """Persist hosted-master approval state and return a user-facing block message when rejected."""
+    if status_code < 300:
+        cfg.pop("peer_master_approval_status", None)
+        return None
+    code, message = _peer_error_detail(body)
+    if code in ("pairing_not_approved", "pairing_required"):
+        cfg["peer_master_approval_status"] = "pending"
+        if code == "pairing_required":
+            return (
+                "Master requires modern pairing. "
+                "Ask the operator to create a pending pairing for this agent ID on the hosted master, then approve it."
+            )
+        return (
+            "Master has not approved this agent yet. "
+            "Ask the operator to approve pending pairing on the hosted master, then run Sync now again."
+        )
+    if code == "pairing_rejected":
+        cfg["peer_master_approval_status"] = "rejected"
+        return message or "Master rejected this agent pairing request."
+    cfg.pop("peer_master_approval_status", None)
+    return None
+
+
+def _peer_approval_banner_html(approval_status: str) -> str:
+    status = str(approval_status or "").strip()
+    if status == "pending":
+        return (
+            "<div style='padding:10px 12px;border:1px solid rgba(245,158,11,.45);border-radius:8px;"
+            "background:rgba(245,158,11,.10);font-size:12px;color:#fbbf24;margin-top:8px;'>"
+            "<strong>Waiting for master approval.</strong> Create/approve pending pairing on the hosted master, "
+            "then run Sync now again.</div>"
+        )
+    if status == "rejected":
+        return (
+            "<div style='padding:10px 12px;border:1px solid rgba(239,68,68,.45);border-radius:8px;"
+            "background:rgba(239,68,68,.10);font-size:12px;color:#f87171;margin-top:8px;'>"
+            "<strong>Pairing rejected by master.</strong> Create a new pending pairing or contact the operator.</div>"
+        )
+    return ""
 
 
 def _dedupe_peers_by_instance_id(peers: Any) -> List[Dict[str, Any]]:
@@ -1649,14 +1704,14 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
     if role != "agent":
         return "Certificate request is only available for agent role."
     master_host, master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     token = str(cfg.get("peering_token", "") or "").strip()
     if not master_host or not token:
         return "Missing master host or peering token."
-    master_url = _resolve_peer_url(master_host, master_port, token, timeout=10)
+    master_url, resolve_err = _peer_master_base_url(cfg, timeout=10)
     if not master_url:
-        return f"Cannot reach master at {master_host}:{master_port}."
+        return resolve_err
     if not _openssl_available():
         return "openssl not available on this system."
     instance_id = _get_instance_id(cfg)
@@ -1683,6 +1738,10 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
         }
         status, body = _peer_http_request(master_url, token, "POST", "/api/peer/register", payload=payload, timeout=15)
         if status >= 300:
+            block = _peer_set_master_approval_status(cfg, status, body)
+            save_config(cfg, reapply_cron=False)
+            if block:
+                return block
             return f"Register failed (HTTP {status}): {body[:300]}"
         try:
             data = json.loads(body)
@@ -1709,14 +1768,14 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
 
 def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
     master_host, master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     token = str(cfg.get("peering_token", "") or "").strip()
     if not master_host or not token:
         return "Agent sync skipped: no master host or peering token configured."
-    master_url = _resolve_peer_url(master_host, master_port, token, timeout=8)
+    master_url, resolve_err = _peer_master_base_url(cfg, timeout=4)
     if not master_url:
-        return f"Cannot reach master at {master_host}:{master_port}."
+        return f"Agent sync skipped: {resolve_err}"
     instance_id = _get_instance_id(cfg)
     instance_name = str(cfg.get("instance_name", "") or "").strip() or instance_id[:8]
     history = _load_history()
@@ -1724,7 +1783,7 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
     auth = _load_auth_state()
     monitors_cfg = cfg.get("monitors", [])
     cb_host, cb_port = _parse_peer_host_port(
-        cfg.get("agent_callback_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("agent_callback_url", ""), _peer_agent_port(cfg)
     )
     push_payload: Dict[str, Any] = {
         "instance_id": instance_id,
@@ -1749,10 +1808,14 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
         cfg["last_peer_sync_latency_ms"] = latency_ms
         if status < 300:
             cfg["last_peer_sync_result"] = f"OK ({latency_ms} ms)"
+            cfg.pop("peer_master_approval_status", None)
             save_config(cfg, reapply_cron=False)
             return f"Pushed to master ({master_url}): {status} ({latency_ms} ms)"
+        block = _peer_set_master_approval_status(cfg, status, body)
         cfg["last_peer_sync_result"] = f"HTTP {status}"
         save_config(cfg, reapply_cron=False)
+        if block:
+            return block
         return f"Master push failed ({master_url}): HTTP {status} - {body}"
     except Exception as e:
         cfg["last_peer_sync"] = int(time.time())
@@ -1763,6 +1826,24 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
 
 
 PEER_DEFAULT_PORT = 8787
+
+
+def _normalize_peer_port(value: Any, default: int = PEER_DEFAULT_PORT) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+def _peer_master_port(cfg: Dict[str, Any]) -> int:
+    legacy = _normalize_peer_port(cfg.get("peer_port", PEER_DEFAULT_PORT))
+    return _normalize_peer_port(cfg.get("peer_master_port", legacy), legacy)
+
+
+def _peer_agent_port(cfg: Dict[str, Any]) -> int:
+    legacy = _normalize_peer_port(cfg.get("peer_port", PEER_DEFAULT_PORT))
+    return _normalize_peer_port(cfg.get("peer_agent_port", legacy), legacy)
 
 
 def _parse_peer_host_port(url_or_host: str, default_port: int = PEER_DEFAULT_PORT) -> Tuple[str, int]:
@@ -1802,27 +1883,122 @@ def _peer_url_for_open(url: str, default_port: int = PEER_DEFAULT_PORT) -> str:
     return f"http://{host}:{port}"
 
 
-def _resolve_peer_url(host: str, port: int, token: str, timeout: int = 5) -> str:
-    """Try HTTPS first, fall back to HTTP. Returns the working base URL (e.g. https://host:port)."""
+def _peer_scheme_probe_order(port: int) -> Tuple[str, ...]:
+    if port in (443, 8443):
+        return ("https", "http")
+    return ("http", "https")
+
+
+def _cached_peer_base_url(cfg: Dict[str, Any], host: str, port: int) -> str:
+    cached = str(cfg.get("peer_master_base_url", "") or "").strip().rstrip("/")
+    if not cached:
+        return ""
+    cached_host, cached_port = _parse_peer_host_port(cached, port)
+    if cached_host.lower() != host.lower() or cached_port != port:
+        return ""
+    return cached
+
+
+def _resolve_peer_url(
+    host: str,
+    port: int,
+    token: str,
+    timeout: int = 5,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Probe master health and return a working base URL (e.g. http://host:port)."""
     if not host:
         return ""
-    for scheme in ("https", "http"):
+    probe_timeout = min(max(timeout, 2), 4)
+    if cfg is not None:
+        cached = _cached_peer_base_url(cfg, host, port)
+        if cached:
+            try:
+                status, _ = _peer_http_request(cached, token, "GET", "/api/peer/health", timeout=min(probe_timeout, 3))
+                if status < 500:
+                    return cached
+            except Exception:
+                pass
+    for scheme in _peer_scheme_probe_order(port):
         base = f"{scheme}://{host}:{port}"
         try:
-            status, _ = _peer_http_request(base, token, "GET", "/api/peer/health", timeout=timeout)
+            status, _ = _peer_http_request(base, token, "GET", "/api/peer/health", timeout=probe_timeout)
             if status < 500:
-                return base.rstrip("/")
+                resolved = base.rstrip("/")
+                if cfg is not None:
+                    cfg["peer_master_base_url"] = resolved
+                return resolved
         except Exception:
             continue
-    return f"https://{host}:{port}"  # prefer https for next attempt
+    return ""
 
 
-def _resolve_peer_url_from_stored(url_or_host: str, token: str, timeout: int = 5) -> str:
+def _resolve_peer_url_from_stored(
+    url_or_host: str,
+    token: str,
+    timeout: int = 5,
+    cfg: Optional[Dict[str, Any]] = None,
+    default_port: int = PEER_DEFAULT_PORT,
+) -> str:
     """Parse stored url (host, host:port, or full URL) and resolve to working scheme. Returns base URL."""
-    host, port = _parse_peer_host_port(url_or_host)
+    host, port = _parse_peer_host_port(url_or_host, default_port)
     if not host:
         return ""
-    return _resolve_peer_url(host, port, token, timeout)
+    return _resolve_peer_url(host, port, token, timeout, cfg)
+
+
+def _peer_direct_base_url(url_or_host: str, default_port: int = PEER_DEFAULT_PORT) -> str:
+    host, port = _parse_peer_host_port(url_or_host, default_port)
+    if not host:
+        return ""
+    scheme = "https" if port in (443, 8443) else "http"
+    return f"{scheme}://{host}:{port}"
+
+
+def _peer_agent_test_inputs(form: Dict[str, List[str]], cfg: Dict[str, Any]) -> Tuple[str, str]:
+    """Read master host/port + token from test-connection POST (save-form or legacy hidden fields)."""
+    token = (form.get("peer_token", [""])[0] or form.get("peering_token", [""])[0] or "").strip()
+    raw = (form.get("peer_url", [""])[0] or "").strip()
+    port_raw = (form.get("peer_master_port", [""])[0] or "").strip()
+    master_port = int(port_raw) if port_raw.isdigit() else _peer_master_port(cfg)
+    if not raw:
+        master_host = (form.get("peer_master_url", [""])[0] or "").strip()
+        if not master_host:
+            master_host = str(cfg.get("peer_master_url", "") or "").strip()
+        if master_host:
+            host, _ = _parse_peer_host_port(master_host, master_port)
+            if host:
+                raw = f"{host}:{master_port}"
+    if not token:
+        token = str(cfg.get("peering_token", "") or "").strip()
+    return raw, token
+
+
+def _peer_lan_reachability_hint(master_host: str, master_port: int) -> str:
+    return (
+        f"If this host cannot reach {master_host}:{master_port}, set HOSTED_BIND_IP=0.0.0.0 on the master "
+        "(deploy/.env) and redeploy, or use NPM HTTPS on port 443 with the proxy hostname."
+    )
+
+
+def _peer_master_base_url(cfg: Dict[str, Any], timeout: int = 4) -> Tuple[str, str]:
+    """Resolve or construct the master base URL. Returns (url, error_message)."""
+    master_host, master_port = _parse_peer_host_port(
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
+    )
+    token = str(cfg.get("peering_token", "") or "").strip()
+    if not master_host or not token:
+        return "", "Missing master host or peering token."
+    resolved = _resolve_peer_url(master_host, master_port, token, timeout=timeout, cfg=cfg)
+    if resolved:
+        return resolved, ""
+    direct = _peer_direct_base_url(f"{master_host}:{master_port}", master_port)
+    if direct:
+        return direct, ""
+    return "", (
+        f"Cannot reach master at {master_host}:{master_port}. "
+        + _peer_lan_reachability_hint(master_host, master_port)
+    )
 
 
 def _peer_http_request(url: str, token: str, method: str = "GET",
@@ -1908,6 +2084,34 @@ def _peer_test_connection(url: str, token: str) -> str:
         return f"FAILED: {url} responded HTTP {status}"
     except Exception as e:
         return f"Connection error: {type(e).__name__}: {e}"
+
+
+def _probe_agent_callback_health(url_or_host: str, token: str, *, default_port: int = PEER_DEFAULT_PORT) -> str:
+    """Check whether an agent callback URL responds to /api/peer/health."""
+    raw = str(url_or_host or "").strip()
+    token = str(token or "").strip()
+    if not raw:
+        return "No agent callback URL configured."
+    if not token:
+        return "No peering token configured."
+    host, port = _parse_peer_host_port(raw, default_port)
+    if not host:
+        return "No agent callback host configured."
+    try:
+        t0 = time.time()
+        resolved = _resolve_peer_url_from_stored(raw, token, timeout=10)
+        if not resolved:
+            resolved = _resolve_peer_url_from_stored(f"{host}:{port}", token, timeout=10)
+        if not resolved:
+            return f"FAILED: Cannot reach agent at {host}:{port}"
+        status, body = _peer_http_request(resolved, token, "GET", "/api/peer/health", timeout=10)
+        latency_ms = round((time.time() - t0) * 1000)
+        if status < 300:
+            return f"OK: Agent reachable at {resolved} ({latency_ms} ms)"
+        detail = body.strip()[:160] if body.strip() else f"HTTP {status}"
+        return f"FAILED: {detail} ({latency_ms} ms)"
+    except Exception as e:
+        return f"FAILED: {type(e).__name__}: {e}"
 
 
 def _peer_sync_from_master(cfg: Dict[str, Any]) -> str:
@@ -2342,14 +2546,14 @@ def _agent_request_master_monitor_action(
     if role != "agent":
         return False, "This action is only supported on agent role.", ""
     master_host, master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     token = str(cfg.get("peering_token", "") or "").strip()
     if not master_host or not token:
         return False, "Missing master host or peering token.", ""
-    master_url = _resolve_peer_url(master_host, master_port, token, timeout=10)
+    master_url, resolve_err = _peer_master_base_url(cfg, timeout=10)
     if not master_url:
-        return False, f"Cannot reach master at {master_host}:{master_port}.", ""
+        return False, resolve_err, ""
     payload = {
         "instance_id": _get_instance_id(cfg),
         "action": action,
@@ -5854,14 +6058,15 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
     role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
     peering_token = str(cfg.get("peering_token", "") or "")
     _master_host, _master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     _cb_host, _cb_port = _parse_peer_host_port(
-        cfg.get("agent_callback_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("agent_callback_url", ""), _peer_agent_port(cfg)
     )
     master_host = _master_host
     agent_callback_host = _cb_host
-    peer_port = int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+    master_port = _peer_master_port(cfg)
+    agent_port = _peer_agent_port(cfg)
     peers = cfg.get("peers", [])
     if not isinstance(peers, list):
         peers = []
@@ -6044,6 +6249,8 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
         )
 
     agent_fields = ""
+    peering_agent_actions_html = ""
+    peering_save_actions_html = ""
     if role == "agent":
         agent_fields = f"""
           <div style="margin-top:16px;padding:10px 12px;border:1px solid rgba(47,128,237,.4);border-radius:8px;background:rgba(47,128,237,.08);font-size:12px;">
@@ -6051,7 +6258,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
             <ol style="margin:6px 0 0 0;padding-left:18px;">
               <li>On the <b>master</b>, copy the peering token shown there.</li>
               <li>Paste it below &mdash; it must match the master <i>exactly</i>.</li>
-              <li>Enter master host, your callback host, port (if not 8787), then Save.</li>
+              <li>Enter master host, your callback host, and ports (master vs this agent), then Save.</li>
             </ol>
           </div>
           <label>Master's peering token <span class="muted">(copy from master's Peering card)</span></label>
@@ -6060,36 +6267,31 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
           <input name="peer_master_url" value="{html.escape(master_host)}" placeholder="master-nas or 192.168.31.32">
           <label>Agent callback host <span class="muted">(this NAS hostname or IP for master to reach you)</span></label>
           <input name="agent_callback_url" value="{html.escape(agent_callback_host)}" placeholder="this-nas or 192.168.31.1">
-          <label>Port <span class="muted">(if not 8787)</span></label>
-          <input name="peer_port" type="number" value="{peer_port}" placeholder="8787" min="1" max="65535" style="max-width:120px;">
-          <div class="button-row" style="margin-top:10px;">
-            <button type="submit">Save peering settings</button>
-          </div>
-        </form>
-        <div class="button-row" style="gap:8px;">
-          <form method="post" action="/peer/test-connection" style="margin:0;">
-            <input type="hidden" name="peer_url" value="{html.escape(f'{master_host}:{peer_port}' if master_host else '')}">
-            <input type="hidden" name="peer_token" value="{html.escape(peering_token)}">
-            <button type="submit">Test connection to master</button>
-          </form>
-          <form method="post" action="/peer/sync-now" style="margin:0;">
+          <label>Master port <span class="muted">(master API/UI, e.g. 8080 for hosted master)</span></label>
+          <input name="peer_master_port" type="number" value="{master_port}" placeholder="Default 8787" min="1" max="65535" style="max-width:120px;">
+          <label>Agent callback port <span class="muted">(this agent's UI/API port)</span></label>
+          <input name="peer_agent_port" type="number" value="{agent_port}" placeholder="Default 8787" min="1" max="65535" style="max-width:120px;">
+        """
+        peering_agent_actions_html = """
+        <div class="button-row peering-action-row" style="gap:8px;margin-top:10px;flex-wrap:wrap;">
+          <button type="submit" form="peering-save-form">Save peering settings</button>
+          <button type="submit" form="peering-save-form" formaction="/peer/test-connection" formmethod="post">Test connection to master</button>
+          <form method="post" action="/peer/sync-now" style="margin:0;display:inline-flex;">
             <button type="submit">Sync now</button>
           </form>
         </div>
         """
     elif role == "master":
-        agent_fields = f"""
-          <div class="button-row" style="margin-top:10px;">
-            <button type="submit">Save peering settings</button>
-          </div>
-        </form>
+        peering_save_actions_html = """
+        <div class="button-row peering-action-row" style="margin-top:10px;">
+          <button type="submit" form="peering-save-form">Save peering settings</button>
+        </div>
         """
     else:
-        agent_fields = """
-          <div class="button-row" style="margin-top:10px;">
-            <button type="submit">Save peering settings</button>
-          </div>
-        </form>
+        peering_save_actions_html = """
+        <div class="button-row peering-action-row" style="margin-top:10px;">
+          <button type="submit" form="peering-save-form">Save peering settings</button>
+        </div>
         """
 
     # Build security status panel
@@ -6344,9 +6546,10 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
         <h3>Multi-Instance Peering</h3>
         <div class="muted">Connect multiple instances for cross-network monitoring. Agents push results to a master dashboard.</div>
         <div class="muted" style="margin-top:6px;">Instance ID: <code>{html.escape(_display_peer_instance_id(instance_id))}</code></div>
+        {_peer_approval_banner_html(str(cfg.get("peer_master_approval_status", "") or ""))}
         {"<div class='ok' style='margin-top:8px;white-space:pre-wrap;'>" + html.escape(peering_message) + "</div>" if peering_message else ""}
         {security_panel}
-        <form method="post" action="/peer/save-settings">
+        <form id="peering-save-form" method="post" action="/peer/save-settings">
           <div>
             <label>Role</label>
             {role_select_block}
@@ -6356,6 +6559,9 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
           {master_peer_actions_html}
           {token_section}
           {agent_fields}
+        </form>
+        {peering_agent_actions_html}
+        {peering_save_actions_html}
         <div class="muted" style="margin-top:10px;">Peering diagnostics</div>
         <pre class="code" style="margin-top:6px;max-height:14rem;overflow:auto;">{html.escape(peering_diagnostics_text)}</pre>
         {peer_cleanup_html}
@@ -10822,21 +11028,34 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 raw_len = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                 form = parse_qs(body, keep_blank_values=True)
-                test_url_raw = (form.get("peer_url", [""])[0] or "").strip()
-                test_token = (form.get("peer_token", [""])[0] or "").strip()
-                test_url = _resolve_peer_url_from_stored(test_url_raw, test_token, timeout=8) if test_url_raw and test_token else test_url_raw
-                result = _peer_test_connection(test_url, test_token) if test_url else "Missing host or token."
+                cfg = load_config()
+                test_url_raw, test_token = _peer_agent_test_inputs(form, cfg)
+                resolved_url = ""
+                if not test_url_raw or not test_token:
+                    result = "Missing master host/port or peering token. Enter master host, master port, and token."
+                    test_url = ""
+                else:
+                    resolved_url = _resolve_peer_url_from_stored(
+                        test_url_raw, test_token, timeout=4, cfg=cfg, default_port=_peer_master_port(cfg)
+                    )
+                    _, target_port = _parse_peer_host_port(test_url_raw, _peer_master_port(cfg))
+                    test_url = resolved_url or _peer_direct_base_url(test_url_raw, target_port)
+                    result = _peer_test_connection(test_url, test_token) if test_url else "Missing master host/port."
                 ok = str(result).strip().lower().startswith("ok")
+                if ok and test_url:
+                    cfg["peer_master_base_url"] = test_url
+                    save_config(cfg, reapply_cron=False)
                 diag_lines = [
                     "Action: Test connection to master",
                     f"Result: {'OK' if ok else 'FAILED'}",
                     "Role: agent (form action)",
                     f"Master target (input): {test_url_raw or '(empty)'}",
-                    f"Resolved target URL: {test_url or '(none)'}",
+                    f"Resolved target URL: {resolved_url or '(probe failed — used direct URL)'}",
+                    f"Direct/final URL: {test_url or '(none)'}",
                     f"Token provided: {'yes' if bool(test_token) else 'no'}",
                     f"Result detail: {result}",
                     ("Next action: Run 'Sync now' to push an agent snapshot."
-                     if ok else "Next action: Verify host/port/token and retry test.")
+                     if ok else "Next action: Save settings, verify master is reachable from this host (port/firewall), then retry.")
                 ]
                 ssl_warning = self._ssl_warning_text()
                 ui_view = self._view_from_referer()
@@ -10856,6 +11075,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 form = parse_qs(body, keep_blank_values=True)
                 cfg = load_config()
                 prev_role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+                prev_master_host = str(cfg.get("peer_master_url", "") or "").strip()
+                prev_master_port = int(cfg.get("peer_master_port", cfg.get("peer_port", PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)
                 role = (form.get("peer_role", [prev_role])[0] or prev_role).strip().lower()
                 if role not in PEER_ROLES:
                     role = prev_role
@@ -10885,11 +11106,20 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 cfg["peer_role"] = role
                 _m_raw = (form.get("peer_master_url", [""])[0] or "").strip()
                 _cb_raw = (form.get("agent_callback_url", [""])[0] or "").strip()
-                _port_val = (form.get("peer_port", [""])[0] or "").strip()
-                _port = int(_port_val) if _port_val and _port_val.isdigit() else PEER_DEFAULT_PORT
-                cfg["peer_master_url"] = _parse_peer_host_port(_m_raw, _port)[0]
-                cfg["agent_callback_url"] = _parse_peer_host_port(_cb_raw, _port)[0]
-                cfg["peer_port"] = _port if 1 <= _port <= 65535 else PEER_DEFAULT_PORT
+                _legacy_port_val = (form.get("peer_port", [""])[0] or "").strip()
+                _master_port_val = (form.get("peer_master_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
+                _agent_port_val = (form.get("peer_agent_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
+                _master_port = int(_master_port_val) if _master_port_val and _master_port_val.isdigit() else PEER_DEFAULT_PORT
+                _agent_port = int(_agent_port_val) if _agent_port_val and _agent_port_val.isdigit() else PEER_DEFAULT_PORT
+                cfg["peer_master_port"] = _master_port if 1 <= _master_port <= 65535 else PEER_DEFAULT_PORT
+                cfg["peer_agent_port"] = _agent_port if 1 <= _agent_port <= 65535 else PEER_DEFAULT_PORT
+                cfg["peer_port"] = cfg["peer_agent_port"]
+                cfg["peer_master_url"] = _parse_peer_host_port(_m_raw, cfg["peer_master_port"])[0]
+                cfg["agent_callback_url"] = _parse_peer_host_port(_cb_raw, cfg["peer_agent_port"])[0]
+                new_master_host = str(cfg.get("peer_master_url", "") or "").strip()
+                new_master_port = int(cfg.get("peer_master_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+                if new_master_host != prev_master_host or new_master_port != prev_master_port:
+                    cfg.pop("peer_master_base_url", None)
                 token_val = (form.get("peering_token", [""])[0] or "").strip()
                 token_auto_generated = False
                 if token_val:
@@ -10924,11 +11154,29 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     "Result: OK",
                     f"Role: {role}",
                     f"Master host: {str(cfg.get('peer_master_url', '') or '(empty)')}",
-                    f"Peer port: {int(cfg.get('peer_port', PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)}",
+                    f"Master port: {int(cfg.get('peer_master_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
+                    f"Agent callback port: {int(cfg.get('peer_agent_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
                     f"Token configured: {'yes' if bool(str(cfg.get('peering_token', '') or '').strip()) else 'no'}",
                     f"Agent callback host: {str(cfg.get('agent_callback_url', '') or '(empty)')}",
-                    "Next action: Run 'Test connection to master' and then 'Sync now'."
                 ]
+                token_for_probe = str(cfg.get("peering_token", "") or "").strip()
+                if role == "agent" and cfg.get("peer_master_url") and token_for_probe:
+                    master_url, _ = _peer_master_base_url(cfg, timeout=4)
+                    master_probe = _peer_test_connection(master_url, token_for_probe) if master_url else "Cannot resolve master URL."
+                    diag_lines.append(f"Master connectivity: {master_probe.splitlines()[0]}")
+                callback_host = str(cfg.get("agent_callback_url", "") or "").strip()
+                if callback_host and token_for_probe:
+                    callback_probe = _probe_agent_callback_health(
+                        callback_host,
+                        token_for_probe,
+                        default_port=int(cfg.get("peer_agent_port", cfg.get("peer_port", PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT),
+                    )
+                    diag_lines.append(f"Agent callback connectivity: {callback_probe}")
+                diag_lines.append(
+                    "Next action: Run 'Test connection to master' and then 'Sync now'."
+                    if role == "agent"
+                    else "Next action: Sync agents after callback URLs are configured."
+                )
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
                     peering_message=f"Peering settings saved.{_extra_msg}",
@@ -11117,7 +11365,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     f"Result: {'OK' if 'failed' not in str(result).lower() and 'error' not in str(result).lower() else 'FAILED'}",
                     f"Role: {role}",
                     f"Master host: {str(cfg.get('peer_master_url', '') or '(empty)')}",
-                    f"Peer port: {int(cfg.get('peer_port', PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)}",
+                    f"Master port: {int(cfg.get('peer_master_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
+                    f"Agent callback port: {int(cfg.get('peer_agent_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
                     f"Token configured: {'yes' if bool(str(cfg.get('peering_token', '') or '').strip()) else 'no'}",
                     f"Agent callback host: {str(cfg.get('agent_callback_url', '') or '(empty)')}",
                     f"Result detail: {result}",
@@ -11279,7 +11528,13 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         break
                 cfg["peers"] = peers
                 save_config(cfg, reapply_cron=False)
-                msg = f"Peer URL updated." if updated else f"Peer not found."
+                token = str(cfg.get("peering_token", "") or "").strip()
+                probe_msg = ""
+                if updated and upd_url and token:
+                    probe_msg = _probe_agent_callback_health(upd_url, token)
+                msg = "Peer URL updated." if updated else "Peer not found."
+                if probe_msg:
+                    msg = f"{msg} {probe_msg}"
                 append_ui_log(f"peer-update-url | {upd_id} -> {upd_url}")
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
