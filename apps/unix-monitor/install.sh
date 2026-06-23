@@ -535,6 +535,143 @@ with open(path, "w", encoding="utf-8") as f:
 PY
 }
 
+print_install_summary() {
+    local config_path="$1"
+    local install_dir="$2"
+    local script_name="$3"
+    local target="$4"
+    local uninstall_target="$5"
+    python3 - <<'PY' "${config_path}" "${install_dir}" "${script_name}" "${target}" "${uninstall_target}"
+import json, re, socket, sys, uuid
+from urllib.parse import urlparse
+
+config_path, install_dir, script_name, target, uninstall = sys.argv[1:6]
+PEER_DEFAULT_PORT = 8787
+
+
+def normalize_peer_port(raw, default=PEER_DEFAULT_PORT):
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+def peer_master_port(cfg):
+    legacy = normalize_peer_port(cfg.get("peer_port", PEER_DEFAULT_PORT))
+    return normalize_peer_port(cfg.get("peer_master_port", legacy), legacy)
+
+
+def peer_agent_port(cfg):
+    legacy = normalize_peer_port(cfg.get("peer_port", PEER_DEFAULT_PORT))
+    return normalize_peer_port(cfg.get("peer_agent_port", legacy), legacy)
+
+
+def parse_peer_host_port(url_or_host, default_port=PEER_DEFAULT_PORT):
+    s = str(url_or_host or "").strip().rstrip("/")
+    if not s:
+        return ("", default_port)
+    parsed = urlparse(s if "://" in s else f"http://{s}")
+    host = (parsed.hostname or parsed.path or s).strip()
+    if not host:
+        return ("", default_port)
+    port = parsed.port if parsed.port is not None else default_port
+    return (host, port)
+
+
+def display_instance_id(instance_id):
+    iid = str(instance_id or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", iid):
+        lower = iid.lower()
+        return f"{lower[0:8]}-{lower[8:12]}-{lower[12:16]}-{lower[16:20]}-{lower[20:32]}"
+    return iid
+
+
+try:
+    with open(config_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+
+if not str(cfg.get("instance_id", "") or "").strip():
+    cfg["instance_id"] = str(uuid.uuid4())
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+instance_id = display_instance_id(cfg.get("instance_id", ""))
+instance_name = str(cfg.get("instance_name", "") or socket.gethostname())
+web_enabled = bool(cfg.get("web_enabled", True))
+role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+sched_backend = str(cfg.get("scheduler_backend", "systemd") or "systemd")
+sched_interval = int(cfg.get("cron_interval_minutes", 1) or 1)
+ui_port = int(cfg.get("ui_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+master_host, _ = parse_peer_host_port(cfg.get("peer_master_url", ""), peer_master_port(cfg))
+master_port = peer_master_port(cfg)
+cb_host, _ = parse_peer_host_port(cfg.get("agent_callback_url", ""), peer_agent_port(cfg))
+agent_port = peer_agent_port(cfg)
+if not cb_host:
+    cb_host = socket.gethostname()
+token = str(cfg.get("peering_token", "") or "").strip()
+token_status = "configured" if token else "not set"
+
+print("")
+print("Configured:")
+print(f"  Instance name:     {instance_name}")
+print(f"  Config file:       {config_path}")
+print(f"  Install directory: {install_dir}")
+print(f"  Webserver mode:    {'enabled' if web_enabled else 'disabled (agent-only)'}")
+if web_enabled:
+    print(f"  Local UI port:     {ui_port}")
+print(f"  Scheduler:         {sched_backend}, every {sched_interval} minute(s)")
+print("")
+print("Peering (for master registration):")
+print(f"  Peering ID:        {instance_id}")
+print("  (Use on hosted master: Settings -> Agents -> Add agent -> Peering ID)")
+print(f"  Role:              {role}")
+print(f"  Master host:       {master_host or '(not set — configure in Settings -> Peering)'}")
+print(f"  Master port:       {master_port}")
+print(f"  Agent callback:    {cb_host}:{agent_port}")
+print(f"  Peering token:     {token_status}")
+
+if role == "agent":
+    if master_host and token:
+        print("")
+        print("Next steps on master:")
+        print("  1. Add pending agent with Peering ID above")
+        print("  2. Set fleet tags if needed")
+        print("  3. Approve pairing — agent sync starts automatically")
+    else:
+        print("")
+        print("Next steps:")
+        print("  1. Set master host, ports, and peering token in Settings -> Peering")
+        print("  2. Register Peering ID on the hosted master and approve pairing")
+elif role == "standalone":
+    print("")
+    print("Peering note:")
+    print("  Standalone mode — switch to agent role in Settings -> Peering when connecting to a master.")
+    print("  Use Peering ID above when adding this host on the master.")
+else:
+    print("")
+    print("Peering note:")
+    print("  Master role — other agents connect to this host using their own Peering IDs.")
+
+print("")
+if web_enabled:
+    print("Webserver mode:")
+    print(f"  UI command: cd {install_dir} && python3 {script_name} --ui --host 0.0.0.0 --port {ui_port}")
+    print(f"  Open:       http://<{cb_host}>:{ui_port}")
+    print("  Peering role and endpoints can be changed in the UI or config.")
+else:
+    print("No-webserver mode:")
+    print("  Agent-only menu: cd {install_dir} && python3 {script_name} --agent-menu")
+    print("  A master connection is mandatory.")
+
+print("")
+print(f"Manual one-shot check: python3 {target} --run-scheduled")
+print(f"Uninstall later:       sudo {uninstall}")
+PY
+}
+
 prompt_webserver_mode() {
     local default_choice="${1:-1}"
     echo ""
@@ -1245,22 +1382,5 @@ fi
 echo ""
 echo "------------------------------------------------------"
 echo -e "${GREEN}${BOLD}Installation complete.${NC}"
-echo ""
-if [ "${WEB_ENABLED}" = "true" ]; then
-    echo "Webserver mode:"
-    echo "  - UI command: cd ${INSTALL_DIR} && python3 ${SCRIPT_NAME} --ui --host 0.0.0.0 --port 8787"
-    echo "  - Open: http://<unix-host>:8787"
-    echo "  - Peering role can be changed in UI or config."
-else
-    echo "No-webserver mode:"
-    echo "  - Agent-only functionality is active."
-    echo "  - Local monitor setup is menu-based only."
-    echo "  - A master connection is mandatory."
-    echo "  - Start menu: cd ${INSTALL_DIR} && python3 ${SCRIPT_NAME} --agent-menu"
-fi
-echo ""
-echo "Scheduler backend: ${SCHED_BACKEND}"
-echo "Scheduler interval: ${SCHED_INTERVAL_MIN} minute(s)"
-echo "Manual one-shot check: python3 ${TARGET} --run-scheduled"
-echo "Uninstall later: sudo ${UNINSTALL_TARGET}"
+print_install_summary "${CONFIG_PATH}" "${INSTALL_DIR}" "${SCRIPT_NAME}" "${TARGET}" "${UNINSTALL_TARGET}"
 echo "------------------------------------------------------"

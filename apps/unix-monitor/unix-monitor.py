@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0004"
+VERSION = "1.11.0-0005"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6545,7 +6545,10 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
       <div class="card" id="peering-card">
         <h3>Multi-Instance Peering</h3>
         <div class="muted">Connect multiple instances for cross-network monitoring. Agents push results to a master dashboard.</div>
-        <div class="muted" style="margin-top:6px;">Instance ID: <code>{html.escape(_display_peer_instance_id(instance_id))}</code></div>
+        <div class="muted" style="margin-top:6px;display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
+          <span>Instance ID: <code id="peer-instance-id">{html.escape(_display_peer_instance_id(instance_id))}</code></span>
+          <button type="button" class="btn secondary copy-peer-instance-id-btn" style="padding:4px 10px;font-size:12px;line-height:1.2;">Copy</button>
+        </div>
         {_peer_approval_banner_html(str(cfg.get("peer_master_approval_status", "") or ""))}
         {"<div class='ok' style='margin-top:8px;white-space:pre-wrap;'>" + html.escape(peering_message) + "</div>" if peering_message else ""}
         {security_panel}
@@ -7734,7 +7737,7 @@ def _render_setup_html(
         </form>
       </div>
       {_render_peering_card(cfg, peering_message=peering_message, peering_diagnostics=peering_diagnostics)}
-      <div class="card">
+      <div class="card danger-zone-card">
         <h3>Danger Zone</h3>
         <div class="muted">Restart package services from UI (web UI + scheduler loop).</div>
         <div style="margin-bottom:18px;padding:12px 0;border-bottom:1px solid var(--border);">
@@ -7773,7 +7776,7 @@ def _render_setup_html(
           </div>
         </form>
         <div class="muted" style="margin-top:14px;">Admin account protected by password + mandatory TOTP 2FA.</div>
-        <div class="card" style="margin-top:16px;border-color:rgba(239,68,68,.25);">
+        <div class="danger-zone-factory" style="margin-top:16px;">
           <h3>Factory Settings</h3>
           <div class="button-row">
             <form method="post" action="/danger-restart" onsubmit="return confirm('Restart addon now? UI will disconnect briefly.');">
@@ -7806,6 +7809,7 @@ def _render_setup_html(
     .layout {{ display: grid; grid-template-columns: 2.1fr 1fr; gap: 12px; }}
     .main-col, .side-col {{ min-width: 0; }}
     .card {{ background: rgba(18,29,47,0.94); border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin-bottom: 14px; box-shadow: 0 14px 30px rgba(0,0,0,.28); backdrop-filter: blur(4px); }}
+    .danger-zone-card {{ border-color: rgba(239,68,68,.35); }}
     /* Stack above the following settings cards so peer dropdowns are not covered (e.g. Danger Zone). */
     #peering-card {{ position: relative; z-index: 30; }}
     #peer-live-panel {{ overflow: visible; position: relative; }}
@@ -8245,6 +8249,46 @@ def _render_setup_html(
           input.type = show ? "text" : "password";
           btn.textContent = show ? "Hide" : "Show";
           btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+        }});
+
+        function copyTextToClipboard(text) {{
+          if (navigator.clipboard && window.isSecureContext) {{
+            return navigator.clipboard.writeText(text);
+          }}
+          return new Promise(function (resolve, reject) {{
+            try {{
+              var ta = document.createElement("textarea");
+              ta.value = text;
+              ta.setAttribute("readonly", "");
+              ta.style.position = "fixed";
+              ta.style.opacity = "0";
+              ta.style.left = "-9999px";
+              document.body.appendChild(ta);
+              ta.focus();
+              ta.select();
+              var ok = document.execCommand("copy");
+              document.body.removeChild(ta);
+              if (ok) resolve();
+              else reject(new Error("copy command failed"));
+            }} catch (e) {{
+              reject(e);
+            }}
+          }});
+        }}
+        document.addEventListener("click", function (ev) {{
+          var copyBtn = ev && ev.target && ev.target.closest ? ev.target.closest(".copy-peer-instance-id-btn") : null;
+          if (!copyBtn) return;
+          var idEl = document.getElementById("peer-instance-id");
+          if (!idEl) return;
+          var idText = (idEl.textContent || "").trim();
+          if (!idText) return;
+          copyTextToClipboard(idText).then(function () {{
+            var label = copyBtn.textContent;
+            copyBtn.textContent = "Copied!";
+            setTimeout(function () {{ copyBtn.textContent = label; }}, 1500);
+          }}).catch(function () {{
+            alert("Failed to copy. Please copy manually.");
+          }});
         }});
 
         var bodyMeta = document.body || null;
