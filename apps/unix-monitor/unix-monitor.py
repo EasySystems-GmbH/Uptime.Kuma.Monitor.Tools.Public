@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0008"
+VERSION = "1.11.0-0009"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1226,14 +1226,9 @@ def _peer_set_master_approval_status(cfg: Dict[str, Any], status_code: int, body
     code, message = _peer_error_detail(body)
     if code in ("pairing_not_approved", "pairing_required"):
         cfg["peer_master_approval_status"] = "pending"
-        if code == "pairing_required":
-            return (
-                "Master requires modern pairing. "
-                "Ask the operator to create a pending pairing for this agent ID on the hosted master, then approve it."
-            )
         return (
             "Master has not approved this agent yet. "
-            "Ask the operator to approve pending pairing on the hosted master, then run Sync now again."
+            "This agent should appear under Pending pairing on the hosted master — ask the operator to approve it."
         )
     if code == "pairing_rejected":
         cfg["peer_master_approval_status"] = "rejected"
@@ -1248,14 +1243,15 @@ def _peer_approval_banner_html(approval_status: str) -> str:
         return (
             "<div style='padding:10px 12px;border:1px solid rgba(245,158,11,.45);border-radius:8px;"
             "background:rgba(245,158,11,.10);font-size:12px;color:#fbbf24;margin-top:8px;'>"
-            "<strong>Waiting for master approval.</strong> Create/approve pending pairing on the hosted master, "
-            "then run Sync now again.</div>"
+            "<strong>Waiting for master approval.</strong> This agent contacted the hosted master and is listed under "
+            "<em>Pending pairing</em>. Approve (or batch-approve) on the master, then sync again.</div>"
         )
     if status == "rejected":
         return (
             "<div style='padding:10px 12px;border:1px solid rgba(239,68,68,.45);border-radius:8px;"
             "background:rgba(239,68,68,.10);font-size:12px;color:#f87171;margin-top:8px;'>"
-            "<strong>Pairing rejected by master.</strong> Create a new pending pairing or contact the operator.</div>"
+            "<strong>Pairing rejected by master.</strong> Retry sync after the operator clears the rejection — a new "
+            "contact opens a fresh pending pairing.</div>"
         )
     return ""
 
@@ -1766,6 +1762,26 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
         return f"Certificate request failed: {type(e).__name__}: {e}"
 
 
+def _agent_maybe_request_cert_bg(cfg: Dict[str, Any]) -> None:
+    if str(cfg.get("peer_role", "") or "").lower() != "agent":
+        return
+    if not _openssl_available():
+        return
+    if _get_mtls_security_status(cfg).get("instance_cert_ok"):
+        return
+    if not str(cfg.get("peer_master_url", "") or "").strip() or not str(cfg.get("peering_token", "") or "").strip():
+        return
+
+    def _run() -> None:
+        try:
+            result = _agent_request_cert(load_config())
+            append_ui_log(f"peer-cert | auto: {result}")
+        except Exception as exc:
+            append_ui_log(f"peer-cert | auto error: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
     master_host, master_port = _parse_peer_host_port(
         cfg.get("peer_master_url", ""), _peer_master_port(cfg)
@@ -1810,6 +1826,7 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
             cfg["last_peer_sync_result"] = f"OK ({latency_ms} ms)"
             cfg.pop("peer_master_approval_status", None)
             save_config(cfg, reapply_cron=False)
+            _agent_maybe_request_cert_bg(cfg)
             return f"Pushed to master ({master_url}): {status} ({latency_ms} ms)"
         block = _peer_set_master_approval_status(cfg, status, body)
         cfg["last_peer_sync_result"] = f"HTTP {status}"
@@ -6438,10 +6455,12 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
         elif master_host and peering_token:
             _sec_actions_agent = (
                 "<div style='margin-top:8px;'>"
-                "<form method='post' action='/peer/request-cert' style='margin:0;'>"
+                "<div class='muted' style='font-size:11px;'>"
+                "Certificate is requested automatically after the master approves pairing and push succeeds.</div>"
+                "<form method='post' action='/peer/request-cert' style='margin:8px 0 0;'>"
                 "<button type='submit'>Request certificate from master</button>"
                 "</form>"
-                "<div class='muted' style='font-size:11px;margin-top:4px;'>Sends a CSR to the master for signing.</div>"
+                "<div class='muted' style='font-size:11px;margin-top:4px;'>Manual retry — sends a CSR to the master for signing.</div>"
                 "</div>"
             )
 
