@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0009"
+VERSION = "1.11.0-0011"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1202,7 +1202,36 @@ def _peer_agent_release_master_binding(cfg: Dict[str, Any]) -> None:
     (d / "master.crt").unlink(missing_ok=True)
     cfg["last_peer_sync"] = 0
     cfg["last_peer_sync_result"] = ""
+    cfg["last_peer_sync_latency_ms"] = None
     cfg.pop("peer_master_approval_status", None)
+
+
+def _peer_remove_agent_master_certs(cfg: Dict[str, Any]) -> None:
+    """Remove mTLS material obtained from a hosted master (agent role)."""
+    d = get_certs_dir()
+    (d / "master.crt").unlink(missing_ok=True)
+    instance_id = str(cfg.get("instance_id", "") or "").strip()
+    if instance_id:
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", instance_id)[:40]
+        for suffix in (".crt", ".key", ".csr"):
+            (d / f"{safe_id}{suffix}").unlink(missing_ok=True)
+    # Agent stores the master's CA as ca.crt only; a local master also has ca.key.
+    if not (d / "ca.key").exists():
+        (d / "ca.crt").unlink(missing_ok=True)
+
+
+def _peer_clear_standalone_peering(cfg: Dict[str, Any], *, prev_role: str = "") -> None:
+    """Clear master connection settings and agent-side master trust when role is standalone."""
+    prev = str(prev_role or "").lower()
+    had_agent_master_certs = prev == "agent" or (get_certs_dir() / "master.crt").exists()
+    _peer_agent_release_master_binding(cfg)
+    cfg["peer_master_url"] = ""
+    cfg["peering_token"] = ""
+    cfg["agent_callback_url"] = ""
+    cfg.pop("peer_master_base_url", None)
+    cfg.pop("peer_master_port", None)
+    if had_agent_master_certs:
+        _peer_remove_agent_master_certs(cfg)
 
 
 def _peer_error_detail(body: str) -> Tuple[str, str]:
@@ -6153,7 +6182,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
             "<div style='margin-top:10px;padding:10px 12px;border:1px solid rgba(245,158,11,.35);border-radius:8px;"
             "background:rgba(245,158,11,.06);'>"
             "<div class='muted' style='font-size:11px;margin-bottom:8px;line-height:1.45;'>"
-            "To switch to Standalone or Master, disconnect first. Your peering token and master host fields are kept.</div>"
+            "To switch to Master, disconnect first. Switching to Standalone clears master host, token, and stored trust.</div>"
             "<form method='post' action='/peer/agent-disconnect-master' style='margin:0;' "
             "onsubmit=\"return confirm('Disconnect from master? Clears stored master certificate and last sync status.');\">"
             "<button type='submit' style='border-color:#f59e0b;color:#f59e0b;background:transparent;'>"
@@ -11163,12 +11192,12 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 if role not in PEER_ROLES:
                     role = prev_role
                 if role != prev_role:
-                    if prev_role == "agent" and _peer_agent_bound_to_master(cfg):
+                    if prev_role == "agent" and role != "standalone" and _peer_agent_bound_to_master(cfg):
                         ssl_warning = self._ssl_warning_text()
                         self._reply_html(_render_setup_html(
                             peering_message=(
                                 "Cannot change role while this agent is connected to a master. "
-                                "Use Disconnect from master first."
+                                "Use Disconnect from master first, or switch to Standalone to clear master settings."
                             ),
                             ui_view="settings",
                             ssl_warning=ssl_warning,
@@ -11219,8 +11248,12 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             cfg["peering_token"] = secrets.token_hex(32)
                             token_auto_generated = True
                 inst_id = _get_instance_id(cfg)
+                if role == "standalone":
+                    _peer_clear_standalone_peering(cfg, prev_role=prev_role)
                 save_config(cfg, reapply_cron=False)
                 _extra_msg = " Peering token auto-generated." if token_auto_generated else ""
+                if role == "standalone" and prev_role != "standalone":
+                    _extra_msg += " Master connection settings and stored trust cleared."
                 if role == "master" and _openssl_available():
                     ca_path = get_certs_dir() / "ca.crt"
                     if not ca_path.exists():
@@ -11259,11 +11292,12 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         default_port=int(cfg.get("peer_agent_port", cfg.get("peer_port", PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT),
                     )
                     diag_lines.append(f"Agent callback connectivity: {callback_probe}")
-                diag_lines.append(
-                    "Next action: Run 'Test connection to master' and then 'Sync now'."
-                    if role == "agent"
-                    else "Next action: Sync agents after callback URLs are configured."
-                )
+                if role == "agent":
+                    diag_lines.append("Next action: Run 'Test connection to master' and then 'Sync now'.")
+                elif role == "master":
+                    diag_lines.append("Next action: Sync agents after callback URLs are configured.")
+                else:
+                    diag_lines.append("Next action: No peering configured.")
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
                     peering_message=f"Peering settings saved.{_extra_msg}",
