@@ -1,0 +1,18 @@
+# Example: unix rollout agent container (agent-only edition).
+services:
+  rollout-agent:
+    image: easysystems/unix-rollout-agent:1.12.0-rollout.1
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      ESYS_ROLLOUT_AGENT: "1"
+      UNIX_MONITOR_DATA: /data
+    volumes:
+      - rollout-agent-data:/data
+    restart: unless-stopped
+
+volumes:
+  rollout-agent-data:

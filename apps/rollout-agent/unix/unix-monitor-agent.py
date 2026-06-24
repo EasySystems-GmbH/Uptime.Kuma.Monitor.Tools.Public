@@ -4,15 +4,15 @@
 # Author: Konrad von Burg               #
 # Date: 2026-02-19                      #
 # Description: Interactive menu script  #
-# to monitor Synology NAS storage and   #
+# to monitor Unix host storage and   #
 # SMART health and report to Kuma.      #
 # Version: 1.0.0                        #
 # Copyright (c) 2026 EasySystems GmbH   #
 #                                       #
 # Usage:                                #
-#   python3 synology-monitor.py         #
-#   python3 synology-monitor.py --run   #
-#   python3 synology-monitor.py --run -d
+#   python3 unix-monitor.py         #
+#   python3 unix-monitor.py --run   #
+#   python3 unix-monitor.py --run -d
 #########################################
 
 from __future__ import annotations
@@ -28,10 +28,13 @@ import html
 import json
 import os
 import base64
+import cProfile
 import hashlib
 import hmac
+import pstats
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import stat
@@ -39,15 +42,20 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
-from io import BytesIO
+import platform
+import warnings
+from io import BytesIO, StringIO
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
 try:
-    import cgi  # type: ignore[import-not-found]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning, module="cgi")
+        import cgi  # type: ignore[import-not-found]
 except Exception:
     cgi = None
 try:
@@ -77,14 +85,49 @@ except Exception:
             return False
 
 
-VERSION = "1.12.0-0001"
+VERSION = "1.12.0-rollout.0001"
 CONFIG_FILE_MODE = 0o600
-CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
+CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
 INTERVAL_MAX = 1440
-CHECK_MODES = ("smart", "storage", "ping", "port", "dns", "backup")
-PEER_ROLES = ("standalone", "agent", "master")
+CHECK_MODES = ("mount", "smart", "storage", "ping", "port", "dns", "backup", "service")
+PEER_ROLES_ALL = ("standalone", "agent", "master")
+PEER_ROLES = PEER_ROLES_ALL
+# Set True only in rollout-agent distribution builds (agent-only edition).
+ROLLOUT_AGENT_BUILD = True
 PEER_HEALTH_TIMEOUT_SEC = 75
+
+
+def _rollout_agent_mode() -> bool:
+    if ROLLOUT_AGENT_BUILD:
+        return True
+    env = os.environ.get("ESYS_ROLLOUT_AGENT", "").strip().lower()
+    return env in ("1", "true", "yes", "on")
+
+
+def _default_peer_role() -> str:
+    return "agent" if _rollout_agent_mode() else "standalone"
+
+
+def _peer_roles() -> Tuple[str, ...]:
+    return ("agent",) if _rollout_agent_mode() else PEER_ROLES_ALL
+
+
+def _cfg_peer_role(cfg: Dict[str, Any]) -> str:
+    role = str(cfg.get("peer_role", _default_peer_role()) or _default_peer_role()).strip().lower()
+    if _rollout_agent_mode():
+        return "agent"
+    return role if role in PEER_ROLES_ALL else _default_peer_role()
+
+
+def _enforce_rollout_agent_config(cfg: Dict[str, Any]) -> bool:
+    if not _rollout_agent_mode():
+        return False
+    if str(cfg.get("peer_role", "") or "").lower() != "agent":
+        cfg["peer_role"] = "agent"
+        return True
+    return False
+# Agent pushes to master on this interval (config override: peer_agent_push_interval_sec).
 PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC = 60
 BACK_KEYS = ("0", "b", "back", "q", "quit")
 CHANGES_NOTICE = "  Changes are not saved until you confirm (Save/Apply)."
@@ -94,7 +137,7 @@ UI_LOG_MAX_LINES = 200
 UI_LOG_DISPLAY_LINES = 100
 _UI_LOG_STATS_CACHE: Dict[str, Any] = {"key": None, "value": (0, 0)}
 UI_LOG_MSG_MAX_CHARS = 6000
-LOG_LINE_TS_PREFIX = re.compile(r"^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|")
+LOG_LINE_TS_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}")
 NAS_VOLUME_PATTERN = re.compile(r"^/volume[0-9]+$")
 SMART_CACHE_MAX_AGE_SEC = 20 * 60
 BACKUP_CACHE_MAX_AGE_SEC = 20 * 60
@@ -104,23 +147,28 @@ INTERNET_CHECK_PORT_PROFILES = ("dns", "http", "https", "custom", "from-target")
 TASK_STATUS_MAX_DETAIL = 2000
 HISTORY_MAX_ENTRIES = 500
 AUTH_FILE_MODE = 0o600
-AUTH_COOKIE_NAME = "synology_auth"
-AUTH_CHALLENGE_COOKIE_NAME = "synology_auth_challenge"
+AUTH_COOKIE_NAME = "unix_auth"
+AUTH_CHALLENGE_COOKIE_NAME = "unix_auth_challenge"
 AUTH_SESSION_TTL_SEC = 1800
 AUTH_CHALLENGE_TTL_SEC = 300
 AUTH_MAX_LOGIN_ATTEMPTS = 5
 AUTH_LOCKOUT_DURATION_SEC = 15 * 60
+SYSTEM_LABEL = (platform.uname().system or platform.system() or "Unix").strip()
 BRAND_NAME = "EasySystems GmbH"
-PRODUCT_NAME = "EasySystems GmbH - Kuma Monitor Addon"
+PRODUCT_NAME = f"{SYSTEM_LABEL} Kuma Monitor Addon"
 BRAND_URL = "https://www.easysystems.ch/de"
 BRAND_LOGO_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABLcAAAHpCAMAAABHmi4cAAAAM1BMVEUAAAAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHAtLHBxDoEgAAAAEHRSTlMAQIAQwPCgYOAg0DBwULCQI8EyEwAAIv1JREFUeNrs3ItuGkEMBdDNsgMbIHD//2tLqVDThvCIEHikcz7CGtt3PAAAAAAAwKOtxrcBoCNTknm7GAA6sclRW74PAF0YczJ9DAAdmPLXvNIuAvXlH23ULgLFveV/y80AUNg2X01yEUBh+5wzrwaAoqacIdEFFLbOd9qocgEV5YK2t1wE6sllUvRAOYnKBfQlUbmAviQqF9CXROUC+pKoXEBfWlQuoC9T7rCXRAVeb5kzZOiBwsbcp40DwEu95QK3IoCKcr/ZfS7glaZc47IgUMs2nwhFAB14zw9ZLQK3K9Ao/ta2A8ArrPKHAT3QjTk/NxlzAbeo8+Dy9we4TaUHV9LkUIHrSj24pLmAmxRZKZ4sNYvANUUyXDIRwO1KhOY/W2sWgafa5chmEejGYs6RzSLQjU3LiRgq0IdNHsI5VOCKQikufxaBa6oWLvN54HlWLQ/RPgaA71Qczh/sPLmAJ9mscyASAXRkscuBSATwi717yVEchgIoWsSxyYfA2/9qe9BSS9AUgcKkYumcDTCzYnOf3ZIu/jKyCDTjMPjkAhqTLj65gNZU/OTyxyKwjdRFaLmAtozn0HIBjam2WcwmFoGtnLKJRaAxqUQd0/wFsI1DH+7lAhpzzCJUoDHpoogAWjP2jueB1iyD43mgManLBhaBxoxn9TzQmjoB/WCvCDy0x4DeXhFYtbeA3l4RWLO7gN5eEVi3t4Decz/Aqr0F9MVeEVizt4B+Mq8IrNlbQG9eEXjGvgJ6d9sAb5uX7txP8U/u+9Ith+8Ceq/9AL8pLZc+vjOcu8PdgF4QAfyS8dTHqr6b6wf0WRABvC4dp3hSLkv1gP7yBfCSseR4RS6Hm83iZOoHqKv+1M5wSjcBvdsEgY3MffxQGa8Deg/DAlsYS7yhjNcroKttgPv2dJdWGSsG9OUL4LF5qj0bnbp4x+R0HnjoFFXk7jqgdzoPfEg6Ry3T4TqgdzoPfMI8xJWaj7l22WWCQHVLjit1ZwzHop0HKjtGdd1NQO8WVKCmS3xAn24SC38rAtWUWFHlPpp08bcisO9lKyIfa40QZQsX8Fy2Vf3S5ePg3nlgj0fyD0Z1UqeHAN40x2eV/58r82AG8I4xx4r6z1wsgzFr4OemqG+9YuiykAvYU7j1xHfSeBZyAT+yxCbK3efKLFzA61KObZR7P95buPjD3t3tNAzDYBjOT8PSrl2++79aGGISAiHRpjDLeZ9z0I4sx/UPYKfh9FdNDHkhcAHYKer/bOG7SI0LwE5VXfoHdSYCFwBDjfK/iTYr6yEAmCzK/1ybj9z5AbBHUqf+2nxkBSoAw+mWVObwRWTpPAAj22t+MH1P+djHBcDmx8SH9bzfUKnNA8PZ9ARlPu+D5i0AGMxNz7Dk81borAHAUGZ16g9c89KdvAEYyao+/acyLkWdlgBgJIueprYtXlrVJyxuBmD2mfgVL0UANkcT/8wUAAzjJh9omwfGUeRDofsUGMVVXlCaB0bhpLx1R2keGESTG4z7AIOY5EcMAEbgpSxPLwQwDnlCwgWMIMoTEi5gBL7iFgkXMIJVrpBwAQNI2mlqpgeDSLgA/5L2KC28yesiq0i4AP+S9qmXcBdfZBQJF+Beko5Frtlo5OJ+NeBe0n5LtBy5mFIEvEs6ouVwFy3WuUi4AO+SDqnx8ef2sIcLcC7poBbeXe2lXOzhApxLvecPs7kqF4tPAedWHVauRjcPcr0a8C3quBI/3orGduHUAMCzqB4Xm4GL0z6Ab6dEiGyrOk/CBfhWPQYuhn0A1yZ1KVeLT0WmqwHXkjwGLhIuwLNNnZb8+EeGMOwDeDar183i6lR6TwHP6ml9npYWodIKAXj2ol5lDu9ylRktAPBrU7fJ3nEgvigCnuUTJwKbrCBuAa4t561gyGaaIYhbgGuv7N1bcuMgEIVhQFwESKj3v9qZJE7FM76BwCnF+b8F6PFUg5ruTfp5dbDZENxvAS9tHTnV3cox8D8ReG0ygD/Y1Tz9W8BrK8cruJwt5t1mE/3yAC4sxyq40rZGdS4vxUkTxzIy4MXFoVPdrfSYl6iuWb1jUjOAL0kGWAZc8xetbppCcZwSAYw8KKbuB48lqgfWLdEDAeBNlBFy30SvpFWNaTXWyR0zs7eAXyGNbPWMz9/WOunFFDvLBVdo3AJ+iSADzB0pmLLaJ+tz/EYEfo9JRoi7r8s22kQBtPIj39ZkaeO4kQLQTssAft8fxUKxBWCPWfrNe6o3tyoA2COMfMwcKLYAPN/kBm4tzBRbAO44yv7Xf3qwKLYAXHPAgmtTJ5ZiC8Awcd3801ohrDrxFFsARpi0KbNImp72SNHWHzpnii0Ad8W3yHpU5mzSy6mTQIM8gJ7E2qx88U+94apsY000yAO4Iupgim2aqGe+J7ecUQBwJur19jIJ3/1LsT+3CkMbALzTOhhjreuaXxxG5dbEVD8AV+X3sPLWulGj+dKg3FIcEQF80H8txphirX3KCmc9Krc4IgI/QjRGv8mqm/4QTptP37jv2Ty/jcmtyBER+Bnif+tJZ9tGnip8w2uf+U7d5thpCBxUDsY6OaCg6qzSwd7OLUOjKXBok16MTXIgDU+YyzNyy3OxBfwMUS+mHKL6clk9kkecFM31DlbLxRbw02QdzGatDDM+tqKXdcBJcVEnhut44EVErY3Zev8Njo+t6EVknvr/KerL+Vsze1iBV5G1/ujDmqVPf2xF/9/Qvyl1t28lUgt4bdOpm7SmTWv4JujoL6ul7GSXpD6RWsAvE796Tkt1Z9d8I/LSVJla5yfFtXNMsya1AJxl2r+y+uTbY0uXi9zpuuJa1YkhtQA8NLXHlra3g0eVnvWJylpSC8ADU2qNrZDkkpt67uat+kSXKYBHcmrbmDMt88PocdKKB4gAqmXXNCUwbk5uMecfbUSVBaBWkJbY0l7uWXfP4ioKAOosLbEVUn2XaiC3ADyFr4+taJw8lKa9wWU5KAKoMJXqUfJrkSq2ck8GowEBDOx/kHDtD2Itvzu4xGYFAPdkVxdb2kuLrT64mGsKoImuiq1oZmkU2oOLwTUAKgSpiK1QZIeg2vq4GG+KP+zdW3LjIBRFUd4gEOjOf7Td7f5JIseOjFCq8F6DOMXjcgB+wjyvki+3CdNBwcVX+gAOCs/mr5Y19f3/c+itIh9hAHjC5sexZXf7w57gCnJc4GoRwEfL49iqTfrFrzP5nHMBeF3xD2KrBi+nWHdXl0elle0igJvq5a5cOkLryVsh6+QlmegC8P38Q47By6mC3d9fHpe2SnYB722TS+wLU0uSl6WwctoFvCsbpEPf54t2ky6pmUp6AW/HZrlYVB/oJN2SC6Zqdo7AuyhZrpW3oj4xXk7induM0VrzEhuYWfFyJXfvLnBpMoD7x/xFhRcwl+jlMr5Fq+7TWQZyCsA8VrlK3rR6JCYZRwGYRpBL+BYXtXNdcgUFYBK2yQWc0Wrn0uTynNIDs7BZRstbteqImOVsiZpnYBolSa/+zNrTQc7kqHgG5lG8jONMxwTVYpKcw1PYBcwkyiAprEX10sFLt8ZSC5iKkQG8M9WqM/RXfrXIqRYwlzAishZ1Mr3lF5d8VQGYi3VyIheMtmqQJYZ8MLMiz6uB+dgs53DN1KKGs9q09LM1H2WCwJyKl17ZmfXq1hgdTXBJ7kmumUgFBDCv6uWQfUAs6jcVrfVq/lu11pQGAtOLcpxzzRhNLR+ADsNjy7tbVplKAx+AX1f0TTU7Vd8wYQ4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwB/27mw9VRiMwnDmiQDr/q92H+yhfXYjEiIY4nrPa6mxnyDyQ0RERERERERERERERERERPQS0QkiohuJDhBERLcRHcBuEfVs8moxCf8k49QcxceSDmC36C/5Ch/8/3SGeTUos0uexAeSBmC36AteQQl6Ee0XbAvrp71NSAOwW8Ru9WpyFjsYLz6HNwC7RexWr6TBXuFTyuUDwG4Ru9WryaBGmMX4fADYLWK3eqVX1FoG/5xL+wCwW8RudWsKqGfH3uWSALtF7Fa/Mo5ZxcDYLWK3euZwlNFiWOwWsVsdczgujRsudovYrX45gOFit4jduhMHMFzsFh3ullEHSUFHKbQadSYVu0UPcbfpvSTaZTEkdovYrT5pixcYc0YEu0XsVp8cXiGJEbFbxG51SQI8McJuEbt1KwavYUe8VJHdInarRxJ/8Jwiu0Xs1k0s2LAoGcVvWmYXsGnAHS52i9itDsWqiabTGj7rCmt2i9itDmU8kOTGGL0yO9635tktYrc6lOo/rFIWD4w3uJndInarP/rI19+nhLJFjIbdInarP/OhU4PaoGy4A0V2i9it/iiUBH3kLKR1481sZreI3eqPOfg5lU4fEC12i9itLqWjh3vRjh8tdovYrS6hxIgd/PjRYreI3epSwxXSZvhosVvEbnWpYQagvEu0JnarF2MNaXtbt6Kc1V9yEq+kvz90vzOkUSJHeBHKvJqEf5JZs+ynWzIrYyx+s6a4ce30rEz6egaUj2Lb5JUxwNd2KT/1shT9eUe3puwS/pOc1y95bGXsz4fu8qrjMb/2PimDorTKHW9m32QUyIKK1Z3X9GDj5soeFOivaPml9Dviw8h5Z1FgF69PWYrbt+vqbkW/WDyweNFmchZlKUfxjFTfaFFLq8qfP3kCYG7PYsBPVmyIKmCDdVJsUqdOTZTOVmzctq195egsyoys365FikealuLe6bq0WzonbAot5fIJW54u1IRvclsngnju5JHLEQWm+UBt3XrbwFPBv6lb2oeKjWvollbYYKL4jzR4IsyirHEp7rxvf2G3pMOJT6YMeMZIsSk19SPVjpWxJw/SWlof3lXdgyM67BLyO7qVLfawvrVbMmCTzeK7uGAHM4mS5qW4752gLuuWD9jHRFFPL9jDabEht/QjVufBoGQ59/pH1XivoVQVhrIwX90tGbBXkE3dynUvwtk2/Y3tS3GLs9Lv65YP2M16UWsK2MdurZNuOVBcq4/23NkDaSx+ChVrVvE9DW1QY9FXdksvqLHq491ydXcYd9jNaFHSvhT3vB7/km75cO60dI/9nN53ZBVEnVDdnnz23RBXFMi265B07ftGmZ2v65a0qJOmo91y2CXpA4VJWpS0L8Utd7ku6JY0qOVOyxaQonhkPp4PWT9TRqLM+jM/mXcn/PRkUW29qlse1aw/1i1X9frWCWgJV91SDDbj+/RuaYcD1GnZAuwv9s50XU4YBMOJ2ROj3P/V9um+cZwAwaqd72+bObYc3wHC8jGRAtuakcGGoP2LVCUDnXdA1DnvCi7vTuFWBI4Sh1sRhrUi+U0BuKSmuF+sqM6tCCx1M6oGMA1cOztQDIyH31jJYSnRk6B4Kx/M1SGruhO4FQFUwAVCNc6TbQaX3BS3A5c6tzqgCn5fuv2sdfFB4Ba4jH/4F0VPA1dD6EP/V4YJjqK3WpOg6+zbyA2Yqk6dWxG4Srrc8gkYWl9/E/4n4NLPbwWse6G83LEVuVND/Vp+byqqBHBVZpJtY4V5AZTJFQFRmVv91YGt6pS5tQNfVoFbynvJO8D/Ai59bsWx4ZwpsC6+yp+4K8jf2cOoO7fCTwWuY9MMlbm48uo0RsHsbFfN4/EkX5sut5KMEdfjFmIBsimesVdFn1v993J4N5rA9wwqVmtQuSWMfb04XqCYeK06LsALbd0QRE9SybsbV+ArN1VutQAS1QtyC6xBJTfFtSeMSLglDxR9p7wrjRxqbW7wWtO7EQ5uvIu7VbgaY8A/lf2Azr2KnPwd73XzW66CTMsFueVff0n9FzeKKtzCUeAtLVEdqc6cH+31iIMf6AQ9PoRLBTK69Eu42ui5DmxF5TqIHaQq1+MW/m0uN8XdJOXWMFtyokZ9gXgguMF2jzQaWSXOKIiNmoBSRZcHRG5eS3WEA2Xv68GFnS63LIjlL8gtBDHDpnjQrnMCt0SB4uLo/kenhTNpLGoKfbjc0s/s8ZE6BXlvCiVc0tbGDLjqat13gGBD8YLVrpev8KFyTN+ervU9w8ey1+MW8u0sNcUdJ3Gdwa04PofDEr1XYsVXAsiNEFkVeuVrINe0jyuvZUpzdZ3WUl0AEXKr2+NQs1Xyv6gCIo8oke4Sw96G5yt5Nrfytiw9LUhtovRMN4gkprjkMOArcMuuZliedPFVqPFZqo4CkrEH3wmwlWaPtz6jhKvNii7tcHtficgFiuJ8+QyoAub4N092uOBIYSnICL9j5dEz0SAimuI9D2K2OsndsQpPn8glDYGABDq48JdC1ga1M7L5m/S+0mbEVFrcSrSm+gVwbWRuITmR4l8bdTWjZ4JBRDbFld55Kbf8MiQjEA0C/V9wy1Ep1InFUfL7+milzdWzqicWSnDlIuIDKHErE5PaiXilSJuCExkzSuLALafYFDfMyLPzi0ZVkYAiFW6ZSKwtj1Kf1XmgylvZfow+qVp1oX12QnqsVLhlydf9idYRSGiYQSAkOpPMNFPcrNj0ytxKlJSV1Zgi1Gnuk5swHn4HPXI5QLRN6g5aiMkzG6ozJ3BrA0Qbne9Qie9NdgaVP8IW7cxuJpnibj2Jl+ZWodQhWJVNOJkUKCbEMSerBz1ybYDICbqxBS+LKafsfXXHSMHlKVEZtSy0wIcKxDPezDHFLe8RL8stQ/J2VDbh7KTrwW1KBZ/bgK7o2BNp1jnTbxZBFaMitxJnQnWhBIqC0RTSM9mgWp5RUHpbbnnKjwoazQqFUo5V8KJAumwGskJXaK5OwqSK//fc2liPFQnB5UFRKNHhyuQzFFM8VTfnlldZKOEJd5orTENnykDW5pjZs0ac7kxg3PKvueV4C0EKoeyA3om9wawz7tgUVytt+qFnc2uh/KhVZddzIqCoAgI5ptxCJ1ewk5urm7jYEdI/5lZnjnndxgEPqApjuq0jn8Etbp/Sevg/cKuptLW7MNyE3JDg62SfKwlKuKTby5wg8SbnFuWfsM5t5qTP3isw64wlmeLGl4bP5ZapKuCKw1jYp+/hsRsQFQXvo3RbbKXvQdbnVmVOp3bjoRZj/HuedcYaVPVhK6kfza2kMv/MDlf9ZIUbzUINFyNnruo25fZxp1dp6HMLJS8XeN5gYmzs9bPOWKop7jjw4arcataWCdwyGWn0kisP0qijKRS5egwCcEkqsjb0r3K2wOXktLhFPxjZASZuVcabscw6YxmmeFq0+Hvb25CkwyF2n+GHvF9Sk3Crq3y7LIOefFTLgbq0kcBFR8BKbKmmDwcOselwi97ZtPB7ooa55QkfLjljWaa4b0/PP58HUdYNMAW/Nha3cAfBF/mTDrpRAb8ZOh9dSVDCJepmTITxLCdxa8fe9ck/krESx846Y7mmuHWF/D/jVvID4zwxbtFntMu/XPxQlJQIv4LK6GqSeOMYcEG2/Kqu5VxueTa32vD/LKNYys46YwWmeAq6KNzSvuCvyTG4ha+b8mleCdcy5ut1oyK3VhhQdoISLsnCRQuvVVd3Ircq9gR+SCgmbsOtMVM8ItV1Erd6hhGFvdC5ZVr44LMmlXDlD//SuFeif8G4k0sqg5syHTXSBrXqcwsEUuRWm3XGSk3xgMqIU7hVPAwrRvrVZamASOZ0xYEXd0W4oSQb4ZWKuIQLL5iok+Ye5sU9m1sIDlTO2AmmuLvTdQa3egCmzKBcPHDgeGoDSKqIV6Imt2bJDvaAnSDSTbwXOpYTuNUUuEXmifYZuSnunek6gVs7sCVgo9grzi9DwEIq3tLPEVqyFQphH8YUcEEs6tyy/zG3TAvwX5BLn1sR+JozwCqzUpHrS29+IfW/6ZMr0rMrhOz9JHBBdG9uCc/QTfG43kX0t/gq2IJZ4WiIRVTCFQk9PrpyC3wsR71ly5SWanqGEVdY39zSOkM3xU2Fc0sfW9V/UYVDCd5p+XfL9iJQbFjxlr5ahY+0yvZj4NWpogwjLl/e3NI5QzfFTYNFZW4lDFl7L+aHnF22MKsVshyYLCyCZ0+n9PhIEVHJww7iy5bqReP2JaQ3t6Rn5Ka48yoyXW6VMLa1tO1ZwC2cXPKJHuHYnQrU4i392NuRT7mR7msFl2t/c0vrDN0UN5Qut/w43FucNHqiLGGSVxwPidDJ4wb0wdXJ+zESb2EZLkup03tzS+sM3RT3kyq3+p9kd+ZA7m/gSCqd5InIdhgHbqcVb9FX6+HKx6HlOmHOb68wqngXbrU7cuuzKZ4MLlVuZWQSOolcfGJ6wSIJ7PnrYboom5NVAmDyhl7CNTDNWcfnijfhlrkntz6b4rng0uSWhV9VCz09ZfgqewBUtbBKuMrRjcNiztYCmAJ9P8Y+sA+DphZhTMubW/IzdFM8Yu+P5sNvSBMvbY2gESlVwn5gTO6gxsBLirfkcoCKHl0GQku1IFBHZd/cYp1RMMXdRjkrcsvx3oAFfkqnGzk7Bnnzge/izfnagM6ZdJTLx1uquWp7EMzeEXGrwFT5W3Nr2BQ3K51X5FZHP1vOLXm4WCn/BBwJ679eUrcCJsvdj4EzbVWekb/cYB7E7bn11RQPixQVHz0iiWsyt+RyUWCk8NFdXUZCYIkclX32kFv0Eq4N/yORXKpwqODO4pah6iIMQs+omOJeDpcityr8VBJwS6zm2dWU+wfobXNvY/pGdtoKzi3ufoyidM3Ujr/pFw1u+Te3PjDFcxwuxSeHX+Qk3JIrBVLBAM4n+1FJQZ/yamdDE4dbeAnXUfeiXO5oWGu+1nz5R3PrpSnuJDm35LtT9bll3Ma0fcW9jzzL4GXNvGSS43ALx1MTtFRLp+90BW4tyLn05tYrU9xqevM53FoF3NLJY3v6sfDBlcMuyP94JMOgld86CgebcuSQAuDaFbiVsJ/z5tYPUzyhT1GPWwv8lP333DKJleFy6BdSnFG81aOkF7DzynA2vIRrEbRUi8Y6VgVuYRCub259Yu/MltwIYSgKLXZ64f+/NpVKZTKZwW4kgcswOs9JjCNzWXSR7kMxEa/RLXgD3VKetLqcFV0Byw13vQLGwTbMZ5LcHSrdGQD4+FJlgG6pByIsunUTiol4jW6pd9AttVMub46K/Hqux0ljnPx1EvGnZ6uVxqlPqvmzRQ/QLVPLmopu/cNP75n/SbqlDMXAH77P5JPrcfKlTgKeDcLSupQEP9DQgy44wdetq55kEN16HoqZKgj+KN3KlAX4+nZQjOwCzWBLHcM7Jhpily7TybxFcGFsBN2iHYZFtz4RJndw/SjdUoZwwRW/XZLs/OngmBVFwJJTQoladorPztctuqok0a1P7KJbE+mWp2xt0tc9WuIXaI7M/h1XqeLJZ1T+uSreD1y/SrdO6mPLuIRutYRCdKtBf+Kb6FakrL/+i9bFHqYXUx6RgK49kWpY5d9jZ3s/cODrFtDvD21Ud2w2L6BbTaEQ3ZrEv/Utm0ZxpsPXq6XMceXWsZraST517GgJeDdjgvH7Lc14TJAa5M7m6XXrTyhkv9VhZm7volum/INyGeW7vfEx5TEb0E56F+XWus5JuS4J+U4X+LrFqU7mGrpuW5hctxpDIbr1AE2zMEJ4O906ygcnIimJWPAwHdPgKo+ItFwSP/vm2tqOOL5ubYqjza6h62CCqXWrNRSiW13rQUCiOHi9J+oWeqKDuhBKQT+uGY94XoZcHbbOt/JgPgl7VA/JbP9WfWAQm7X5hPsMW4J5das5FOLfalrWPa38cLvFKpM69OAtXF6FTt31o72RjisjS+56XjKTmm6I6f/GvnCzJLH88uWoNIHyCGdvvn+0l2BW3WoPhfjlEfVO0ZuQ9r9kM/a+1pDSkGfutkLt5Y7gdg1/x6B3FzrtkUy5I2ISid/c91D9c6HH+8Ri8/c63BpzGL7gtgFegjl1qz0U8j6x8erPk85OiJOlzcghXbRrMdevu74pbaS2P+gpkamTeGVRrMuVjiecehD1dGve/8QeUN/RXvGuw3mCGXWrORRSD6L5OGKBUmADc0qxGacUO/89oVMswJaOJJIdpI5nbxqD8/pDgPwVCqn+Vp1wbXrfLvPxLdDZh7T93cfm40q1PwDz6VZzKKT+1nMSIrFeP3TjTikelcPLfIXR7JRrR3S3nECx0OkfCsYwXhPxFFuXG6x5It/ndLrVIRQTMVK3dlSWVVvCifuwiBUD6M4rN6Yi914o8FfL3KftOpjCJCB2hdg86lk4uLl0qzUUUl8e7Vr2+OQ81qaTcvN+7uLvjLZuuQs+CTjlAMjF97nsPe7/tiHHcDeVbvUIxUwM9Z255l+CpmU4sm23msfE2RWHatLtbYTL5o4bvYDwh/CwgFvK6mxjjuFuJt1qCMWy/RPNxiDWpKJxO6RNqUPYBwWvquyWVYR4G1THGFKnyy0c0GflNUPX+IP75ffCwcaJdEuZH7XdUqUXumm2u4pyHaY8gpTpC981FHxgTvQ4yl4MruDhD+XsYt6CNDQFarmVwhxrCzvTfqs9FAuYIIbrFoTylbTnz3/geNpEl2pRSNun4UTvLN/BYOoVE97iqEhQ0KPPk2pIbGXg/88g5BmBnup+ixuKqZKJXXULccVgzu03lwnlORwTZTDmdKae/Q2gsHii9I3PKlqvCFjuk2r+bPF9fCJ2xPBsniufiPiusz9NHKFb/DlpLuzLA21fsbqAHVevXNvXL5UXRQbqZmEiW6f7MzPgGG7zdP6t5lBMXglihG7xT0GOUH8rh1esLo6SdBtvhDLQuVL09aLt4tXLmOv6Jz1TnPGdz20olnDK99ctvnBZT6obCOYFm+I8NNa7LRTsrqikbrbpnIadTM4OmwVvCxI36bvq36H4CYfEl+iW2jDLHEK3aJ9R7KFoBGzSbXxe0TBG4TsmljasNISMqCLJnXbRFAz2mLf+FiUUs13Jv0q31GEReweEbpEWmkQO0z44b5wNVrW0YgA9F9+IU90LSFVy6ui+u9lr7nqn6FDM5Tftr1vcBc9FXn353Q6+gdTDbXracVWL778ARSM63MhJwkUeMVylDRen74uBCsVMtQKH6ladI9z+B7L7YsBmEb9KZgYO1BDiFkoL1uUx9gunyEDb2E/dNWcRvGoithyg3Br9E5tDMatqDdGtOj49m4WxSz8f2EO5+RQ6iALNLPQVbkXrUB0YUKtXu5uxp50QAx8eCw1mvP58PjYPC/WrbgrFvOhe3Mc8P5iQ5/+/l6j/oSqgPqT+Kfxj4qFGkvfTljrWbLrTh5QKYeDY7UmdKfVFL7gDG1LwLjwYm595FuNDMbVovZy8O/NlFh4w4ENS+Uw6e8x1VIFmPlFv139mf2OuTUfVDTfOgBiPzZnQdejRf6pvGozbjthncMGc27HuJK6GYt2vOxJAbKfIxMpGkIed26jX9tBHftGCsBJ+2pK2CPvWqQRBWIhz2pK2dcwqzmlBEB4BE9dYa36eaJUgCAuxL3YLdNXNW4IgLERa7BbITt+JShCEG+Jit0DHCrV6BUF4yjVv55Mq5wKtEQRBeE5Y6xYolhoL6LEgCPU3PvM+Rv1gk1t5QVget5h5K9T7YQiCsBB26h4CT27lF9NjQRA+OBYzb7k1eroIgvCEcy2zABR5Ui0IqwOLmbf2ehdCQRAWwi9mFgjypFoQlietZRbQ5S+LmWkFQfggLmYW+MXevRwhCEVBFKzi8wARNf9oXVluiOBUdxQDzHCH8hbkTa2ywGxSDX176wfNm/IW5J2xWPIwqYa80SpvnSbV0Le2YslwDwPyrlgsWU2qIW+0YsnmHgbkzbFYsnx+Wl9Jgb+tFUsOk2roW1qd8rd7GJB3xMpbq0k15D1bnfLLpBr69lZ562VSDXln7O31dCfw+AsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADf9uCABAAAAEDQ/9ftCFQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADgJTBUMNyALqpSAAAAAElFTkSuQmCC"
 BRAND_FAVICON_URL = "https://www.easysystems.ch/Themes/essys_v2-v1_19-08-2025/favicon/android-icon-96x96.png"
 BRAND_FONT_STACK = "\"Overpass\",\"Segoe UI\",\"Inter\",\"Helvetica Neue\",Arial,sans-serif"
 BRAND_AUTHOR = "Konrad von Burg"
-BRAND_COPYRIGHT = "Copyright (c) 2026 EasySystems GmbH. All rights reserved."
-UPDATE_CHECK_INTERVAL_SEC = 6 * 3600  # Max once per 6 hours
+BRAND_COPYRIGHT = "Copyright (c) 2026"
+PUBLIC_GITHUB_REPO = os.environ.get("PUBLIC_REPO", "EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public")
+REPO_URL = f"https://github.com/{PUBLIC_GITHUB_REPO}"
+GITHUB_REPO = PUBLIC_GITHUB_REPO
+AUTOUPDATE_CHECK_INTERVAL_SEC = 6 * 3600  # Max once per 6 hours
+UPDATE_SCRIPT_REMOTE_PATH = "apps/unix-monitor/unix-monitor.py"
 PRODUCT_DESC = (
-    "Checks Synology NAS SMART and storage health, provides guided elevated-access setup and diagnostics, "
+    "Checks Unix host SMART and storage health, provides guided elevated-access setup and diagnostics, "
     "and pushes monitor status to Uptime Kuma."
 )
 
@@ -168,8 +216,6 @@ def _monitor_source_platform(monitor: Dict[str, Any]) -> str:
         or str(monitor.get("platform", "") or "")
         or str(monitor.get("source", "") or "")
     )
-    if not str(hint or "").strip():
-        return "synology"
     return _normalize_source_platform(hint)
 
 
@@ -182,7 +228,7 @@ def get_script_path() -> Path:
 
 
 def get_auth_state_path() -> Path:
-    return get_runtime_data_dir() / "synology-auth.json"
+    return get_runtime_data_dir() / "unix-auth.json"
 
 
 def _default_auth_state() -> Dict[str, Any]:
@@ -193,14 +239,15 @@ def _default_auth_state() -> Dict[str, Any]:
         "recovery_hashes": [],
         "failed_attempts": 0,
         "lockout_until": 0,
-        "session_secret": secrets.token_hex(32),
         "last_login_ip": "",
         "last_login_at": 0,
         "login_history": [],
+        "session_secret": secrets.token_hex(32),
     }
 
 
 _request_ctx = threading.local()
+_peer_sync_guard = threading.Lock()
 
 
 def _set_request_display_host(host: str) -> None:
@@ -226,15 +273,23 @@ def _load_auth_state() -> Dict[str, Any]:
     except Exception:
         data = _default_auth_state()
         _save_auth_state(data)
+    changed = False
+    defaults = _default_auth_state()
+    for k, v in defaults.items():
+        if k not in data:
+            data[k] = v
+            changed = True
     if "session_secret" not in data or not str(data.get("session_secret", "")).strip():
         data["session_secret"] = secrets.token_hex(32)
+        changed = True
+    if changed:
         _save_auth_state(data)
     return data
 
 
 def _save_auth_state(data: Dict[str, Any]) -> None:
     p = get_auth_state_path()
-    tmp = p.parent / ".synology-auth.json.tmp"
+    tmp = p.parent / ".unix-auth.json.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, AUTH_FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -383,12 +438,61 @@ def _register_auth_success(auth: Dict[str, Any]) -> None:
     _save_auth_state(auth)
 
 
-def _append_login_event(auth: Dict[str, Any], ip: str, state: str) -> None:
-    events = auth.get("login_history", [])
-    if not isinstance(events, list):
-        events = []
-    events.append({"ts": int(time.time()), "ip": str(ip or "unknown"), "state": str(state or "unknown")})
-    auth["login_history"] = events[-20:]
+def _sign_payload(payload: Dict[str, Any], secret: str) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    sig = hmac.new(secret.encode("utf-8"), b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{b64}.{sig}"
+
+
+def _verify_signed_payload(token: str, secret: str) -> Optional[Dict[str, Any]]:
+    try:
+        b64, sig = token.split(".", 1)
+    except ValueError:
+        return None
+    expected = hmac.new(secret.encode("utf-8"), b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        padded = b64 + "=" * (-len(b64) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    exp = int(data.get("exp", 0) or 0)
+    if exp and exp < int(time.time()):
+        return None
+    return data
+
+
+def _auth_initialized(auth: Optional[Dict[str, Any]] = None) -> bool:
+    state = auth or _load_auth_state()
+    return bool(state.get("auth_initialized")) and bool(state.get("password_hash")) and bool(state.get("totp_secret"))
+
+
+def _consume_recovery_code(auth: Dict[str, Any], code: str) -> bool:
+    target = _hash_recovery_code(code)
+    hashes = auth.get("recovery_hashes", [])
+    if not isinstance(hashes, list):
+        return False
+    for row in hashes:
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("used")):
+            continue
+        if hmac.compare_digest(str(row.get("hash", "")), target):
+            row["used"] = True
+            _save_auth_state(auth)
+            return True
+    return False
+
+
+def _count_unused_recovery(auth: Dict[str, Any]) -> int:
+    hashes = auth.get("recovery_hashes", [])
+    if not isinstance(hashes, list):
+        return 0
+    return len([x for x in hashes if isinstance(x, dict) and not bool(x.get("used"))])
 
 
 def _detect_primary_server_ip() -> str:
@@ -499,298 +603,57 @@ def _ui_bind_host_options(all_ips: List[str]) -> List[str]:
     return opts
 
 
-def _sign_payload(payload: Dict[str, Any], secret: str) -> str:
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    sig = hmac.new(secret.encode("utf-8"), b64.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"{b64}.{sig}"
-
-
-def _verify_signed_payload(token: str, secret: str) -> Optional[Dict[str, Any]]:
-    try:
-        b64, sig = token.split(".", 1)
-    except ValueError:
-        return None
-    expected = hmac.new(secret.encode("utf-8"), b64.encode("utf-8"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig):
-        return None
-    try:
-        padded = b64 + "=" * (-len(b64) % 4)
-        data = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    exp = int(data.get("exp", 0) or 0)
-    if exp and exp < int(time.time()):
-        return None
-    return data
-
-
-def _auth_initialized(auth: Optional[Dict[str, Any]] = None) -> bool:
-    state = auth or _load_auth_state()
-    return bool(state.get("auth_initialized")) and bool(state.get("password_hash")) and bool(state.get("totp_secret"))
-
-
-def _consume_recovery_code(auth: Dict[str, Any], code: str) -> bool:
-    target = _hash_recovery_code(code)
-    hashes = auth.get("recovery_hashes", [])
-    if not isinstance(hashes, list):
-        return False
-    for row in hashes:
-        if not isinstance(row, dict):
+def _ntp_sync_details() -> Dict[str, str]:
+    result = {"synced": "unknown", "service": "unknown", "source": "unknown", "detail": "No NTP details available"}
+    rc, out = _run_cmd(["timedatectl", "show", "-p", "NTPSynchronized", "-p", "NTPService", "-p", "SystemClockSynchronized"], timeout_sec=5)
+    if rc == 0 and out.strip():
+        values: Dict[str, str] = {}
+        for ln in out.splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                values[k.strip()] = v.strip()
+        ntp_sync = values.get("NTPSynchronized", values.get("SystemClockSynchronized", "unknown")).lower()
+        result["synced"] = "yes" if ntp_sync == "yes" else ("no" if ntp_sync == "no" else "unknown")
+        result["service"] = values.get("NTPService", "unknown") or "unknown"
+    for cmd in (["chronyc", "sources", "-n"], ["ntpq", "-pn"]):
+        rc2, out2 = _run_cmd(cmd, timeout_sec=6)
+        if rc2 != 0 or not out2.strip():
             continue
-        if bool(row.get("used")):
-            continue
-        if hmac.compare_digest(str(row.get("hash", "")), target):
-            row["used"] = True
-            _save_auth_state(auth)
-            return True
-    return False
+        lines = [ln.strip() for ln in out2.splitlines() if ln.strip()]
+        src = ""
+        for ln in lines:
+            if ln.startswith(("^*", "*", "+", "^+")):
+                parts = ln.split()
+                if len(parts) >= 2:
+                    src = parts[1]
+                    break
+        if not src and len(lines) > 2:
+            parts = lines[2].split()
+            if len(parts) >= 2:
+                src = parts[1]
+        if src:
+            result["source"] = src
+            result["detail"] = f"Synced={result['synced']} | Service={result['service']} | Source={src}"
+            return result
+    result["detail"] = f"Synced={result['synced']} | Service={result['service']} | Source={result['source']}"
+    return result
 
 
-def _count_unused_recovery(auth: Dict[str, Any]) -> int:
-    hashes = auth.get("recovery_hashes", [])
-    if not isinstance(hashes, list):
-        return 0
-    return len([x for x in hashes if isinstance(x, dict) and not bool(x.get("used"))])
-
-
-GITHUB_REPO = os.environ.get("PUBLIC_REPO", "EasySystems-GmbH/Uptime.Kuma.Monitor.Tools.Public")
-UPDATE_CHECK_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-UPDATE_INFO_REMOTE_PATH = "apps/synology-monitor/community-package/package/INFO"
-
-
-def _get_update_check_path() -> Path:
-    return get_runtime_data_dir() / "synology-update-check.json"
-
-
-def _version_tuple(version: str) -> Tuple[int, ...]:
-    """Parse '1.5.0-0001' or 'v1.0.0-0055' to (1, 0, 0, 55) for comparison."""
-    s = str(version or "").strip().lstrip("vV")
-    if not s:
-        return (0, 0, 0, 0)
-    main, _, build = s.partition("-")
-    parts = [int(x or 0) for x in re.split(r"[.]", main)[:3]]
-    while len(parts) < 3:
-        parts.append(0)
-    try:
-        parts.append(int(build.strip()) if build.strip() else 0)
-    except ValueError:
-        parts.append(0)
-    return tuple(parts[:4])
-
-
-def _selected_update_channel(cfg: Optional[Dict[str, Any]] = None) -> str:
-    if cfg is None:
-        cfg = load_config()
-    return "main" if bool(cfg.get("update_from_main", False)) else "latest"
-
-
-def _fetch_latest_release_meta() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    try:
-        req = http.client.HTTPSConnection("api.github.com", timeout=10)
-        req.request("GET", f"/repos/{GITHUB_REPO}/releases/latest", headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "synology-monitor"})
-        resp = req.getresponse()
-        data = resp.read().decode("utf-8", errors="ignore")
-        req.close()
-        if resp.status != 200:
-            return None, None, f"HTTP {resp.status}"
-        obj = json.loads(data)
-        # Keep the release tag exactly as published (e.g. "v1.2.3"), because
-        # raw.githubusercontent.com refs must match the real tag name.
-        tag = str(obj.get("tag_name", "") or "").strip()
-        if not tag:
-            return None, None, "No tag_name in response"
-        download_url = None
-        for asset in obj.get("assets", []) or []:
-            if isinstance(asset, dict) and str(asset.get("name", "")).endswith("synology-monitor-basic.spk"):
-                download_url = str(asset.get("browser_download_url", "") or "").strip() or None
-                break
-        return tag, download_url, None
-    except Exception as e:
-        return None, None, str(e) if str(e) else type(e).__name__
-
-
-def _fetch_public_spk_version_from_info(ref: str) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        req = http.client.HTTPSConnection("raw.githubusercontent.com", timeout=10)
-        ref_path = quote(ref, safe="")
-        req.request("GET", f"/{GITHUB_REPO}/{ref_path}/{UPDATE_INFO_REMOTE_PATH}", headers={"User-Agent": "synology-monitor"})
-        resp = req.getresponse()
-        data = resp.read().decode("utf-8", errors="ignore")
-        req.close()
-        if resp.status != 200:
-            return None, f"HTTP {resp.status}"
-        m = re.search(r'^version="([^"]+)"', data, flags=re.MULTILINE)
-        if not m:
-            return None, "No version in INFO"
-        return m.group(1).strip(), None
-    except Exception as e:
-        return None, str(e) if str(e) else type(e).__name__
-
-
-def _run_update_check(cfg: Optional[Dict[str, Any]] = None) -> None:
-    """Fetch selected source public SPK version, compare with VERSION, save result. Runs in background."""
-    channel = _selected_update_channel(cfg)
-    result: Dict[str, Any] = {
-        "checked_at": int(time.time()),
-        "error": None,
-        "latest_version": None,
-        "public_version": None,
-        "selected_channel": channel,
-        "selected_ref": None,
-        "update_available": False,
-        "download_url": None,
-    }
-    try:
-        if channel == "main":
-            ref = "main"
-        else:
-            tag, download_url, tag_err = _fetch_latest_release_meta()
-            if tag_err or not tag:
-                result["error"] = tag_err or "Failed to resolve latest release"
-                _save_update_check_result(result)
-                return
-            ref = tag
-            result["download_url"] = download_url
-        result["selected_ref"] = ref
-        public_version, version_err = _fetch_public_spk_version_from_info(ref)
-        if version_err or not public_version:
-            result["error"] = version_err or "Failed to resolve public version"
-            _save_update_check_result(result)
-            return
-
-        result["public_version"] = public_version
-        result["latest_version"] = public_version
-        current = _version_tuple(VERSION)
-        latest = _version_tuple(public_version)
-        result["update_available"] = latest > current
-    except Exception as e:
-        result["error"] = str(e) if str(e) else type(e).__name__
-    _save_update_check_result(result)
-
-
-def _save_update_check_result(result: Dict[str, Any]) -> None:
-    path = _get_update_check_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.parent / ".synology-update-check.json.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
-        os.replace(str(tmp), str(path))
-    except Exception:
-        pass
-
-
-def _load_update_check_result() -> Dict[str, Any]:
-    path = _get_update_check_path()
-    if not path.exists():
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _update_check_needs_refresh(
-    cfg: Optional[Dict[str, Any]] = None,
-    last: Optional[Dict[str, Any]] = None,
-    ttl_sec: int = UPDATE_CHECK_INTERVAL_SEC,
-) -> bool:
-    if cfg is None:
-        cfg = load_config()
-    if last is None:
-        last = _load_update_check_result()
-    if not isinstance(last, dict) or not last:
-        return True
-    selected_channel = _selected_update_channel(cfg)
-    cached_channel = str(last.get("selected_channel", "") or "")
-    if cached_channel != selected_channel:
-        return True
-    checked_at = int(last.get("checked_at", 0) or 0)
-    if checked_at <= 0:
-        return True
-    return (int(time.time()) - checked_at) >= int(ttl_sec)
-
-
-def _ensure_fresh_update_check_async(
-    cfg: Optional[Dict[str, Any]] = None,
-    force: bool = False,
-    ttl_sec: int = UPDATE_CHECK_INTERVAL_SEC,
-) -> bool:
-    if cfg is None:
-        cfg = load_config()
-    if not force and not _update_check_needs_refresh(cfg=cfg, ttl_sec=ttl_sec):
-        return False
-    threading.Thread(target=lambda: _run_update_check(cfg), daemon=True).start()
-    return True
-
-
-def _parse_info_version_text(content: str) -> str:
-    m = re.search(r'^version="([^"]+)"', str(content or ""), flags=re.MULTILINE)
-    return str(m.group(1)).strip() if m else ""
-
-
-def _detect_installed_synology_monitor_version() -> str:
-    candidates = [
-        Path("/var/packages/synology-monitor/INFO"),
-        Path("/var/packages/synology-monitor/target/INFO"),
-        Path("/usr/local/synology-monitor/INFO"),
-        Path("/opt/synology-monitor/INFO"),
-        get_script_path().parent / "community-package" / "package" / "INFO",
-    ]
-    for p in candidates:
-        try:
-            if p.exists():
-                txt = p.read_text(encoding="utf-8", errors="ignore")
-                v = _parse_info_version_text(txt)
-                if v:
-                    return v
-        except OSError:
-            continue
-    return VERSION
-
-
-def _build_synology_update_sync_report(cfg: Optional[Dict[str, Any]] = None, force: bool = True) -> Dict[str, Any]:
-    if cfg is None:
-        cfg = load_config()
-    if force:
-        _run_update_check(cfg)
-    check = _load_update_check_result()
-    installed = _detect_installed_synology_monitor_version()
-    public_version = str(check.get("public_version", "") or check.get("latest_version", "") or "").strip()
-    cmp_val = 0
-    if public_version:
-        if _version_tuple(installed) < _version_tuple(public_version):
-            cmp_val = -1
-        elif _version_tuple(installed) > _version_tuple(public_version):
-            cmp_val = 1
-    status = "unknown"
-    if str(check.get("error", "") or "").strip():
-        status = "error"
-    elif public_version:
-        status = "update_available" if cmp_val < 0 else "up_to_date"
-    return {
-        "installed_version": installed or VERSION,
-        "public_version": public_version,
-        "selected_channel": str(check.get("selected_channel", "") or _selected_update_channel(cfg)),
-        "error": str(check.get("error", "") or "").strip(),
-        "status": status,
-        "cmp": cmp_val,
-        "raw_check": check,
-    }
+def _append_login_event(auth: Dict[str, Any], ip: str, state: str) -> None:
+    events = auth.get("login_history", [])
+    if not isinstance(events, list):
+        events = []
+    events.append({"ts": int(time.time()), "ip": str(ip or "unknown"), "state": str(state or "unknown")})
+    auth["login_history"] = events[-20:]
 
 
 def get_config_path() -> Path:
     script_dir = get_script_path().parent
-    home_config = Path.home() / ".config" / "synology-monitor.json"
-    package_var = Path("/var/packages/synology-monitor/var/synology-monitor.json")
+    home_config = Path.home() / ".config" / "unix-monitor.json"
+    package_var = Path("/var/lib/unix-monitor/unix-monitor.json")
     if package_var.exists():
         return package_var
-    script_local = script_dir / "synology-monitor.json"
+    script_local = script_dir / "unix-monitor.json"
     if script_local.exists():
         return script_local
     if home_config.exists():
@@ -804,8 +667,8 @@ def get_config_path() -> Path:
 
 
 def _legacy_config_candidates(active: Path) -> List[Path]:
-    script_local = get_script_path().parent / "synology-monitor.json"
-    home_config = Path.home() / ".config" / "synology-monitor.json"
+    script_local = get_script_path().parent / "unix-monitor.json"
+    home_config = Path.home() / ".config" / "unix-monitor.json"
     candidates = [script_local, home_config]
     return [p for p in candidates if p != active and p.exists()]
 
@@ -839,8 +702,8 @@ def _migrate_config_if_needed(active_path: Path) -> bool:
 
 def get_runtime_data_dir() -> Path:
     script_dir = get_script_path().parent
-    package_var_dir = Path("/var/packages/synology-monitor/var")
-    home_dir = Path.home() / ".config" / "synology-monitor"
+    package_var_dir = Path("/var/lib/unix-monitor")
+    home_dir = Path.home() / ".config" / "unix-monitor"
     candidates = [package_var_dir, script_dir, home_dir]
     for d in candidates:
         try:
@@ -853,7 +716,7 @@ def get_runtime_data_dir() -> Path:
 
 
 def get_ui_log_path() -> Path:
-    return get_runtime_data_dir() / "synology-monitor-ui.log"
+    return get_runtime_data_dir() / "unix-monitor-ui.log"
 
 
 def append_ui_log(message: str) -> None:
@@ -874,31 +737,32 @@ def append_ui_log(message: str) -> None:
 
 
 def _parse_log_line_datetime(line: str) -> Optional[datetime]:
-    m = LOG_LINE_TS_PREFIX.match(line or "")
-    if not m:
+    if len(line) < 19:
+        return None
+    if not LOG_LINE_TS_PREFIX.match(line[:32]):
         return None
     try:
-        return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        return datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
 
 
 def _normalize_log_date(value: str) -> str:
     v = (value or "all").strip().lower()
-    if v in ("all", "today", "yesterday"):
+    if v in ("all", "any", ""):
+        return "all"
+    if v in ("today", "yesterday"):
         return v
     if re.match(r"^\d{4}-\d{2}-\d{2}$", v):
-        try:
-            datetime.strptime(v, "%Y-%m-%d")
-            return v
-        except ValueError:
-            return "all"
+        return v
     return "all"
 
 
 def _normalize_log_time_scope(value: str) -> str:
     v = (value or "all").strip().lower()
-    if v in ("all", "15m", "1h", "6h", "24h"):
+    if v in ("all", "any", ""):
+        return "all"
+    if v in ("15m", "1h", "6h", "24h"):
         return v
     return "all"
 
@@ -928,7 +792,6 @@ def _filter_log_lines(
     log_time_scope: str,
     log_time_from: str = "",
     log_time_to: str = "",
-    log_word: str = "",
 ) -> List[str]:
     filt = (log_filter or "all").strip().lower()
     ld = _normalize_log_date(log_date)
@@ -938,9 +801,9 @@ def _filter_log_lines(
         target_day = now.date()
     elif ld == "yesterday":
         target_day = (now - timedelta(days=1)).date()
-    elif ld not in ("all", ""):
+    elif ld != "all":
         try:
-            target_day = datetime.strptime(ld, "%Y-%m-%d").date()
+            target_day = datetime.strptime(ld[:10], "%Y-%m-%d").date()
         except ValueError:
             target_day = None
     lt = _normalize_log_time_scope(log_time_scope)
@@ -950,7 +813,6 @@ def _filter_log_lines(
         cutoff = now - timedelta(seconds=age_sec)
     tf = _normalize_log_time_hhmm(log_time_from)
     tt = _normalize_log_time_hhmm(log_time_to)
-    word = (log_word or "").strip().lower()
     needs_ts = bool(target_day or cutoff or tf or tt)
 
     def _to_min(hhmm: str) -> int:
@@ -962,9 +824,7 @@ def _filter_log_lines(
     out: List[str] = []
     for ln in lines:
         low = (ln or "").lower()
-        if word and word not in low:
-            continue
-        if filt in ("smart", "storage", "ping", "port", "dns", "backup") and filt not in low:
+        if filt in ("smart", "storage", "ping", "port", "dns", "backup", "service") and filt not in low:
             continue
         ts = _parse_log_line_datetime(ln) if needs_ts else None
         if needs_ts and ts is None:
@@ -1065,10 +925,6 @@ def _fmt_uptime(seconds: Optional[float]) -> str:
 
 def _collect_system_specs() -> Dict[str, str]:
     cpu = os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
-    if cpu and re.fullmatch(r"\d+", cpu):
-        cpu = ""
-    cpu_core_count: Optional[int] = None
-    proc_cpu_count = 0
     if not cpu:
         try:
             with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
@@ -1078,23 +934,10 @@ def _collect_system_specs() -> Dict[str, str]:
                     k, v = ln.split(":", 1)
                     key = k.strip().lower()
                     val = v.strip()
-                    if key == "processor":
-                        if re.fullmatch(r"\d+", val):
-                            proc_cpu_count += 1
-                            continue
-                        # Some environments report model text in "processor".
-                        if val and not re.fullmatch(r"\d+", val):
-                            cpu = val
-                            continue
-                    if key == "cpu cores":
-                        try:
-                            parsed_cores = int(val)
-                            if parsed_cores > 0:
-                                cpu_core_count = parsed_cores
-                        except ValueError:
-                            pass
-                        continue
                     if key not in {"model name", "hardware", "processor"}:
+                        continue
+                    # Skip "processor: 0/1/2..." index lines and prefer real model/hardware names.
+                    if key == "processor" and re.fullmatch(r"\d+", val):
                         continue
                     cpu = val
                     if cpu:
@@ -1102,19 +945,7 @@ def _collect_system_specs() -> Dict[str, str]:
         except OSError:
             pass
     if not cpu:
-        cpu = os.uname().machine if hasattr(os, "uname") else "unknown"
-    if not cpu_core_count:
-        try:
-            detected = int(os.cpu_count() or 0)
-            if detected > 0:
-                cpu_core_count = detected
-        except (TypeError, ValueError):
-            cpu_core_count = None
-    if (not cpu_core_count) and proc_cpu_count > 0:
-        cpu_core_count = proc_cpu_count
-    cpu = (cpu or "n/a").strip() or "n/a"
-    if cpu_core_count and cpu_core_count > 0 and f"{cpu_core_count} core" not in cpu.lower():
-        cpu = f"{cpu} ({cpu_core_count} cores)"
+        cpu = platform.machine() or "unknown"
 
     mem_total_bytes = 0.0
     try:
@@ -1145,45 +976,11 @@ def _collect_system_specs() -> Dict[str, str]:
         pass
 
     return {
-        "cpu": cpu,
-        "cpu_cores": str(cpu_core_count or ""),
+        "cpu": cpu or "n/a",
         "ram": _fmt_bytes(mem_total_bytes),
         "disk": disk_text,
         "uptime": _fmt_uptime(uptime_seconds),
     }
-
-
-def _read_tail_lines(path: Path, max_lines: int = 120, max_bytes: int = 262_144) -> List[str]:
-    """Read only the tail of a text file (bounded bytes + line count)."""
-    if max_lines <= 0:
-        return []
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            file_size = f.tell()
-            if file_size <= 0:
-                return []
-
-            remaining = min(file_size, max_bytes)
-            chunk_size = 4096
-            chunks: List[bytes] = []
-            newline_count = 0
-            while remaining > 0 and newline_count <= max_lines:
-                to_read = min(chunk_size, remaining)
-                remaining -= to_read
-                f.seek(file_size - (remaining + to_read), os.SEEK_SET)
-                chunk = f.read(to_read)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                newline_count += chunk.count(b"\n")
-
-            data = b"".join(reversed(chunks))
-        text = data.decode("utf-8", errors="ignore")
-        lines = text.splitlines(keepends=True)
-        return lines[-max_lines:] if len(lines) > max_lines else lines
-    except OSError:
-        return []
 
 
 def read_ui_log(
@@ -1193,7 +990,6 @@ def read_ui_log(
     log_time_scope: str = "all",
     log_time_from: str = "",
     log_time_to: str = "",
-    log_word: str = "",
 ) -> str:
     path = get_ui_log_path()
     if not path.exists():
@@ -1204,7 +1000,6 @@ def read_ui_log(
         or _normalize_log_time_scope(log_time_scope) != "all"
         or bool(_normalize_log_time_hhmm(log_time_from))
         or bool(_normalize_log_time_hhmm(log_time_to))
-        or bool((log_word or "").strip())
     )
     try:
         if not has_active_filter and max_lines > 0:
@@ -1215,7 +1010,7 @@ def read_ui_log(
             return "No log entries yet."
         with open(path, encoding="utf-8", errors="ignore") as f:
             all_lines = f.readlines()
-        lines = _filter_log_lines(all_lines, log_filter, log_date, log_time_scope, log_time_from, log_time_to, log_word)
+        lines = _filter_log_lines(all_lines, log_filter, log_date, log_time_scope, log_time_from, log_time_to)
         tail = lines[-max_lines:] if max_lines > 0 else lines
         text = "".join(tail).strip()
         if text:
@@ -1235,7 +1030,6 @@ def apply_log_filters_to_text(
     log_time_scope: str = "all",
     log_time_from: str = "",
     log_time_to: str = "",
-    log_word: str = "",
     max_lines: int = UI_LOG_DISPLAY_LINES,
 ) -> str:
     if not (text or "").strip():
@@ -1243,7 +1037,7 @@ def apply_log_filters_to_text(
     lines = text.splitlines(keepends=True)
     if not lines:
         return text
-    lines = _filter_log_lines(lines, log_filter, log_date, log_time_scope, log_time_from, log_time_to, log_word)
+    lines = _filter_log_lines(lines, log_filter, log_date, log_time_scope, log_time_from, log_time_to)
     tail = lines[-max_lines:] if max_lines > 0 else lines
     out = "".join(tail).strip()
     if out:
@@ -1332,21 +1126,6 @@ def _normalize_peer_instance_id_key(instance_id: str) -> str:
     return iid
 
 
-def _registered_peer_instance_ids(cfg: Dict[str, Any]) -> set[str]:
-    """Instance IDs listed under cfg['peers'] (master's registered agents)."""
-    peers = cfg.get("peers", [])
-    if not isinstance(peers, list):
-        return set()
-    out: set[str] = set()
-    for p in peers:
-        if not isinstance(p, dict):
-            continue
-        pid = str(p.get("instance_id", "") or "").strip()
-        if _is_valid_peer_instance_id(pid):
-            out.add(pid)
-    return out
-
-
 def _dedupe_peers_by_instance_id(peers: Any) -> List[Dict[str, Any]]:
     """Collapse duplicate peer rows sharing the same instance_id (keeps most recently seen)."""
     if not isinstance(peers, list):
@@ -1368,6 +1147,33 @@ def _dedupe_peers_by_instance_id(peers: Any) -> List[Dict[str, Any]]:
         seen.add(pid)
         out.append(p)
     return out
+
+
+def _registered_peer_instance_ids(cfg: Dict[str, Any]) -> set[str]:
+    """Instance IDs listed under cfg['peers'] (master's registered agents)."""
+    peers = cfg.get("peers", [])
+    if not isinstance(peers, list):
+        return set()
+    out: set[str] = set()
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("instance_id", "") or "").strip()
+        if _is_valid_peer_instance_id(pid):
+            out.add(pid)
+    return out
+
+
+def _is_legacy_peer(peer: Optional[Dict[str, Any]]) -> bool:
+    """True when peer enrolled via legacy token register (default for older peers)."""
+    if not isinstance(peer, dict):
+        return True
+    enrollment = str(peer.get("enrollment", "") or "").strip().lower()
+    if enrollment in ("legacy-peer", "legacy"):
+        return True
+    if enrollment in ("modern-pairing", "modern", "paired"):
+        return False
+    return True
 
 
 def _peer_monitor_name(pm: Dict[str, Any], fallback: str = "?") -> str:
@@ -1401,6 +1207,103 @@ def _peer_monitor_mode(pm: Dict[str, Any]) -> str:
     if mode in ("smart", "storage", "ping", "port", "dns", "backup", "service"):
         return mode
     return "smart"
+
+
+def _peer_agent_bound_to_master(cfg: Dict[str, Any]) -> bool:
+    """True when an agent has established trust or a successful master sync (role change blocked until released)."""
+    if str(cfg.get("peer_role", "") or "").lower() != "agent":
+        return False
+    sec = _get_mtls_security_status(cfg)
+    if sec.get("has_master_cert"):
+        return True
+    res = str(cfg.get("last_peer_sync_result", "") or "")
+    return res.startswith("OK")
+
+
+def _peer_master_has_registered_agents(cfg: Dict[str, Any]) -> bool:
+    return len(_registered_peer_instance_ids(cfg)) > 0
+
+
+def _peer_role_change_blocked_reason(cfg: Dict[str, Any]) -> str:
+    """Non-empty string if the Role control should be locked; empty if the user may change role."""
+    if _rollout_agent_mode():
+        return ""
+    r = _cfg_peer_role(cfg)
+    if r == "agent" and _peer_agent_bound_to_master(cfg):
+        return "agent"
+    if r == "master" and _peer_master_has_registered_agents(cfg):
+        return "master"
+    return ""
+
+
+def _peer_agent_release_master_binding(cfg: Dict[str, Any]) -> None:
+    """Clear agent-side master trust and sync markers (keeps token / master host fields)."""
+    d = get_certs_dir()
+    (d / "master.crt").unlink(missing_ok=True)
+    cfg["last_peer_sync"] = 0
+    cfg["last_peer_sync_result"] = ""
+    cfg["last_peer_sync_latency_ms"] = None
+    cfg.pop("peer_master_approval_status", None)
+
+
+def _peer_remove_agent_master_certs(cfg: Dict[str, Any]) -> None:
+    """Remove mTLS material obtained from a hosted master (agent role)."""
+    d = get_certs_dir()
+    (d / "master.crt").unlink(missing_ok=True)
+    instance_id = str(cfg.get("instance_id", "") or "").strip()
+    if instance_id:
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", instance_id)[:40]
+        for suffix in (".crt", ".key", ".csr"):
+            (d / f"{safe_id}{suffix}").unlink(missing_ok=True)
+    # Agent stores the master's CA as ca.crt only; a local master also has ca.key.
+    if not (d / "ca.key").exists():
+        (d / "ca.crt").unlink(missing_ok=True)
+
+
+def _peer_clear_standalone_peering(cfg: Dict[str, Any], *, prev_role: str = "") -> None:
+    """Clear master connection settings and agent-side master trust when role is standalone."""
+    prev = str(prev_role or "").lower()
+    had_agent_master_certs = prev == "agent" or (get_certs_dir() / "master.crt").exists()
+    _peer_agent_release_master_binding(cfg)
+    cfg["peer_master_url"] = ""
+    cfg["peering_token"] = ""
+    cfg["agent_callback_url"] = ""
+    cfg.pop("peer_master_base_url", None)
+    cfg.pop("peer_master_port", None)
+    if had_agent_master_certs:
+        _peer_remove_agent_master_certs(cfg)
+
+
+def _peer_error_detail(body: str) -> Tuple[str, str]:
+    try:
+        data = json.loads(body)
+        detail = data.get("detail")
+        if isinstance(detail, dict):
+            return str(detail.get("errorCode", "") or ""), str(detail.get("message", "") or "")
+        if isinstance(detail, str):
+            return "", detail
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return "", str(body or "")[:300]
+
+
+def _peer_set_master_approval_status(cfg: Dict[str, Any], status_code: int, body: str) -> Optional[str]:
+    """Persist hosted-master approval state and return a user-facing block message when rejected."""
+    if status_code < 300:
+        cfg.pop("peer_master_approval_status", None)
+        return None
+    code, message = _peer_error_detail(body)
+    if code == "pairing_not_approved" or code == "pairing_required":
+        cfg["peer_master_approval_status"] = "pending"
+        return (
+            "Master has not approved this agent yet. "
+            "This agent should appear under Pending pairing on the hosted master — ask the operator to approve it."
+        )
+    if code == "pairing_rejected":
+        cfg["peer_master_approval_status"] = "rejected"
+        return message or "Master rejected this agent pairing request."
+    cfg.pop("peer_master_approval_status", None)
+    return None
 
 
 def get_peer_data_dir() -> Path:
@@ -1480,7 +1383,7 @@ def _generate_ca(force: bool = False) -> Tuple[bool, str]:
         rc, out = _run_cmd([
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
             "-keyout", str(ca_key), "-out", str(ca_crt),
-            "-days", "3650", "-subj", "/CN=SynologyMonitorCA",
+            "-days", "3650", "-subj", "/CN=UnixMonitorCA",
         ], timeout_sec=30)
         if rc != 0:
             return False, f"openssl CA generation failed (rc={rc}): {out[:200]}"
@@ -1650,119 +1553,6 @@ def _get_mtls_security_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _peer_agent_bound_to_master(cfg: Dict[str, Any]) -> bool:
-    """True when an agent has established trust or a successful master sync (role change blocked until released)."""
-    if str(cfg.get("peer_role", "") or "").lower() != "agent":
-        return False
-    sec = _get_mtls_security_status(cfg)
-    if sec.get("has_master_cert"):
-        return True
-    res = str(cfg.get("last_peer_sync_result", "") or "")
-    return res.startswith("OK")
-
-
-def _peer_master_has_registered_agents(cfg: Dict[str, Any]) -> bool:
-    return len(_registered_peer_instance_ids(cfg)) > 0
-
-
-def _peer_role_change_blocked_reason(cfg: Dict[str, Any]) -> str:
-    """Non-empty string if the Role control should be locked; empty if the user may change role."""
-    r = str(cfg.get("peer_role", "standalone") or "standalone").lower()
-    if r == "agent" and _peer_agent_bound_to_master(cfg):
-        return "agent"
-    if r == "master" and _peer_master_has_registered_agents(cfg):
-        return "master"
-    return ""
-
-
-def _peer_agent_release_master_binding(cfg: Dict[str, Any]) -> None:
-    """Clear agent-side master trust and sync markers (keeps token / master host fields)."""
-    d = get_certs_dir()
-    (d / "master.crt").unlink(missing_ok=True)
-    cfg["last_peer_sync"] = 0
-    cfg["last_peer_sync_result"] = ""
-    cfg["last_peer_sync_latency_ms"] = None
-    cfg.pop("peer_master_approval_status", None)
-
-
-def _peer_remove_agent_master_certs(cfg: Dict[str, Any]) -> None:
-    """Remove mTLS material obtained from a hosted master (agent role)."""
-    d = get_certs_dir()
-    (d / "master.crt").unlink(missing_ok=True)
-    instance_id = str(cfg.get("instance_id", "") or "").strip()
-    if instance_id:
-        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", instance_id)[:40]
-        for suffix in (".crt", ".key", ".csr"):
-            (d / f"{safe_id}{suffix}").unlink(missing_ok=True)
-    # Agent stores the master's CA as ca.crt only; a local master also has ca.key.
-    if not (d / "ca.key").exists():
-        (d / "ca.crt").unlink(missing_ok=True)
-
-
-def _peer_clear_standalone_peering(cfg: Dict[str, Any], *, prev_role: str = "") -> None:
-    """Clear master connection settings and agent-side master trust when role is standalone."""
-    prev = str(prev_role or "").lower()
-    had_agent_master_certs = prev == "agent" or (get_certs_dir() / "master.crt").exists()
-    _peer_agent_release_master_binding(cfg)
-    cfg["peer_master_url"] = ""
-    cfg["peering_token"] = ""
-    cfg["agent_callback_url"] = ""
-    cfg.pop("peer_master_base_url", None)
-    cfg.pop("peer_master_port", None)
-    if had_agent_master_certs:
-        _peer_remove_agent_master_certs(cfg)
-
-
-def _peer_error_detail(body: str) -> Tuple[str, str]:
-    try:
-        data = json.loads(body)
-        detail = data.get("detail")
-        if isinstance(detail, dict):
-            return str(detail.get("errorCode", "") or ""), str(detail.get("message", "") or "")
-        if isinstance(detail, str):
-            return "", detail
-    except (json.JSONDecodeError, ValueError, TypeError):
-        pass
-    return "", str(body or "")[:300]
-
-
-def _peer_set_master_approval_status(cfg: Dict[str, Any], status_code: int, body: str) -> Optional[str]:
-    if status_code < 300:
-        cfg.pop("peer_master_approval_status", None)
-        return None
-    code, message = _peer_error_detail(body)
-    if code in ("pairing_not_approved", "pairing_required"):
-        cfg["peer_master_approval_status"] = "pending"
-        return (
-            "Master has not approved this agent yet. "
-            "This agent should appear under Pending pairing on the hosted master — ask the operator to approve it."
-        )
-    if code == "pairing_rejected":
-        cfg["peer_master_approval_status"] = "rejected"
-        return message or "Master rejected this agent pairing request."
-    cfg.pop("peer_master_approval_status", None)
-    return None
-
-
-def _peer_approval_banner_html(approval_status: str) -> str:
-    status = str(approval_status or "").strip()
-    if status == "pending":
-        return (
-            "<div style='padding:10px 12px;border:1px solid rgba(245,158,11,.45);border-radius:8px;"
-            "background:rgba(245,158,11,.10);font-size:12px;color:#fbbf24;margin-top:8px;'>"
-            "<strong>Waiting for master approval.</strong> This agent contacted the hosted master and is listed under "
-            "<em>Pending pairing</em>. Approve (or batch-approve) on the master, then sync again.</div>"
-        )
-    if status == "rejected":
-        return (
-            "<div style='padding:10px 12px;border:1px solid rgba(239,68,68,.45);border-radius:8px;"
-            "background:rgba(239,68,68,.10);font-size:12px;color:#f87171;margin-top:8px;'>"
-            "<strong>Pairing rejected by master.</strong> Retry sync after the operator clears the rejection — a new "
-            "contact opens a fresh pending pairing.</div>"
-        )
-    return ""
-
-
 # --- Payload encryption (AES-GCM) for HTTP safety net ---
 
 def _derive_aes_key(token: str, salt: bytes = b"synmon-peer-v1") -> bytes:
@@ -1848,7 +1638,7 @@ def _decrypt_payload(encoded: str, token: str) -> Optional[str]:
     return bytes(plaintext_bytes).decode("utf-8", errors="ignore")
 
 
-BACKUP_SALT = b"synology-monitor-backup-v1"
+BACKUP_SALT = b"unix-monitor-backup-v1"
 
 
 def _derive_backup_key(user_key: str) -> bytes:
@@ -1937,14 +1727,14 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
     if role != "agent":
         return "Certificate request is only available for agent role."
     master_host, master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     token = str(cfg.get("peering_token", "") or "").strip()
     if not master_host or not token:
         return "Missing master host or peering token."
-    master_url = _resolve_peer_url(master_host, master_port, token, timeout=10)
+    master_url, resolve_err = _peer_master_base_url(cfg, timeout=4)
     if not master_url:
-        return f"Cannot reach master at {master_host}:{master_port}."
+        return resolve_err
     if not _openssl_available():
         return "openssl not available on this system."
     instance_id = _get_instance_id(cfg)
@@ -1969,12 +1759,12 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
             "monitor_count": len(cfg.get("monitors", [])) if isinstance(cfg.get("monitors", []), list) else 0,
             "csr_pem": csr_pem,
         }
-        status, body = _peer_http_request(master_url, token, "POST", "/api/peer/register", payload=payload, timeout=15)
+        status, body = _peer_http_request(master_url, token, "POST", "/api/peer/register", payload=payload, timeout=30)
         if status >= 300:
-            block = _peer_set_master_approval_status(cfg, status, body)
-            save_config(cfg, reapply_cron=False)
-            if block:
-                return block
+            approval_msg = _peer_set_master_approval_status(cfg, status, body)
+            if approval_msg:
+                save_config(cfg, reapply_cron=False)
+                return approval_msg
             return f"Register failed (HTTP {status}): {body[:300]}"
         try:
             data = json.loads(body)
@@ -1984,6 +1774,12 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
         ca_cert = str(data.get("ca_cert", "") or "").strip()
         master_cert = str(data.get("master_cert", "") or "").strip()
         if not signed_cert or not ca_cert:
+            csr_note = str(data.get("csr_note", "") or "").strip()
+            if csr_note:
+                return (
+                    "Master accepted registration but did not sign a certificate. "
+                    f"{csr_note} Token-only peering still works for sync/push."
+                )
             return "Register failed: master did not return signed cert + CA cert."
         crt_path.write_text(signed_cert + ("\n" if not signed_cert.endswith("\n") else ""), encoding="utf-8")
         (d / "ca.crt").write_text(ca_cert + ("\n" if not ca_cert.endswith("\n") else ""), encoding="utf-8")
@@ -1994,12 +1790,16 @@ def _agent_request_cert(cfg: Dict[str, Any]) -> str:
         crt_path.chmod(0o644)
         (d / "ca.crt").chmod(0o644)
         csr_path.unlink(missing_ok=True)
+        cfg["peer_master_base_url"] = master_url
+        save_config(cfg, reapply_cron=False)
         return "Certificate signed by master CA and stored locally."
     except Exception as e:
-        return f"Certificate request failed: {type(e).__name__}: {e}"
+        hint = _peer_lan_reachability_hint(master_host, master_port)
+        return f"Certificate request failed: {type(e).__name__}: {e}. {hint}"
 
 
 def _agent_maybe_request_cert_bg(cfg: Dict[str, Any]) -> None:
+    """After a successful push, request a signed cert from the master when OpenSSL + CA are available."""
     if str(cfg.get("peer_role", "") or "").lower() != "agent":
         return
     if not _openssl_available():
@@ -2186,33 +1986,38 @@ def _agent_process_hosted_actions(cfg: Dict[str, Any]) -> str:
 
 def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
     master_host, master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     token = str(cfg.get("peering_token", "") or "").strip()
     if not master_host or not token:
         return "Agent sync skipped: no master host or peering token configured."
-    master_url = _resolve_peer_url(master_host, master_port, token, timeout=8)
+    master_url, resolve_err = _peer_master_base_url(cfg, timeout=4)
     if not master_url:
-        return f"Cannot reach master at {master_host}:{master_port}."
+        return f"Agent sync skipped: {resolve_err}"
     instance_id = _get_instance_id(cfg)
     instance_name = str(cfg.get("instance_name", "") or "").strip() or instance_id[:8]
     history = _load_history()
     state = _load_monitor_state()
     auth = _load_auth_state()
-    monitors_cfg = cfg.get("monitors", [])
+    live = _build_live_snapshot()
+    monitors_cfg = live.get("monitors") or cfg.get("monitors", [])
+    channels = live.get("channels") or {}
     cb_host, cb_port = _parse_peer_host_port(
-        cfg.get("agent_callback_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("agent_callback_url", ""), _peer_agent_port(cfg)
     )
     push_payload: Dict[str, Any] = {
         "instance_id": instance_id,
         "instance_name": instance_name,
         "version": VERSION,
-        "last_login_ip": str(auth.get("last_login_ip", "") or "").strip(),
-        "last_login_at": int(auth.get("last_login_at", 0) or 0),
+        "platform": SYSTEM_LABEL,
+        "platform_family": "unix",
         "monitors": monitors_cfg,
+        "channels": channels,
         "history": history[-200:],
         "state": state,
         "pushed_at": int(time.time()),
+        "last_login_ip": str(auth.get("last_login_ip", "") or "").strip(),
+        "last_login_at": int(auth.get("last_login_at", 0) or 0),
     }
     if cb_host:
         push_payload["callback_url"] = f"{cb_host}:{cb_port}"
@@ -2223,28 +2028,48 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
         cfg["last_peer_sync"] = int(time.time())
         cfg["last_peer_sync_latency_ms"] = latency_ms
         if status < 300:
-            cfg["last_peer_sync_result"] = f"OK ({latency_ms} ms)"
             cfg.pop("peer_master_approval_status", None)
+            cfg["last_peer_sync_result"] = f"OK ({latency_ms} ms)"
             save_config(cfg, reapply_cron=False)
             _agent_maybe_request_cert_bg(cfg)
             _agent_pull_hosted_config(cfg)
             _agent_process_hosted_actions(cfg)
             return f"Pushed to master ({master_url}): {status} ({latency_ms} ms)"
-        block = _peer_set_master_approval_status(cfg, status, body)
+        approval_msg = _peer_set_master_approval_status(cfg, status, body)
+        cfg["last_peer_sync"] = int(time.time())
+        cfg["last_peer_sync_latency_ms"] = latency_ms
         cfg["last_peer_sync_result"] = f"HTTP {status}"
         save_config(cfg, reapply_cron=False)
-        if block:
-            return block
+        if approval_msg:
+            return f"Master push blocked ({master_url}): {approval_msg}"
         return f"Master push failed ({master_url}): HTTP {status} - {body}"
     except Exception as e:
         cfg["last_peer_sync"] = int(time.time())
         cfg["last_peer_sync_result"] = f"Error: {type(e).__name__}"
         cfg["last_peer_sync_latency_ms"] = None
         save_config(cfg, reapply_cron=False)
-        return f"Master push error: {type(e).__name__}: {e}"
+        return f"Master push error: {type(e).__name__}: {e}. {_peer_lan_reachability_hint(master_host, master_port)}"
 
 
 PEER_DEFAULT_PORT = 8787
+
+
+def _normalize_peer_port(value: Any, default: int = PEER_DEFAULT_PORT) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+def _peer_master_port(cfg: Dict[str, Any]) -> int:
+    legacy = _normalize_peer_port(cfg.get("peer_port", PEER_DEFAULT_PORT))
+    return _normalize_peer_port(cfg.get("peer_master_port", legacy), legacy)
+
+
+def _peer_agent_port(cfg: Dict[str, Any]) -> int:
+    legacy = _normalize_peer_port(cfg.get("peer_port", PEER_DEFAULT_PORT))
+    return _normalize_peer_port(cfg.get("peer_agent_port", legacy), legacy)
 
 
 def _parse_peer_host_port(url_or_host: str, default_port: int = PEER_DEFAULT_PORT) -> Tuple[str, int]:
@@ -2284,27 +2109,122 @@ def _peer_url_for_open(url: str, default_port: int = PEER_DEFAULT_PORT) -> str:
     return f"http://{host}:{port}"
 
 
-def _resolve_peer_url(host: str, port: int, token: str, timeout: int = 5) -> str:
-    """Try HTTPS first, fall back to HTTP. Returns the working base URL (e.g. https://host:port)."""
+def _peer_scheme_probe_order(port: int) -> Tuple[str, ...]:
+    if port in (443, 8443):
+        return ("https", "http")
+    return ("http", "https")
+
+
+def _cached_peer_base_url(cfg: Dict[str, Any], host: str, port: int) -> str:
+    cached = str(cfg.get("peer_master_base_url", "") or "").strip().rstrip("/")
+    if not cached:
+        return ""
+    cached_host, cached_port = _parse_peer_host_port(cached, port)
+    if cached_host.lower() != host.lower() or cached_port != port:
+        return ""
+    return cached
+
+
+def _resolve_peer_url(
+    host: str,
+    port: int,
+    token: str,
+    timeout: int = 5,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Probe master health and return a working base URL (e.g. http://host:port)."""
     if not host:
         return ""
-    for scheme in ("https", "http"):
+    probe_timeout = min(max(timeout, 2), 4)
+    if cfg is not None:
+        cached = _cached_peer_base_url(cfg, host, port)
+        if cached:
+            try:
+                status, _ = _peer_http_request(cached, token, "GET", "/api/peer/health", timeout=min(probe_timeout, 3))
+                if status < 500:
+                    return cached
+            except Exception:
+                pass
+    for scheme in _peer_scheme_probe_order(port):
         base = f"{scheme}://{host}:{port}"
         try:
-            status, _ = _peer_http_request(base, token, "GET", "/api/peer/health", timeout=timeout)
+            status, _ = _peer_http_request(base, token, "GET", "/api/peer/health", timeout=probe_timeout)
             if status < 500:
-                return base.rstrip("/")
+                resolved = base.rstrip("/")
+                if cfg is not None:
+                    cfg["peer_master_base_url"] = resolved
+                return resolved
         except Exception:
             continue
-    return f"https://{host}:{port}"  # prefer https for next attempt
+    return ""
 
 
-def _resolve_peer_url_from_stored(url_or_host: str, token: str, timeout: int = 5) -> str:
+def _resolve_peer_url_from_stored(
+    url_or_host: str,
+    token: str,
+    timeout: int = 5,
+    cfg: Optional[Dict[str, Any]] = None,
+    default_port: int = PEER_DEFAULT_PORT,
+) -> str:
     """Parse stored url (host, host:port, or full URL) and resolve to working scheme. Returns base URL."""
-    host, port = _parse_peer_host_port(url_or_host)
+    host, port = _parse_peer_host_port(url_or_host, default_port)
     if not host:
         return ""
-    return _resolve_peer_url(host, port, token, timeout)
+    return _resolve_peer_url(host, port, token, timeout, cfg)
+
+
+def _peer_direct_base_url(url_or_host: str, default_port: int = PEER_DEFAULT_PORT) -> str:
+    host, port = _parse_peer_host_port(url_or_host, default_port)
+    if not host:
+        return ""
+    scheme = "https" if port in (443, 8443) else "http"
+    return f"{scheme}://{host}:{port}"
+
+
+def _peer_agent_test_inputs(form: Dict[str, List[str]], cfg: Dict[str, Any]) -> Tuple[str, str]:
+    """Read master host/port + token from test-connection POST (save-form or legacy hidden fields)."""
+    token = (form.get("peer_token", [""])[0] or form.get("peering_token", [""])[0] or "").strip()
+    raw = (form.get("peer_url", [""])[0] or "").strip()
+    port_raw = (form.get("peer_master_port", [""])[0] or "").strip()
+    master_port = int(port_raw) if port_raw.isdigit() else _peer_master_port(cfg)
+    if not raw:
+        master_host = (form.get("peer_master_url", [""])[0] or "").strip()
+        if not master_host:
+            master_host = str(cfg.get("peer_master_url", "") or "").strip()
+        if master_host:
+            host, _ = _parse_peer_host_port(master_host, master_port)
+            if host:
+                raw = f"{host}:{master_port}"
+    if not token:
+        token = str(cfg.get("peering_token", "") or "").strip()
+    return raw, token
+
+
+def _peer_lan_reachability_hint(master_host: str, master_port: int) -> str:
+    return (
+        f"If this host cannot reach {master_host}:{master_port}, set HOSTED_BIND_IP=0.0.0.0 on the master "
+        "(deploy/.env) and redeploy, or use NPM HTTPS on port 443 with the proxy hostname."
+    )
+
+
+def _peer_master_base_url(cfg: Dict[str, Any], timeout: int = 4) -> Tuple[str, str]:
+    """Resolve or construct the master base URL. Returns (url, error_message)."""
+    master_host, master_port = _parse_peer_host_port(
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
+    )
+    token = str(cfg.get("peering_token", "") or "").strip()
+    if not master_host or not token:
+        return "", "Missing master host or peering token."
+    resolved = _resolve_peer_url(master_host, master_port, token, timeout=timeout, cfg=cfg)
+    if resolved:
+        return resolved, ""
+    direct = _peer_direct_base_url(f"{master_host}:{master_port}", master_port)
+    if direct:
+        return direct, ""
+    return "", (
+        f"Cannot reach master at {master_host}:{master_port}. "
+        + _peer_lan_reachability_hint(master_host, master_port)
+    )
 
 
 def _peer_http_request(url: str, token: str, method: str = "GET",
@@ -2392,6 +2312,34 @@ def _peer_test_connection(url: str, token: str) -> str:
         return f"Connection error: {type(e).__name__}: {e}"
 
 
+def _probe_agent_callback_health(url_or_host: str, token: str, *, default_port: int = PEER_DEFAULT_PORT) -> str:
+    """Check whether an agent callback URL responds to /api/peer/health."""
+    raw = str(url_or_host or "").strip()
+    token = str(token or "").strip()
+    if not raw:
+        return "No agent callback URL configured."
+    if not token:
+        return "No peering token configured."
+    host, port = _parse_peer_host_port(raw, default_port)
+    if not host:
+        return "No agent callback host configured."
+    try:
+        t0 = time.time()
+        resolved = _resolve_peer_url_from_stored(raw, token, timeout=10)
+        if not resolved:
+            resolved = _resolve_peer_url_from_stored(f"{host}:{port}", token, timeout=10)
+        if not resolved:
+            return f"FAILED: Cannot reach agent at {host}:{port}"
+        status, body = _peer_http_request(resolved, token, "GET", "/api/peer/health", timeout=10)
+        latency_ms = round((time.time() - t0) * 1000)
+        if status < 300:
+            return f"OK: Agent reachable at {resolved} ({latency_ms} ms)"
+        detail = body.strip()[:160] if body.strip() else f"HTTP {status}"
+        return f"FAILED: {detail} ({latency_ms} ms)"
+    except Exception as e:
+        return f"FAILED: {type(e).__name__}: {e}"
+
+
 def _peer_sync_from_master(cfg: Dict[str, Any]) -> str:
     """Master pulls full snapshot from each agent, saves it, and updates peer status."""
     peers = cfg.get("peers", [])
@@ -2450,6 +2398,10 @@ def _trigger_peer_sync_bg(cfg: Dict[str, Any]) -> None:
     role = str(cfg.get("peer_role", "") or "").lower()
     if role not in ("agent", "master"):
         return
+    if not _peer_sync_guard.acquire(blocking=False):
+        append_ui_log("peer-sync | auto skipped: previous sync still running")
+        return
+
     def _do_sync() -> None:
         try:
             fresh = load_config()
@@ -2463,6 +2415,8 @@ def _trigger_peer_sync_bg(cfg: Dict[str, Any]) -> None:
             append_ui_log(f"peer-sync | auto: {result}")
         except Exception as exc:
             append_ui_log(f"peer-sync | auto error: {type(exc).__name__}: {exc}")
+        finally:
+            _peer_sync_guard.release()
     threading.Thread(target=_do_sync, daemon=True).start()
 
 
@@ -2520,7 +2474,6 @@ def _fetch_agent_diag(
     log_time_scope: str = "all",
     log_time_from: str = "",
     log_time_to: str = "",
-    log_word: str = "",
     resolve_timeout: int = 15,
     fetch_timeout: int = 25,
 ) -> str:
@@ -2548,7 +2501,6 @@ def _fetch_agent_diag(
             f"?view={quote(view)}&log_filter={quote(log_filter)}"
             f"&log_date={quote(log_date)}&log_time_scope={quote(log_time_scope)}"
             f"&log_time_from={quote(log_time_from)}&log_time_to={quote(log_time_to)}"
-            f"&log_word={quote(log_word)}"
         )
         status, body = _peer_http_request(p_url, token, "GET", f"/api/peer/diag{qs}", timeout=fetch_timeout)
         if status < 300:
@@ -2598,98 +2550,8 @@ def _clear_agent_logs(cfg: Dict[str, Any], peer_id: str, timeout: int = 12) -> s
         return f"{p_name}: {type(e).__name__}: {e}"
 
 
-def _infer_peer_source_platform_for_update(cfg: Dict[str, Any], peer_id: str) -> str:
-    for p in (cfg.get("peers", []) or []):
-        if str(p.get("instance_id", "")) != peer_id:
-            continue
-        direct = str(p.get("platform", "") or "").strip().lower()
-        if direct:
-            if "synology" in direct or direct == "dsm":
-                return "synology"
-            # Non-Synology explicit platform values default to updatable Unix-class agents.
-            return "unix"
-        for key in ("platform_family", "instance_name", "version", "url"):
-            val = str(p.get(key, "") or "").strip().lower()
-            if not val:
-                continue
-            if "synology" in val or "dsm" in val:
-                return "synology"
-    snap = _load_peer_snapshot(peer_id) or {}
-    for key in ("platform", "platform_family"):
-        val = str(snap.get(key, "") or "").strip().lower()
-        if not val:
-            continue
-        if "synology" in val or "dsm" in val:
-            return "synology"
-        return "unix"
-    return "unknown"
-
-
-def _is_unknown_update_override_enabled(cfg: Dict[str, Any], peer_id: str) -> bool:
-    raw = cfg.get("allow_unknown_update_peers", [])
-    if not isinstance(raw, list):
-        return False
-    return peer_id in {str(x or "").strip() for x in raw}
-
-
-def _set_unknown_update_override(cfg: Dict[str, Any], peer_id: str, enabled: bool) -> None:
-    raw = cfg.get("allow_unknown_update_peers", [])
-    ids = {str(x or "").strip() for x in (raw if isinstance(raw, list) else []) if str(x or "").strip()}
-    if enabled:
-        ids.add(peer_id)
-    else:
-        ids.discard(peer_id)
-    cfg["allow_unknown_update_peers"] = sorted(ids)
-
-
-def _peer_update_capability(cfg: Dict[str, Any], peer_id: str) -> Tuple[bool, str, str]:
-    source_platform = _infer_peer_source_platform_for_update(cfg, peer_id)
-    if source_platform == "synology":
-        return False, source_platform, "Synology updates are manual (Package Center/SPK)."
-    if source_platform == "unix":
-        return True, source_platform, ""
-    if _is_unknown_update_override_enabled(cfg, peer_id):
-        return True, "unknown", ""
-    return False, "unknown", "Unknown platform; update blocked by default."
-
-
-def _peer_agent_platform_display(cfg: Dict[str, Any], peer_id: str) -> Tuple[str, str]:
-    snap = _load_peer_snapshot(peer_id) or {}
-    plat = str(snap.get("platform", "") or "").strip()
-    fam = str(snap.get("platform_family", "") or "").strip()
-    for p in (cfg.get("peers", []) or []):
-        if str(p.get("instance_id", "")) != peer_id:
-            continue
-        if not plat:
-            plat = str(p.get("platform", "") or "").strip()
-        if not fam:
-            fam = str(p.get("platform_family", "") or "").strip()
-        break
-    return plat, fam
-
-
-def _peer_update_options_hint_inner_html(cfg: Dict[str, Any], peer_id: str) -> str:
-    plat, fam = _peer_agent_platform_display(cfg, peer_id)
-    explain = (
-        "Remote updates are only offered when this master recognizes the agent as a supported Unix install. "
-        "If the agent does not advertise a known platform, updates stay disabled until you allow them here."
-    )
-    det_parts = []
-    if plat:
-        det_parts.append(f"OS: {plat}")
-    if fam:
-        det_parts.append(f"family: {fam}")
-    det = " · ".join(det_parts) if det_parts else "Not reported yet (wait for the next agent sync)."
-    return (
-        f"<div class='peer-update-options-hint'>"
-        f"<p class='muted' style='font-size:11px;line-height:1.4;margin:0 0 8px 0;'>{html.escape(explain)}</p>"
-        f"<p style='font-size:11px;line-height:1.4;margin:0 0 10px 0;color:#c8dbf8;'>{html.escape(det)}</p>"
-        f"</div>"
-    )
-
-
 def _trigger_agent_update(cfg: Dict[str, Any], peer_id: str) -> Tuple[Optional[str], Optional[str]]:
-    """Master triggers update on agent. Returns (session_id, error). Synology agents return error (no script update)."""
+    """Master triggers update on agent. Returns (session_id, error). session_id None on error."""
     token = str(cfg.get("peering_token", "") or "").strip()
     if not token:
         return None, "No peering token configured."
@@ -2706,7 +2568,7 @@ def _trigger_agent_update(cfg: Dict[str, Any], peer_id: str) -> Tuple[Optional[s
         return None, update_block_reason
     p_url_raw = str(target.get("url", "") or "").strip().rstrip("/")
     if not p_url_raw:
-        return None, "No URL configured for agent."
+        return None, f"No URL configured for agent."
     p_url = _resolve_peer_url_from_stored(p_url_raw, token, timeout=10)
     if not p_url:
         return None, f"Cannot reach agent at {p_url_raw}."
@@ -2935,7 +2797,7 @@ def _agent_request_master_monitor_action(
     if role != "agent":
         return False, "This action is only supported on agent role.", ""
     master_host, master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     token = str(cfg.get("peering_token", "") or "").strip()
     if not master_host or not token:
@@ -2968,17 +2830,131 @@ def _agent_request_master_monitor_action(
         return False, f"{type(e).__name__}: {e}", ""
 
 
+def _infer_peer_source_platform(cfg: Dict[str, Any], peer_id: str) -> str:
+    for p in (cfg.get("peers", []) or []):
+        if str(p.get("instance_id", "")) != peer_id:
+            continue
+        direct = str(p.get("platform", "") or "")
+        if direct:
+            return _normalize_source_platform(direct)
+        probe = " ".join(
+            [
+                str(p.get("instance_name", "") or ""),
+                str(p.get("version", "") or ""),
+                str(p.get("url", "") or ""),
+            ]
+        )
+        if "synology" in probe.lower() or "dsm" in probe.lower():
+            return "synology"
+    snap = _load_peer_snapshot(peer_id) or {}
+    for key in ("platform", "platform_family", "instance_name", "version"):
+        val = str(snap.get(key, "") or "")
+        if "synology" in val.lower() or "dsm" in val.lower():
+            return "synology"
+    return "unix"
+
+
+def _infer_peer_source_platform_for_update(cfg: Dict[str, Any], peer_id: str) -> str:
+    for p in (cfg.get("peers", []) or []):
+        if str(p.get("instance_id", "")) != peer_id:
+            continue
+        direct = str(p.get("platform", "") or "").strip().lower()
+        if direct:
+            if "synology" in direct or direct == "dsm":
+                return "synology"
+            # Non-Synology explicit platform values default to updatable Unix-class agents.
+            return "unix"
+        for key in ("platform_family", "instance_name", "version", "url"):
+            val = str(p.get(key, "") or "").strip().lower()
+            if not val:
+                continue
+            if "synology" in val or "dsm" in val:
+                return "synology"
+    snap = _load_peer_snapshot(peer_id) or {}
+    for key in ("platform", "platform_family"):
+        val = str(snap.get(key, "") or "").strip().lower()
+        if not val:
+            continue
+        if "synology" in val or "dsm" in val:
+            return "synology"
+        return "unix"
+    return "unknown"
+
+
+def _is_unknown_update_override_enabled(cfg: Dict[str, Any], peer_id: str) -> bool:
+    raw = cfg.get("allow_unknown_update_peers", [])
+    if not isinstance(raw, list):
+        return False
+    return peer_id in {str(x or "").strip() for x in raw}
+
+
+def _set_unknown_update_override(cfg: Dict[str, Any], peer_id: str, enabled: bool) -> None:
+    raw = cfg.get("allow_unknown_update_peers", [])
+    ids = {str(x or "").strip() for x in (raw if isinstance(raw, list) else []) if str(x or "").strip()}
+    if enabled:
+        ids.add(peer_id)
+    else:
+        ids.discard(peer_id)
+    cfg["allow_unknown_update_peers"] = sorted(ids)
+
+
+def _peer_update_capability(cfg: Dict[str, Any], peer_id: str) -> Tuple[bool, str, str]:
+    source_platform = _infer_peer_source_platform_for_update(cfg, peer_id)
+    if source_platform == "synology":
+        return False, source_platform, "Synology updates are manual (Package Center/SPK)."
+    if source_platform == "unix":
+        return True, source_platform, ""
+    if _is_unknown_update_override_enabled(cfg, peer_id):
+        return True, "unknown", ""
+    return False, "unknown", "Unknown platform; update blocked by default."
+
+
+def _peer_agent_platform_display(cfg: Dict[str, Any], peer_id: str) -> Tuple[str, str]:
+    snap = _load_peer_snapshot(peer_id) or {}
+    plat = str(snap.get("platform", "") or "").strip()
+    fam = str(snap.get("platform_family", "") or "").strip()
+    for p in (cfg.get("peers", []) or []):
+        if str(p.get("instance_id", "")) != peer_id:
+            continue
+        if not plat:
+            plat = str(p.get("platform", "") or "").strip()
+        if not fam:
+            fam = str(p.get("platform_family", "") or "").strip()
+        break
+    return plat, fam
+
+
+def _peer_update_options_hint_inner_html(cfg: Dict[str, Any], peer_id: str) -> str:
+    plat, fam = _peer_agent_platform_display(cfg, peer_id)
+    explain = (
+        "Remote updates are only offered when this master recognizes the agent as a supported Unix install. "
+        "If the agent does not advertise a known platform, updates stay disabled until you allow them here."
+    )
+    det_parts = []
+    if plat:
+        det_parts.append(f"OS: {plat}")
+    if fam:
+        det_parts.append(f"family: {fam}")
+    det = " · ".join(det_parts) if det_parts else "Not reported yet (wait for the next agent sync)."
+    return (
+        f"<div class='peer-update-options-hint'>"
+        f"<p class='muted' style='font-size:11px;line-height:1.4;margin:0 0 8px 0;'>{html.escape(explain)}</p>"
+        f"<p style='font-size:11px;line-height:1.4;margin:0 0 10px 0;color:#c8dbf8;'>{html.escape(det)}</p>"
+        f"</div>"
+    )
+
+
 def get_smart_cache_path() -> Path:
-    return get_runtime_data_dir() / "synology-smart-cache.json"
+    return get_runtime_data_dir() / "unix-smart-cache.json"
 
 
 def get_system_log_cache_path() -> Path:
-    return get_runtime_data_dir() / "synology-system-log-cache.json"
+    return get_runtime_data_dir() / "unix-system-log-cache.json"
 
 
 def _write_smart_cache(payload: Dict[str, Any]) -> None:
     path = get_smart_cache_path()
-    tmp = path.parent / ".synology-smart-cache.json.tmp"
+    tmp = path.parent / ".unix-smart-cache.json.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2991,7 +2967,7 @@ def _write_smart_cache(payload: Dict[str, Any]) -> None:
 
 def _write_system_log_cache(payload: Dict[str, Any]) -> None:
     path = get_system_log_cache_path()
-    tmp = path.parent / ".synology-system-log-cache.json.tmp"
+    tmp = path.parent / ".unix-system-log-cache.json.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -3025,12 +3001,12 @@ def _read_system_log_cache() -> Optional[Dict[str, Any]]:
 
 
 def get_backup_cache_path() -> Path:
-    return get_runtime_data_dir() / "synology-backup-cache.json"
+    return get_runtime_data_dir() / "unix-backup-cache.json"
 
 
 def _write_backup_cache(payload: Dict[str, Any]) -> None:
     path = get_backup_cache_path()
-    tmp = path.parent / ".synology-backup-cache.json.tmp"
+    tmp = path.parent / ".unix-backup-cache.json.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -3060,6 +3036,431 @@ def get_smart_helper_script_path() -> Path:
     return get_script_path().parent / "smart-helper.sh"
 
 
+def get_update_helper_path() -> Path:
+    return get_script_path().parent / "update-helper.sh"
+
+
+def _update_helper_env(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Env for update-helper: UNIX_MONITOR_USE_MAIN=1 when update_from_main is enabled."""
+    if cfg is None:
+        cfg = load_config()
+    if cfg.get("update_from_main"):
+        return {"UNIX_MONITOR_USE_MAIN": "1"}
+    return {}
+
+
+def _get_update_check_path() -> Path:
+    return get_runtime_data_dir() / "unix-update-check.json"
+
+
+def _version_tuple(version: str) -> Tuple[int, ...]:
+    """Parse '1.5.0-0001' or 'v1.0.0-0055' to (1, 0, 0, 55) for comparison."""
+    s = str(version or "").strip().lstrip("vV")
+    if not s:
+        return (0, 0, 0, 0)
+    main, _, build = s.partition("-")
+    parts = [int(x or 0) for x in re.split(r"[.]", main)[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    try:
+        parts.append(int(build.strip()) if build.strip() else 0)
+    except ValueError:
+        parts.append(0)
+    return tuple(parts[:4])
+
+
+def _version_display_short(version: str, max_len: int = 24) -> str:
+    raw = str(version or "").strip()
+    if not raw:
+        return "unknown"
+    short = raw.split("+", 1)[0].strip() or raw
+    if len(short) <= max_len:
+        return short
+    return short[:max_len] + "..."
+
+
+def _selected_update_channel(cfg: Optional[Dict[str, Any]] = None) -> str:
+    if cfg is None:
+        cfg = load_config()
+    return "main" if bool(cfg.get("update_from_main", False)) else "latest"
+
+
+def _fetch_latest_release_tag() -> Tuple[Optional[str], Optional[str]]:
+    try:
+        req = http.client.HTTPSConnection("api.github.com", timeout=10)
+        req.request(
+            "GET",
+            f"/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "unix-monitor"},
+        )
+        resp = req.getresponse()
+        data = resp.read().decode("utf-8", errors="ignore")
+        req.close()
+        if resp.status != 200:
+            return None, f"HTTP {resp.status}"
+        obj = json.loads(data)
+        tag = str(obj.get("tag_name", "") or "").strip().lstrip("vV")
+        if not tag:
+            return None, "No tag_name in response"
+        return tag, None
+    except Exception as e:
+        return None, str(e) if str(e) else type(e).__name__
+
+
+def _fetch_public_version_from_script(ref: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        req = http.client.HTTPSConnection("raw.githubusercontent.com", timeout=10)
+        ref_path = quote(ref, safe="")
+        req.request("GET", f"/{GITHUB_REPO}/{ref_path}/{UPDATE_SCRIPT_REMOTE_PATH}", headers={"User-Agent": "unix-monitor"})
+        resp = req.getresponse()
+        data = resp.read().decode("utf-8", errors="ignore")
+        req.close()
+        if resp.status != 200:
+            return None, f"HTTP {resp.status}"
+        m = re.search(r'^VERSION\s*=\s*"([^"]+)"', data, flags=re.MULTILINE)
+        if not m:
+            return None, "No VERSION in script"
+        return m.group(1).strip(), None
+    except Exception as e:
+        return None, str(e) if str(e) else type(e).__name__
+
+
+def _run_update_check(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Fetch selected channel public version, compare with local VERSION. Returns result dict."""
+    channel = _selected_update_channel(cfg)
+    result: Dict[str, Any] = {
+        "checked_at": int(time.time()),
+        "error": None,
+        "latest_version": None,
+        "public_version": None,
+        "selected_channel": channel,
+        "selected_ref": None,
+        "effective_ref": None,
+        "update_available": False,
+    }
+    try:
+        if channel == "main":
+            ref = "main"
+        else:
+            tag, tag_err = _fetch_latest_release_tag()
+            if tag_err or not tag:
+                result["error"] = tag_err or "Failed to resolve latest release"
+                return result
+            ref = tag
+
+        result["selected_ref"] = ref
+        effective_ref = ref
+        public_version, version_err = _fetch_public_version_from_script(ref)
+        if (version_err or not public_version) and ref != "main":
+            # Match update-helper behavior: release tags may not include unix-monitor; fall back to main.
+            public_version, version_err = _fetch_public_version_from_script("main")
+            if not version_err and public_version:
+                effective_ref = "main"
+        if version_err or not public_version:
+            result["error"] = version_err or "Failed to resolve public script version"
+            return result
+
+        result["public_version"] = public_version
+        result["latest_version"] = public_version  # Backward compatibility with existing cache consumers
+        result["effective_ref"] = effective_ref
+        current = _version_tuple(VERSION)
+        latest = _version_tuple(public_version)
+        result["update_available"] = latest > current
+    except Exception as e:
+        result["error"] = str(e) if str(e) else type(e).__name__
+    return result
+
+
+def _save_update_check_result(result: Dict[str, Any]) -> None:
+    path = _get_update_check_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / ".unix-update-check.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+        os.replace(str(tmp), str(path))
+    except Exception:
+        pass
+
+
+def _load_update_check_result() -> Dict[str, Any]:
+    path = _get_update_check_path()
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _update_check_needs_refresh(
+    cfg: Optional[Dict[str, Any]] = None,
+    last: Optional[Dict[str, Any]] = None,
+    ttl_sec: int = AUTOUPDATE_CHECK_INTERVAL_SEC,
+) -> bool:
+    if cfg is None:
+        cfg = load_config()
+    if last is None:
+        last = _load_update_check_result()
+    if not isinstance(last, dict) or not last:
+        return True
+    selected_channel = _selected_update_channel(cfg)
+    cached_channel = str(last.get("selected_channel", "") or "")
+    if cached_channel != selected_channel:
+        return True
+    checked_at = int(last.get("checked_at", 0) or 0)
+    if checked_at <= 0:
+        return True
+    return (int(time.time()) - checked_at) >= int(ttl_sec)
+
+
+def _ensure_fresh_update_check(
+    cfg: Optional[Dict[str, Any]] = None,
+    force: bool = False,
+    ttl_sec: int = AUTOUPDATE_CHECK_INTERVAL_SEC,
+) -> Dict[str, Any]:
+    if cfg is None:
+        cfg = load_config()
+    last = _load_update_check_result()
+    if not force and not _update_check_needs_refresh(cfg=cfg, last=last, ttl_sec=ttl_sec):
+        return last
+    result = _run_update_check(cfg)
+    _save_update_check_result(result)
+    return result
+
+
+def _parse_info_version_text(content: str) -> str:
+    m = re.search(r'^version="([^"]+)"', str(content or ""), flags=re.MULTILINE)
+    return str(m.group(1)).strip() if m else ""
+
+
+def _detect_installed_unix_monitor_version() -> str:
+    info_candidates = [
+        Path("/var/packages/synology-monitor/INFO"),
+        Path("/var/packages/synology-monitor/target/INFO"),
+        Path("/usr/local/synology-monitor/INFO"),
+        Path("/opt/synology-monitor/INFO"),
+    ]
+    for p in info_candidates:
+        try:
+            if p.exists():
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+                v = _parse_info_version_text(txt)
+                if v:
+                    return v
+        except OSError:
+            continue
+    py_candidates = [
+        Path("/opt/unix-monitor/unix-monitor.py"),
+        get_script_path(),
+    ]
+    for p in py_candidates:
+        try:
+            if p.exists():
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r'^VERSION\s*=\s*"([^"]+)"', txt, flags=re.MULTILINE)
+                if m:
+                    return str(m.group(1)).strip()
+        except OSError:
+            continue
+    return VERSION
+
+
+def _version_cmp_value(a: str, b: str) -> int:
+    ta = _version_tuple(a)
+    tb = _version_tuple(b)
+    if ta < tb:
+        return -1
+    if ta > tb:
+        return 1
+    return 0
+
+
+def _build_unix_update_sync_report(cfg: Optional[Dict[str, Any]] = None, force: bool = True) -> Dict[str, Any]:
+    if cfg is None:
+        cfg = load_config()
+    check = _ensure_fresh_update_check(cfg=cfg, force=force, ttl_sec=AUTOUPDATE_CHECK_INTERVAL_SEC)
+    installed = _detect_installed_unix_monitor_version()
+    public_version = str(check.get("public_version", "") or check.get("latest_version", "") or "").strip()
+    cmp_val = _version_cmp_value(installed or "0", public_version or "0") if public_version else 0
+    status = "unknown"
+    if check.get("error"):
+        status = "error"
+    elif public_version:
+        status = "update_available" if cmp_val < 0 else "up_to_date"
+    return {
+        "installed_version": installed or VERSION,
+        "public_version": public_version,
+        "selected_channel": str(check.get("selected_channel", "") or _selected_update_channel(cfg)),
+        "error": str(check.get("error", "") or "").strip(),
+        "cmp": cmp_val,
+        "status": status,
+        "raw_check": check,
+    }
+
+
+def _cleanup_update_runtime_cache() -> None:
+    cleanup_paths = [
+        Path("/var/lib/unix-monitor/__pycache__"),
+        Path("/var/lib/unix-monitor/cache"),
+        Path.home() / ".cache" / "unix-monitor",
+    ]
+    for p in cleanup_paths:
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+
+def _get_autoupdate_on_logout_flag_path() -> Path:
+    return get_runtime_data_dir() / "unix-autoupdate-on-logout.flag"
+
+
+def _get_agent_update_session_path() -> Path:
+    return get_runtime_data_dir() / "unix-agent-update-session.json"
+
+
+def _load_agent_update_session() -> Dict[str, Any]:
+    path = _get_agent_update_session_path()
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_agent_update_session(data: Dict[str, Any]) -> None:
+    path = _get_agent_update_session_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / ".unix-agent-update-session.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(str(tmp), str(path))
+    except OSError:
+        pass
+
+
+def _run_agent_update_background() -> str:
+    """Run update-helper in background, streaming output to session file. Returns session_id."""
+    session_id = secrets.token_hex(8)
+    helper = get_update_helper_path()
+    script_dir = str(get_script_path().parent)
+    append_ui_log(f"peer-update | session {session_id} helper={helper} script_dir={script_dir}")
+    if not helper.exists():
+        append_ui_log(f"peer-update | helper missing at {helper}")
+        try:
+            _save_agent_update_session({
+                "session_id": session_id,
+                "stage": "failed",
+                "log": [],
+                "error": "Update helper not found",
+                "started_at": int(time.time()),
+                "updated_at": int(time.time()),
+            })
+        except Exception as e:
+            append_ui_log(f"peer-update | save session failed: {type(e).__name__}: {e}")
+            raise
+        return session_id
+    try:
+        _save_agent_update_session({
+            "session_id": session_id,
+            "stage": "running",
+            "log": [],
+            "error": None,
+            "started_at": int(time.time()),
+            "updated_at": int(time.time()),
+        })
+    except Exception as e:
+        append_ui_log(f"peer-update | save session failed: {type(e).__name__}: {e}")
+        raise
+
+    def _do_update() -> None:
+        log_lines: List[str] = []
+        try:
+            cfg = load_config()
+            proc_env = {**os.environ, **_update_helper_env(cfg)}
+            proc = subprocess.Popen(
+                [str(helper), script_dir, "update", "no-restart"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=proc_env,
+            )
+            assert proc.stdout
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip("\n")
+                if line:
+                    log_lines.append(line)
+                    sess = _load_agent_update_session()
+                    sess["log"] = list(log_lines)
+                    sess["updated_at"] = int(time.time())
+                    _save_agent_update_session(sess)
+            proc.wait()
+            sess = _load_agent_update_session()
+            sess["log"] = list(log_lines)
+            sess["stage"] = "done" if proc.returncode == 0 else "failed"
+            sess["error"] = None if proc.returncode == 0 else f"Exit code {proc.returncode}"
+            sess["updated_at"] = int(time.time())
+            _save_agent_update_session(sess)
+            if proc.returncode == 0:
+                time.sleep(2)
+                for u in ("unix-monitor-ui.service", "unix-monitor-scheduler.timer", "unix-monitor-smart-helper.timer", "unix-monitor-backup-helper.timer", "unix-monitor-system-log-helper.timer"):
+                    _run_cmd(["systemctl", "restart", u], timeout_sec=10)
+        except Exception as e:
+            log_lines.append(f"Error: {e}")
+            sess = _load_agent_update_session()
+            sess["log"] = list(log_lines)
+            sess["stage"] = "failed"
+            sess["error"] = str(e)
+            sess["updated_at"] = int(time.time())
+            _save_agent_update_session(sess)
+
+    threading.Thread(target=_do_update, daemon=True).start()
+    return session_id
+
+
+def _maybe_run_autoupdate(defer_if_user_logged_in: bool = True) -> None:
+    """Background: if autoupdate enabled, check for updates. If available and not deferred, run update. Throttled.
+    When defer_if_user_logged_in=True (page load), only check and save result; do not apply.
+    When defer_if_user_logged_in=False (e.g. logout), apply update if available."""
+    try:
+        cfg = load_config()
+        result = _ensure_fresh_update_check(cfg=cfg, force=False, ttl_sec=AUTOUPDATE_CHECK_INTERVAL_SEC)
+        if defer_if_user_logged_in:
+            return
+        if not cfg.get("autoupdate_enabled"):
+            return
+        if not result.get("update_available"):
+            return
+        helper = get_update_helper_path()
+        if not helper.exists():
+            return
+        script_dir = str(get_script_path().parent)
+        rc, out = _run_cmd([str(helper), script_dir, "update", "no-restart"], timeout_sec=30, env=_update_helper_env(cfg))
+        if rc != 0:
+            append_ui_log(f"autoupdate | failed: {out.strip() or rc}")
+            return
+        append_ui_log(f"autoupdate | updated to {result.get('latest_version', '?')}")
+
+        def _delayed_restart() -> None:
+            time.sleep(2)
+            for u in ("unix-monitor-ui.service", "unix-monitor-scheduler.timer", "unix-monitor-smart-helper.timer", "unix-monitor-backup-helper.timer", "unix-monitor-system-log-helper.timer"):
+                _run_cmd(["systemctl", "restart", u], timeout_sec=10)
+
+        threading.Thread(target=_delayed_restart, daemon=True).start()
+    except Exception:
+        pass
+
+
 def get_task_guide_images() -> Dict[str, Path]:
     base = get_script_path().parent
     return {
@@ -3071,12 +3472,12 @@ def get_task_guide_images() -> Dict[str, Path]:
 
 
 def get_task_status_path() -> Path:
-    return get_runtime_data_dir() / "synology-task-status.json"
+    return get_runtime_data_dir() / "unix-task-status.json"
 
 
 def _write_task_status(payload: Dict[str, Any]) -> None:
     path = get_task_status_path()
-    tmp = path.parent / ".synology-task-status.json.tmp"
+    tmp = path.parent / ".unix-task-status.json.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -3111,15 +3512,15 @@ def _detect_task_hint() -> str:
 
 
 def get_history_path() -> Path:
-    return get_runtime_data_dir() / "synology-monitor-history.json"
+    return get_runtime_data_dir() / "unix-monitor-history.json"
 
 
 def get_monitor_state_path() -> Path:
-    return get_runtime_data_dir() / "synology-monitor-state.json"
+    return get_runtime_data_dir() / "unix-monitor-state.json"
 
 
 def get_schedule_state_path() -> Path:
-    return get_runtime_data_dir() / "synology-schedule-state.json"
+    return get_runtime_data_dir() / "unix-schedule-state.json"
 
 
 def _load_monitor_state() -> Dict[str, Dict[str, Any]]:
@@ -3142,7 +3543,7 @@ def _load_monitor_state() -> Dict[str, Dict[str, Any]]:
 
 def _save_monitor_state(state: Dict[str, Dict[str, Any]]) -> None:
     p = get_monitor_state_path()
-    tmp = p.parent / ".synology-monitor-state.json.tmp"
+    tmp = p.parent / ".unix-monitor-state.json.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -3186,7 +3587,7 @@ def _touch_scheduled_run(monitor_name: str = "") -> None:
     state["last_run_ts"] = now
     if monitor_name:
         state.setdefault("per_monitor", {})[monitor_name] = now
-    tmp = p.parent / ".synology-schedule-state.json.tmp"
+    tmp = p.parent / ".unix-schedule-state.json.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -3210,44 +3611,123 @@ def _read_schedule_state() -> Dict[str, Any]:
 
 
 def _scheduler_pid_path() -> Path:
-    return Path("/var/packages/synology-monitor/target/scheduler.pid")
+    return Path("/var/lib/unix-monitor/scheduler.pid")
 
 
 def _scheduler_service_path() -> Path:
-    return Path("/var/packages/synology-monitor/scripts/start-stop-status")
+    return Path("/usr/local/bin/unix-monitor-service")
+
+
+def _systemd_show_properties(unit: str, props: List[str]) -> Dict[str, str]:
+    if not unit or not props:
+        return {}
+    cmd = ["systemctl", "show", unit, "--no-pager"]
+    for prop in props:
+        cmd.extend(["-p", prop])
+    rc, out = _run_cmd(cmd, timeout_sec=8)
+    if rc != 0:
+        return {}
+    data: Dict[str, str] = {}
+    for ln in (out or "").splitlines():
+        if "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        if k and k not in data:
+            data[k] = v.strip()
+    return data
+
+
+def _systemd_timer_status(timer_unit: str) -> Dict[str, str]:
+    keys = ["LoadState", "ActiveState", "SubState", "NextElapseUSecRealtime", "LastTriggerUSec", "UnitFileState"]
+    data = _systemd_show_properties(timer_unit, keys)
+    if not data:
+        return {
+            "load_state": "unknown",
+            "active_state": "unknown",
+            "sub_state": "unknown",
+            "next": "n/a",
+            "last": "n/a",
+            "unit_file_state": "unknown",
+        }
+    return {
+        "load_state": data.get("LoadState", "unknown"),
+        "active_state": data.get("ActiveState", "unknown"),
+        "sub_state": data.get("SubState", "unknown"),
+        "next": data.get("NextElapseUSecRealtime", "n/a"),
+        "last": data.get("LastTriggerUSec", "n/a"),
+        "unit_file_state": data.get("UnitFileState", "unknown"),
+    }
 
 
 def _scheduler_status_data(cfg: Dict[str, Any]) -> Dict[str, Any]:
     interval = int(cfg.get("cron_interval_minutes", 60) or 60)
     cron_enabled = bool(cfg.get("cron_enabled", False))
-    pid_path = _scheduler_pid_path()
-    pid_text = "missing"
-    running = False
-    if pid_path.exists():
-        try:
-            pid = int(pid_path.read_text(encoding="utf-8", errors="ignore").strip() or "0")
-            pid_text = str(pid) if pid > 0 else "invalid"
-            if pid > 0:
-                try:
-                    os.kill(pid, 0)
-                    running = True
-                except OSError:
-                    running = False
-        except (OSError, ValueError):
-            pid_text = "invalid"
+    backend = str(cfg.get("scheduler_backend", "cron")).strip().lower()
+    if backend not in ("systemd", "cron"):
+        backend = "cron"
+    cfg_path = str(get_config_path())
+    runtime_dir = str(get_runtime_data_dir())
     state = _read_schedule_state()
     last_ts = int(state.get("last_run_ts", 0) or 0)
     last_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_ts)) if last_ts else "never"
     due_text = "yes" if _is_scheduled_due(interval) else "no"
     helper_ok, helper_msg = get_smart_helper_status()
-    lines = [
-        f"Scheduler process: {'running' if running else 'not running'} (pid={pid_text})",
-        f"Automatic checks enabled (global): {'yes' if cron_enabled else 'no'}",
-        f"Global fallback interval: {interval} minute(s)",
-        f"Last scheduled run: {last_text}",
-        f"SMART elevated cache: {'active' if helper_ok else 'inactive'} | {helper_msg}",
-        f"Scheduler service script: {_scheduler_service_path()}",
-    ]
+    lines: List[str]
+    scheduler_process = "n/a"
+    scheduler_timer = "n/a"
+    timer_next = "n/a"
+    timer_last = "n/a"
+    pid_text = "missing"
+    if backend == "systemd":
+        t = _systemd_timer_status("unix-monitor-scheduler.timer")
+        timer_running = t.get("active_state") == "active"
+        scheduler_timer = (
+            f"{'active' if timer_running else 'inactive'} "
+            f"(state={t.get('active_state')}/{t.get('sub_state')}, unit={t.get('unit_file_state')})"
+        )
+        timer_next = str(t.get("next", "n/a"))
+        timer_last = str(t.get("last", "n/a"))
+        lines = [
+            f"Scheduler backend: {backend}",
+            f"Scheduler timer: {scheduler_timer}",
+            "Scheduler service mode: systemd oneshot (no persistent PID expected)",
+            f"Automatic checks enabled (global): {'yes' if cron_enabled else 'no'}",
+            f"Configured scheduler interval: {interval} minute(s)",
+            f"Timer next trigger: {timer_next}",
+            f"Timer last trigger: {timer_last}",
+            f"Last scheduled run (state file): {last_text}",
+            f"SMART elevated cache: {'active' if helper_ok else 'inactive'} | {helper_msg}",
+            f"Config file: {cfg_path}",
+            f"Runtime data dir: {runtime_dir}",
+            f"Scheduler service script: {_scheduler_service_path()}",
+        ]
+    else:
+        pid_path = _scheduler_pid_path()
+        running = False
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8", errors="ignore").strip() or "0")
+                pid_text = str(pid) if pid > 0 else "invalid"
+                if pid > 0:
+                    try:
+                        os.kill(pid, 0)
+                        running = True
+                    except OSError:
+                        running = False
+            except (OSError, ValueError):
+                pid_text = "invalid"
+        scheduler_process = f"{'running' if running else 'not running'} (pid={pid_text})"
+        lines = [
+            f"Scheduler backend: {backend}",
+            f"Scheduler process: {scheduler_process}",
+            f"Automatic checks enabled (global): {'yes' if cron_enabled else 'no'}",
+            f"Configured scheduler interval: {interval} minute(s)",
+            f"Last scheduled run: {last_text}",
+            f"SMART elevated cache: {'active' if helper_ok else 'inactive'} | {helper_msg}",
+            f"Config file: {cfg_path}",
+            f"Runtime data dir: {runtime_dir}",
+            f"Scheduler service script: {_scheduler_service_path()}",
+        ]
     per_mon = state.get("per_monitor", {})
     monitors = cfg.get("monitors", [])
     if monitors:
@@ -3271,13 +3751,19 @@ def _scheduler_status_data(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "due": due,
             })
     return {
+        "backend": backend,
         "global_enabled": cron_enabled,
         "global_interval_minutes": interval,
         "last_scheduled_run": last_text,
         "is_due": due_text,
-        "scheduler_process": f"{'running' if running else 'not running'} (pid={pid_text})",
+        "scheduler_process": scheduler_process if backend != "systemd" else "systemd oneshot",
+        "scheduler_timer": scheduler_timer,
+        "timer_next": timer_next,
+        "timer_last": timer_last,
         "smart_cache_active": helper_ok,
         "smart_cache_message": helper_msg,
+        "config_path": cfg_path,
+        "runtime_dir": runtime_dir,
         "service_script": str(_scheduler_service_path()),
         "monitor_rows": per_monitor_rows,
         "raw_text": "\n".join(lines),
@@ -3304,7 +3790,7 @@ def _load_history() -> List[Dict[str, Any]]:
 
 def _save_history(entries: List[Dict[str, Any]]) -> None:
     p = get_history_path()
-    tmp = p.parent / ".synology-monitor-history.json.tmp"
+    tmp = p.parent / ".unix-monitor-history.json.tmp"
     trimmed = entries[-HISTORY_MAX_ENTRIES:]
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -3379,9 +3865,8 @@ def _tail_text_file(path: Path, max_lines: int = 120) -> str:
     if not path.exists():
         return f"{path}: missing"
     try:
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        tail = "".join(lines[-max_lines:]).strip()
+        lines = _read_tail_lines(path, max_lines=max_lines)
+        tail = "".join(lines).strip()
         return tail if tail else f"{path}: empty"
     except OSError as e:
         return f"{path}: {type(e).__name__}: {e}"
@@ -3398,43 +3883,60 @@ def _extract_error_lines(text: str, max_lines: int = 80) -> str:
 def _build_task_diag_text(cfg: Dict[str, Any]) -> str:
     interval = int(cfg.get("cron_interval_minutes", 60) or 60)
     cron_enabled = bool(cfg.get("cron_enabled", False))
+    backend = str(cfg.get("scheduler_backend", "cron")).strip().lower()
+    if backend not in ("systemd", "cron"):
+        backend = "cron"
     sched_state = _read_schedule_state()
     last_sched = int(sched_state.get("last_run_ts", 0) or 0)
     last_sched_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sched)) if last_sched else "never"
 
-    pid_path = _scheduler_pid_path()
     pid_val = 0
     running = False
-    if pid_path.exists():
-        try:
-            pid_val = int(pid_path.read_text(encoding="utf-8", errors="ignore").strip() or "0")
-            if pid_val > 0:
-                try:
-                    os.kill(pid_val, 0)
-                    running = True
-                except OSError:
-                    running = False
-        except (OSError, ValueError):
-            pid_val = 0
+    timer_diag = ""
+    if backend == "systemd":
+        t = _systemd_timer_status("unix-monitor-scheduler.timer")
+        running = t.get("active_state") == "active"
+        timer_diag = (
+            f"- scheduler timer: {'active' if running else 'inactive'} "
+            f"(state={t.get('active_state')}/{t.get('sub_state')}, unit={t.get('unit_file_state')})\n"
+            "- scheduler service mode: systemd oneshot (no persistent PID expected)\n"
+            f"- timer next trigger: {t.get('next', 'n/a')}\n"
+            f"- timer last trigger: {t.get('last', 'n/a')}\n"
+        )
+    else:
+        pid_path = _scheduler_pid_path()
+        if pid_path.exists():
+            try:
+                pid_val = int(pid_path.read_text(encoding="utf-8", errors="ignore").strip() or "0")
+                if pid_val > 0:
+                    try:
+                        os.kill(pid_val, 0)
+                        running = True
+                    except OSError:
+                        running = False
+            except (OSError, ValueError):
+                pid_val = 0
 
     helper_ok, helper_msg = get_smart_helper_status()
     cache = _read_smart_cache() or {}
     helper_checked = int(cache.get("checked_at", 0) or 0)
     helper_checked_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(helper_checked)) if helper_checked else "never"
 
-    rc, out = _run_cmd(["crontab", "-l"], timeout_sec=8)
-    if rc == 0:
-        cron_lines = [ln for ln in out.splitlines() if "synology-monitor" in ln]
-        cron_text = "\n".join(cron_lines) if cron_lines else "(no synology-monitor crontab entries)"
-    else:
-        cron_text = f"(crontab unavailable rc={rc})"
+    cron_text = "(cron backend not selected)"
+    if backend == "cron":
+        rc, out = _run_cmd(["crontab", "-l"], timeout_sec=8)
+        if rc == 0:
+            cron_lines = [ln for ln in out.splitlines() if "unix-monitor" in ln]
+            cron_text = "\n".join(cron_lines) if cron_lines else "(no unix-monitor crontab entries)"
+        else:
+            cron_text = f"(crontab unavailable rc={rc})"
 
     auto_task = _read_task_status()
     auto_task_text = json.dumps(auto_task, indent=2) if auto_task else "No auto-create task attempts recorded."
 
-    helper_log = Path("/var/packages/synology-monitor/target/smart-helper.log")
-    backup_helper_log = Path("/var/packages/synology-monitor/target/backup-helper.log")
-    sched_log = Path("/var/packages/synology-monitor/target/monitor-scheduler.log")
+    helper_log = Path("/var/lib/unix-monitor/smart-helper.log")
+    backup_helper_log = Path("/var/lib/unix-monitor/backup-helper.log")
+    sched_log = Path("/var/lib/unix-monitor/monitor-scheduler.log")
 
     backup_cache = _read_backup_cache() or {}
     backup_checked = int(backup_cache.get("checked_at", 0) or 0)
@@ -3453,17 +3955,24 @@ def _build_task_diag_text(cfg: Dict[str, Any]) -> str:
         per_mon_lines.append(f"  {mn}: interval={mi}m, cron={'on' if mc else 'off'}, last_run={mlr_text}")
     per_mon_text = "\n".join(per_mon_lines) if per_mon_lines else "  (no monitors)"
 
+    scheduler_line = (
+        f"- scheduler process: {'running' if running else 'not running'} (pid={pid_val or 'n/a'})\n"
+        if backend == "cron"
+        else timer_diag
+    )
+
     return (
         "Automation Overview\n"
+        f"- scheduler backend: {backend}\n"
         f"- automatic checks enabled (global): {'yes' if cron_enabled else 'no'}\n"
-        f"- global fallback interval: {interval} minute(s)\n"
-        f"- scheduler process: {'running' if running else 'not running'} (pid={pid_val or 'n/a'})\n"
+        f"- configured scheduler interval: {interval} minute(s)\n"
+        f"{scheduler_line}"
         f"- last scheduled run: {last_sched_text}\n"
         f"\nPer-monitor schedule:\n{per_mon_text}\n"
         f"- SMART helper cache: {'active' if helper_ok else 'inactive'} (last: {helper_checked_text})\n"
         f"- SMART helper message: {helper_msg}\n"
         f"- Backup helper cache: last={backup_checked_text} overall={backup_overall}\n\n"
-        "Crontab entries (synology-monitor)\n"
+        "Crontab entries (unix-monitor; cron backend only)\n"
         f"{cron_text}\n\n"
         "Auto-create task status\n"
         f"{auto_task_text}\n\n"
@@ -3478,9 +3987,9 @@ def _build_task_diag_text(cfg: Dict[str, Any]) -> str:
 
 def _build_system_diag_text() -> str:
     ui_log = _tail_text_file(get_ui_log_path(), max_lines=200)
-    helper_log = _tail_text_file(Path("/var/packages/synology-monitor/target/smart-helper.log"), max_lines=160)
-    backup_helper_log_text = _tail_text_file(Path("/var/packages/synology-monitor/target/backup-helper.log"), max_lines=100)
-    sched_log = _tail_text_file(Path("/var/packages/synology-monitor/target/monitor-scheduler.log"), max_lines=160)
+    helper_log = _tail_text_file(Path("/var/lib/unix-monitor/smart-helper.log"), max_lines=160)
+    backup_helper_log_text = _tail_text_file(Path("/var/lib/unix-monitor/backup-helper.log"), max_lines=100)
+    sched_log = _tail_text_file(Path("/var/lib/unix-monitor/monitor-scheduler.log"), max_lines=160)
     sys_cache = _read_system_log_cache() or {}
     cache_checked = int(sys_cache.get("checked_at", 0) or 0)
     cache_checked_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cache_checked)) if cache_checked else "never"
@@ -3516,7 +4025,6 @@ def _build_diag_text(
     log_time_scope: str = "all",
     log_time_from: str = "",
     log_time_to: str = "",
-    log_word: str = "",
 ) -> str:
     view = (diag_view or "logs").strip().lower()
     if view == "task":
@@ -3556,7 +4064,6 @@ def _build_diag_text(
         log_time_scope=log_time_scope,
         log_time_from=log_time_from,
         log_time_to=log_time_to,
-        log_word=log_word,
     )
 
 
@@ -3565,7 +4072,7 @@ def _build_live_snapshot() -> Dict[str, Any]:
     history = _load_history()
     state = _load_monitor_state()
 
-    channels_order = ("smart", "storage", "ping", "port", "dns", "backup")
+    channels_order = ("smart", "storage", "ping", "port", "dns", "backup", "service")
     used_channels: List[str] = []
     for m in cfg.get("monitors", []):
         mode = str(m.get("check_mode", "smart")).lower()
@@ -3652,11 +4159,13 @@ def _build_live_snapshot() -> Dict[str, Any]:
             age = now - best_seen if best_seen else 9999
             peer_status = "online" if age < PEER_HEALTH_TIMEOUT_SEC else "offline"
             peer_latency = pc_info.get("latency_ms")
-            p_url = str(pc_info.get("url", "") or "").strip().rstrip("/")
-            if peer_status == "offline" and p_url and token:
+            p_url_raw = str(pc_info.get("url", "") or "").strip().rstrip("/")
+            p_url = p_url_raw
+            if peer_status == "offline" and p_url_raw and token:
                 try:
+                    p_url = _resolve_peer_url_from_stored(p_url_raw, token, timeout=5)
                     t0 = time.time()
-                    hst, _ = _peer_http_request(p_url, token, "GET", "/api/peer/health", timeout=3)
+                    hst, _ = _peer_http_request(p_url, token, "GET", "/api/peer/health", timeout=5)
                     if hst < 300:
                         peer_status = "online"
                         peer_latency = round((time.time() - t0) * 1000)
@@ -3674,12 +4183,12 @@ def _build_live_snapshot() -> Dict[str, Any]:
                 "url": p_url,
                 "open_url": _peer_url_for_open(p_url),
                 "version": str(pc_info.get("version", "") or ""),
+                "agent_platform": str(snap.get("platform", "") or ""),
+                "agent_platform_family": str(snap.get("platform_family", "") or ""),
                 "source_platform": source_platform,
                 "update_supported": update_supported,
                 "update_block_reason": update_block_reason,
                 "unknown_update_allowed": _is_unknown_update_override_enabled(cfg, peer_id),
-                "agent_platform": str(snap.get("platform", "") or ""),
-                "agent_platform_family": str(snap.get("platform_family", "") or ""),
             })
             peer_history = snap.get("history", [])
             peer_state_raw = snap.get("state", {})
@@ -3767,6 +4276,125 @@ def _build_live_snapshot() -> Dict[str, Any]:
     }
 
 
+def _build_live_snapshot_for_source(source_id: str = "local") -> Dict[str, Any]:
+    """Build a live snapshot scoped to one source context (local or a peer instance_id)."""
+    base = _build_live_snapshot()
+    cfg = load_config()
+    local_name = str(cfg.get("instance_name", "") or "").strip() or "Local"
+    sid = (source_id or "local").strip()
+    if sid == "local":
+        base["source_id"] = "local"
+        base["source_name"] = local_name
+        base["source_scope"] = "local"
+        return base
+
+    if not _is_valid_peer_instance_id(sid):
+        base["source_id"] = "local"
+        base["source_name"] = local_name
+        base["source_scope"] = "local"
+        return base
+
+    snap = _load_peer_snapshot(sid)
+    if not snap:
+        base["source_id"] = "local"
+        base["source_name"] = local_name
+        base["source_scope"] = "local"
+        return base
+
+    if sid not in _registered_peer_instance_ids(cfg):
+        base["source_id"] = "local"
+        base["source_name"] = local_name
+        base["source_scope"] = "local"
+        return base
+
+    channels_order = ("smart", "storage", "ping", "port", "dns", "backup", "service")
+    peer_name = str(snap.get("instance_name", "") or sid[:8])
+    peer_history = snap.get("history", [])
+    peer_state_raw = snap.get("state", {})
+    peer_state: Dict[str, Dict[str, Any]] = {}
+    if isinstance(peer_state_raw, dict):
+        for mk, mv in peer_state_raw.items():
+            k = str(mk or "").strip()
+            if not k:
+                continue
+            peer_state[k] = mv if isinstance(mv, dict) else {}
+    elif isinstance(peer_state_raw, list):
+        # Backward-compatible read path: older peers may serialize state as a list.
+        for item in peer_state_raw:
+            if not isinstance(item, dict):
+                continue
+            mk = (
+                str(item.get("monitor", "") or "").strip()
+                or str(item.get("name", "") or "").strip()
+                or str(item.get("monitor_name", "") or "").strip()
+            )
+            if not mk:
+                continue
+            peer_state[mk] = item
+    peer_monitors_cfg = snap.get("monitors", [])
+
+    used_channels: List[str] = []
+    for pm in peer_monitors_cfg:
+        mode = str(pm.get("check_mode", "smart")).lower()
+        if mode in channels_order and mode not in used_channels:
+            used_channels.append(mode)
+    for e in peer_history:
+        ch = str(e.get("channel", "")).lower()
+        if ch in channels_order and ch not in used_channels:
+            used_channels.append(ch)
+    used_channels = [c for c in channels_order if c in used_channels] or ["smart", "storage"]
+
+    channel_data: Dict[str, Dict[str, Any]] = {}
+    for channel in used_channels:
+        items = [e for e in peer_history if str(e.get("channel")) == channel]
+        latest = items[-1] if items else {}
+        st = str(latest.get("status", "unknown"))
+        pct = {"up": 100, "warning": 55, "down": 15}.get(st, 0)
+        ts = int(latest.get("ts", 0) or 0)
+        channel_data[channel] = {
+            "status": st,
+            "pct": pct,
+            "ts": ts,
+            "history_statuses": [str(x.get("status", "unknown")) for x in items[-20:]],
+        }
+
+    peer_monitor_latest: Dict[str, Dict[str, Any]] = {}
+    for e in peer_history:
+        mn = str(e.get("monitor", ""))
+        if mn:
+            peer_monitor_latest[mn] = e
+
+    monitors: List[Dict[str, Any]] = []
+    for pm in peer_monitors_cfg:
+        pname = _peer_monitor_name(pm, "?")
+        pmode = _peer_monitor_mode(pm)
+        platest = peer_monitor_latest.get(pname, {})
+        pst = str(platest.get("status", "unknown"))
+        pping = platest.get("ping_ms", "n/a")
+        pts = int(platest.get("ts", 0) or 0)
+        ps = peer_state.get(pname, {})
+        monitors.append(
+            {
+                "name": pname,
+                "mode": pmode,
+                "status": pst,
+                "ping_ms": pping,
+                "ts": pts,
+                "banner": str(ps.get("banner", "") or ""),
+                "output": str(ps.get("output", "") or ""),
+                "level": "err" if str(ps.get("level", "ok")) == "err" else "ok",
+                "origin": peer_name,
+            }
+        )
+
+    base["channels"] = channel_data
+    base["monitors"] = monitors
+    base["source_id"] = sid
+    base["source_name"] = peer_name
+    base["source_scope"] = "remote"
+    return base
+
+
 def get_smart_helper_status() -> Tuple[bool, str]:
     if os.geteuid() == 0:
         return True, "Package is running as root."
@@ -3800,7 +4428,7 @@ def _ui_auto_create_task_beta() -> str:
     summary = "Auto-create task failed; use manual Task Scheduler setup."
 
     # Attempt 1: create non-root cron entry for current package user.
-    cron_line = f"*/5 * * * * {helper_script} # synology-monitor smart helper beta"
+    cron_line = f"*/5 * * * * {helper_script} # unix-monitor smart helper beta"
     rc, out = _run_cmd(["crontab", "-l"], timeout_sec=8)
     if rc == 127:
         attempts.append("crontab: command not found")
@@ -3968,9 +4596,6 @@ def load_config() -> Dict[str, Any]:
     if internet_dns_servers != str(cfg.get("internet_check_dns_servers", "") or "").strip():
         cfg["internet_check_dns_servers"] = internet_dns_servers
         changed = True
-    if "update_from_main" not in cfg:
-        cfg["update_from_main"] = False
-        changed = True
     monitors = [m for m in cfg.get("monitors", []) if isinstance(m, dict)]
     for monitor in monitors:
         cleaned = normalize_kuma_url(monitor.get("kuma_url", ""))
@@ -3991,7 +4616,7 @@ def load_config() -> Dict[str, Any]:
     for m in reversed(monitors):
         name = str(m.get("name", "")).strip()
         if not name:
-            name = f"{str(m.get('check_mode', 'smart')).lower()}-synology-check"
+            name = f"{str(m.get('check_mode', 'smart')).lower()}-unix-check"
             m["name"] = name
             changed = True
         if name in seen:
@@ -4004,15 +4629,20 @@ def load_config() -> Dict[str, Any]:
         cfg["monitors"] = deduped
         changed = True
 
+    if _enforce_rollout_agent_config(cfg):
+        changed = True
+
     if changed:
         save_config(cfg, reapply_cron=False)
     return cfg
 
 
 def save_config(cfg: Dict[str, Any], reapply_cron: bool = True) -> None:
+    if isinstance(cfg.get("peers"), list):
+        cfg["peers"] = _dedupe_peers_by_instance_id(cfg["peers"])
     path = get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.parent / ".synology-monitor.json.tmp"
+    tmp_path = path.parent / ".unix-monitor.json.tmp"
     try:
         fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, CONFIG_FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -4090,9 +4720,12 @@ def apply_cron_schedule(cfg: Dict[str, Any]) -> bool:
     return add_cron_entry(int(cfg.get("cron_interval_minutes", 60)))
 
 
-def _run_cmd(cmd: List[str], timeout_sec: int = 20) -> Tuple[int, str]:
+def _run_cmd(cmd: List[str], timeout_sec: int = 20, env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec, check=False)
+        kwargs: Dict[str, Any] = dict(capture_output=True, text=True, timeout=timeout_sec, check=False)
+        if env is not None:
+            kwargs["env"] = {**os.environ, **env}
+        p = subprocess.run(cmd, **kwargs)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except FileNotFoundError:
         return 127, f"Command not found: {cmd[0]}"
@@ -4155,11 +4788,16 @@ def _severity(status: str) -> int:
     return {"up": 0, "warning": 1, "down": 2}.get(status, 2)
 
 
-def _has_synology_tools() -> Tuple[bool, str]:
-    rc, _ = _run_cmd(["synospace", "--help"], timeout_sec=6)
+def _has_native_storage_probe() -> Tuple[bool, str]:
+    rc, out = _run_cmd(["synospace", "--help"], timeout_sec=6)
+    if rc == 0:
+        return True, ""
     if rc == 127:
-        return False, "synospace not found (run this on a Synology NAS)"
-    return True, ""
+        return False, "native storage probe unavailable on this host; using Unix fallback checks"
+    if rc == 124:
+        return False, "native storage probe timed out; using Unix fallback checks"
+    detail = out.strip() or f"exit code {rc}"
+    return False, f"native storage probe unavailable ({detail}); using Unix fallback checks"
 
 
 def _check_storage_fallback(debug: bool = False) -> Tuple[str, List[str]]:
@@ -4167,8 +4805,14 @@ def _check_storage_fallback(debug: bool = False) -> Tuple[str, List[str]]:
     lines: List[str] = []
     fs_stats: List[Tuple[int, str, str]] = []
 
-    rc, out = _run_cmd(["df", "-P"], timeout_sec=10)
+    df_scope = "local filesystems"
+    rc, out = _run_cmd(["df", "-P", "-l"], timeout_sec=8)
     if rc != 0:
+        df_scope = "all filesystems"
+        rc, out = _run_cmd(["df", "-P"], timeout_sec=12)
+    if rc != 0:
+        if rc == 124:
+            return "warning", ["Fallback df timed out while collecting storage usage"]
         return "down", [f"Fallback df failed: {out.strip()}"]
 
     for line in out.splitlines()[1:]:
@@ -4206,7 +4850,7 @@ def _check_storage_fallback(debug: bool = False) -> Tuple[str, List[str]]:
     fs_count = len(fs_stats)
     if fs_stats:
         top_pct, top_mp, top_fs = sorted(fs_stats, reverse=True)[0]
-        lines.insert(0, f"Fallback probe: scanned {fs_count} filesystems, max usage {top_pct}% on {top_mp} ({top_fs})")
+        lines.insert(0, f"Fallback probe ({df_scope}): scanned {fs_count} filesystems, max usage {top_pct}% on {top_mp} ({top_fs})")
         nas_volumes = sorted([(pct, mpoint, fs) for (pct, mpoint, fs) in fs_stats if NAS_VOLUME_PATTERN.match(mpoint)], key=lambda x: x[1])
         other_mounts = sorted([(pct, mpoint, fs) for (pct, mpoint, fs) in fs_stats if not NAS_VOLUME_PATTERN.match(mpoint)], key=lambda x: x[1])
 
@@ -4332,7 +4976,7 @@ def check_smart(configured_devices: List[str], debug: bool = False) -> Tuple[str
     if not target_devices and not nvme_devices:
         return "down", ["No SATA/block/SCSI/NVMe devices detected"], _latency_ms(t0)
 
-    # Preserve original Synology behavior: detect sequence gaps that often mean missing disks.
+    # Preserve original behavior: detect sequence gaps that often mean missing disks.
     for missing in _missing_letter_devices(detected["block"], "/dev/sda"):
         lines.append(f"Disk {missing}: MISSING (expected but not detected)")
         status = "down"
@@ -4475,7 +5119,7 @@ def run_system_log_helper() -> int:
 
 
 def _detect_backup_packages() -> List[Dict[str, Any]]:
-    """Detect installed Synology backup packages."""
+    """Detect installed backup packages."""
     pkgs: List[Dict[str, Any]] = []
     known = [
         ("HyperBackup", "Hyper Backup"),
@@ -4505,7 +5149,7 @@ def _detect_backup_packages() -> List[Dict[str, Any]]:
 
 
 def _read_backup_logs(max_lines: int = 600) -> str:
-    """Read Synology backup log files. Merges file logs and synologtool output."""
+    """Read backup log files."""
     log_paths = [
         Path("/var/log/synolog/synobackup.log"),
         Path("/var/packages/HyperBackup/var/log/synolog/synobackup.log"),
@@ -4518,8 +5162,7 @@ def _read_backup_logs(max_lines: int = 600) -> str:
         try:
             if not p.exists():
                 continue
-            with open(p, encoding="utf-8", errors="ignore") as f:
-                all_lines.extend(f.readlines())
+            all_lines.extend(_read_tail_lines(p, max_lines=max_lines))
         except OSError:
             continue
     # Also try synologtool to get log entries from Synology's log database
@@ -4541,10 +5184,43 @@ def _read_backup_logs(max_lines: int = 600) -> str:
     return tail
 
 
+def _read_tail_lines(path: Path, max_lines: int = 120, max_bytes: int = 262_144) -> List[str]:
+    """Read only the tail of a text file (bounded bytes + line count)."""
+    if max_lines <= 0:
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            if file_size <= 0:
+                return []
+
+            remaining = min(file_size, max_bytes)
+            chunk_size = 4096
+            chunks: List[bytes] = []
+            newline_count = 0
+            while remaining > 0 and newline_count <= max_lines:
+                to_read = min(chunk_size, remaining)
+                remaining -= to_read
+                f.seek(file_size - (remaining + to_read), os.SEEK_SET)
+                chunk = f.read(to_read)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+
+            data = b"".join(reversed(chunks))
+        text = data.decode("utf-8", errors="ignore")
+        lines = text.splitlines(keepends=True)
+        return lines[-max_lines:] if len(lines) > max_lines else lines
+    except OSError:
+        return []
+
+
 def _parse_backup_log_tasks(log_text: str) -> Dict[str, Dict[str, Any]]:
     """Parse backup log for task statuses keyed by task name.
 
-    Synology backup logs use formats like:
+    Backup logs use formats like:
       Backup task [My Task Name] finished successfully. [12345]
       Backup task [My Task Name] has started
       Datensicherungsaufgabe [My Task Name] fehlgeschlagen
@@ -4851,7 +5527,7 @@ def run_backup_helper() -> int:
     return 0
 
 
-def _probe_backup(source_platform: str = "synology") -> Tuple[str, List[str], float]:
+def _probe_backup(source_platform: str = "unix") -> Tuple[str, List[str], float]:
     """Check backup status, reading from privileged backup-helper cache or direct probing."""
     t0 = time.time()
     lines: List[str] = []
@@ -4914,7 +5590,7 @@ def _probe_backup(source_platform: str = "synology") -> Tuple[str, List[str], fl
         else:
             lines.append("No backup tasks discovered via Hyper Backup API/logs")
             if packages:
-                lines.append("Check helper permissions or whether tasks are visible to this DSM account")
+                lines.append("Check helper permissions or whether tasks are visible to this account")
 
         overall = str(cache.get("overall", "unknown"))
         status = {"up": "up", "down": "down", "warning": "warning"}.get(overall, "warning")
@@ -4980,11 +5656,11 @@ def _probe_backup(source_platform: str = "synology") -> Tuple[str, List[str], fl
 
 def check_storage(debug: bool = False) -> Tuple[str, List[str], float]:
     t0 = time.perf_counter()
-    ok_tools, err = _has_synology_tools()
+    ok_tools, err = _has_native_storage_probe()
     if not ok_tools:
-        append_ui_log(f"storage-check | synospace unavailable | reason={err}")
+        append_ui_log(f"storage-check | native probe unavailable | reason={err}")
         fb_status, fb_lines = _check_storage_fallback(debug=debug)
-        fb_lines.insert(0, f"Synology storage command unavailable: {err}")
+        fb_lines.insert(0, err)
         return fb_status, fb_lines, _latency_ms(t0)
 
     rc, out = _run_cmd(["synospace", "--enum"], timeout_sec=20)
@@ -4993,7 +5669,7 @@ def check_storage(debug: bool = False) -> Tuple[str, List[str], float]:
         if "PermissionError" in err_text or "Permission denied" in err_text:
             append_ui_log(f"storage-check | synospace permission denied | rc={rc} | detail={err_text}")
             fb_status, fb_lines = _check_storage_fallback(debug=debug)
-            fb_lines.insert(0, "synospace permission denied; using fallback storage checks")
+            fb_lines.insert(0, "Native storage probe permission denied; using Unix fallback checks")
             return fb_status, fb_lines, _latency_ms(t0)
         append_ui_log(f"storage-check | synospace failed | rc={rc} | detail={err_text}")
         return "down", [f"Failed to retrieve storage status: {err_text}"], _latency_ms(t0)
@@ -5021,6 +5697,74 @@ def check_storage(debug: bool = False) -> Tuple[str, List[str], float]:
     if debug:
         print(f"    [storage] synospace lines: {len(out.splitlines())}")
     return status, lines, _latency_ms(t0)
+
+
+def get_mounts() -> List[Tuple[str, str, str]]:
+    result: List[Tuple[str, str, str]] = []
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    device, mpoint, fstype = parts[0], parts[1], parts[2]
+                    if mpoint.startswith(("/sys", "/proc", "/dev/pts", "/run")):
+                        continue
+                    if fstype in ("sysfs", "proc", "devtmpfs", "tmpfs", "cgroup", "cgroup2"):
+                        continue
+                    result.append((device, mpoint, fstype))
+    except FileNotFoundError:
+        pass
+    return result
+
+
+def check_mount_accessible(mount_point: str) -> Tuple[bool, Optional[str], float]:
+    resolved = os.path.realpath(mount_point)
+    if resolved != os.path.normpath(mount_point):
+        return False, "Symlink or path traversal detected", 0.0
+    path = Path(resolved)
+    if not path.exists():
+        return False, "Path does not exist", 0.0
+    if not path.is_dir():
+        return False, "Not a directory", 0.0
+    t0 = time.perf_counter()
+    try:
+        os.statvfs(mount_point)
+        return True, None, _latency_ms(t0)
+    except PermissionError:
+        return False, "Permission denied (statvfs)", _latency_ms(t0)
+    except OSError as e:
+        return False, str(e), _latency_ms(t0)
+
+
+def check_mounts_status(
+    mounts: List[Tuple[str, str, str]],
+    debug: bool = False,
+) -> Tuple[str, List[str], float]:
+    ok_list: List[str] = []
+    fail_list: List[Tuple[str, str]] = []
+    max_latency_ms = 0.0
+
+    for _dev, mpoint, fstype in mounts:
+        ok, err, lat_ms = check_mount_accessible(mpoint)
+        max_latency_ms = max(max_latency_ms, lat_ms)
+        if debug:
+            res = "OK" if ok else f"FAIL: {err or 'unreachable'}"
+            print(f"    [mount] {mpoint} ({fstype}) -> {res} ({lat_ms:.2f}ms)")
+        if ok:
+            ok_list.append(f"{mpoint} ({fstype})")
+        else:
+            fail_list.append((mpoint, err or "unreachable"))
+
+    if not fail_list:
+        status = "up"
+        lines = [f"All {len(ok_list)} mount(s) healthy", *ok_list]
+    elif not ok_list:
+        status = "down"
+        lines = [f"All {len(fail_list)} mount(s) down", *[f"{m}: {e}" for m, e in fail_list]]
+    else:
+        status = "warning"
+        lines = [f"{len(ok_list)} OK, {len(fail_list)} down", *[f"{m}: {e}" for m, e in fail_list]]
+    return status, lines, max_latency_ms
 
 
 def check_host(mode: str, devices: List[str], debug: bool = False) -> Tuple[str, str, float]:
@@ -5088,11 +5832,103 @@ def _probe_dns(name: str, dns_server: str = "") -> Tuple[str, List[str], float]:
         return "down", [f"DNS lookup failed for {target}: {type(e).__name__}: {e}"], _latency_ms(t0)
 
 
+def _split_service_names(raw: str) -> List[str]:
+    vals = [x.strip() for x in str(raw or "").replace(";", ",").split(",")]
+    uniq: List[str] = []
+    for name in vals:
+        if name and name not in uniq:
+            uniq.append(name)
+    return uniq
+
+
+def _service_state_systemd(name: str) -> Optional[Tuple[str, str]]:
+    cand = [name]
+    if not name.endswith(".service"):
+        cand.append(f"{name}.service")
+    for unit in cand:
+        rc, out = _run_cmd(["systemctl", "is-active", unit], timeout_sec=5)
+        txt = (out or "").strip().splitlines()
+        status = txt[-1].strip().lower() if txt else ""
+        if rc == 0 and status in ("active", "running"):
+            return "up", f"{unit}: active"
+        if status:
+            if status in ("inactive", "failed", "deactivating", "activating", "unknown", "not-found"):
+                return "down", f"{unit}: {status}"
+            return "warning", f"{unit}: {status}"
+    return None
+
+
+def _service_state_sysv(name: str) -> Optional[Tuple[str, str]]:
+    rc, out = _run_cmd(["service", name, "status"], timeout_sec=8)
+    low = (out or "").lower()
+    if rc == 0 and ("running" in low or "started" in low):
+        return "up", f"{name}: running"
+    if "unrecognized service" in low or "not-found" in low or "not found" in low:
+        return "down", f"{name}: not found"
+    if "stopped" in low or "inactive" in low or "dead" in low or rc != 0:
+        detail = (out or "").strip().splitlines()
+        tail = detail[-1].strip() if detail else "not running"
+        return "down", f"{name}: {tail}"
+    return None
+
+
+def _probe_service(monitor: Dict[str, Any]) -> Tuple[str, List[str], float]:
+    t0 = time.perf_counter()
+    names = _split_service_names(str(monitor.get("service_names", "") or ""))
+    desc_filter = str(monitor.get("service_description_filter", "") or "").strip().lower()
+    selected = list(names)
+    if not selected and desc_filter:
+        rc, out = _run_cmd(
+            ["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"],
+            timeout_sec=10,
+        )
+        if rc == 0:
+            for ln in (out or "").splitlines():
+                row = ln.strip()
+                if not row:
+                    continue
+                parts = row.split(None, 4)
+                unit = parts[0] if parts else ""
+                desc = parts[4] if len(parts) >= 5 else ""
+                if unit and desc_filter in (unit + " " + desc).lower():
+                    base = unit[:-8] if unit.endswith(".service") else unit
+                    if base and base not in selected:
+                        selected.append(base)
+    if not selected:
+        return "down", ["Service mode requires service names or a matching description filter."], _latency_ms(t0)
+
+    worst = "up"
+    lines: List[str] = []
+    for name in selected:
+        st = _service_state_systemd(name) or _service_state_sysv(name)
+        if st is None:
+            st = ("warning", f"{name}: unable to determine status")
+        s, detail = st
+        lines.append(f"{name}: {detail}")
+        if _severity(s) > _severity(worst):
+            worst = s
+    return worst, lines, _latency_ms(t0)
+
+
 def check_host_with_monitor(mode: str, devices: List[str], monitor: Dict[str, Any], debug: bool = False) -> Tuple[str, str, float]:
     worst = "up"
     max_latency = 0.0
     sections: List[str] = []
     source_platform = _monitor_source_platform(monitor)
+
+    if mode == "mount":
+        mounts_data = monitor.get("mounts", [])
+        mounts = [
+            (x.get("device", "?"), x.get("mount_point", ""), x.get("fstype", "?"))
+            for x in mounts_data if x.get("mount_point")
+        ]
+        if not mounts:
+            mounts = get_mounts()
+        m_status, m_lines, m_lat = check_mounts_status(mounts, debug=debug)
+        max_latency = max(max_latency, m_lat)
+        if _severity(m_status) > _severity(worst):
+            worst = m_status
+        sections.append("Mounts:\n" + "\n".join(f"  - {x}" for x in m_lines))
 
     if mode == "smart":
         s_status, s_lines, s_lat = check_smart(devices, debug=debug)
@@ -5146,10 +5982,48 @@ def check_host_with_monitor(mode: str, devices: List[str], monitor: Dict[str, An
             b_lines = b_lines[:8] + [f"... and {hidden} more line(s)"]
         sections.append("Backup:\n" + "\n".join(f"  - {x}" for x in b_lines))
 
+    if mode == "service":
+        svc_status, svc_lines, svc_lat = _probe_service(monitor)
+        max_latency = max(max_latency, svc_lat)
+        if _severity(svc_status) > _severity(worst):
+            worst = svc_status
+        sections.append("Service:\n" + "\n".join(f"  - {x}" for x in svc_lines))
+
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     check_title = _check_title_for_platform(source_platform)
     msg = f"{check_title} ({mode}) = {worst} @ {now}\n" + "\n".join(sections)
     return worst, msg, max_latency
+
+
+def push_to_kuma(url: str, status: str, message: str, ping_ms: float, debug: bool = False) -> bool:
+    """Push heartbeat to Uptime Kuma. Kuma only accepts status 'up' or 'down' (anything else becomes down).
+    We map 'warning' -> 'up' so degraded-but-not-down shows green; the message conveys the warning."""
+    kuma_status = "up" if status == "warning" else status
+    base = normalize_kuma_url(url)
+    compact_msg = _compact_kuma_message(message)
+    full = f"{base}?status={kuma_status}&msg={quote(compact_msg)}&ping={ping_ms}"
+    if debug:
+        print(f"    [push] GET {base}?status=...&msg=...&ping={ping_ms}")
+    try:
+        parsed = urlparse(full)
+        host = parsed.hostname or parsed.netloc.split(":")[0]
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=10, context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        ok = resp.status in (200, 201, 204)
+        if debug:
+            print(f"    [push] response: HTTP {resp.status}")
+        conn.close()
+        return ok
+    except Exception as e:
+        if debug:
+            print(f"    [push] error: {type(e).__name__}: {e}")
+        return False
 
 
 def _compact_kuma_message(message: str, max_len: int = 600) -> str:
@@ -5210,37 +6084,6 @@ def _compact_kuma_message(message: str, max_len: int = 600) -> str:
     return compact
 
 
-def push_to_kuma(url: str, status: str, message: str, ping_ms: float, debug: bool = False) -> bool:
-    """Push heartbeat to Uptime Kuma. Kuma only accepts status 'up' or 'down' (anything else becomes down).
-    We map 'warning' -> 'up' so degraded-but-not-down shows green; the message conveys the warning."""
-    kuma_status = "up" if status == "warning" else status
-    base = normalize_kuma_url(url)
-    compact_message = _compact_kuma_message(message)
-    full = f"{base}?status={kuma_status}&msg={quote(compact_message)}&ping={ping_ms}"
-    if debug:
-        print(f"    [push] GET {base}?status=...&msg=...&ping={ping_ms}")
-    try:
-        parsed = urlparse(full)
-        host = parsed.hostname or parsed.netloc.split(":")[0]
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-        if parsed.scheme == "https":
-            conn = http.client.HTTPSConnection(host, port, timeout=10, context=ssl.create_default_context())
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=10)
-        conn.request("GET", path)
-        resp = conn.getresponse()
-        ok = resp.status in (200, 201, 204)
-        if debug:
-            print(f"    [push] response: HTTP {resp.status}")
-        conn.close()
-        return ok
-    except Exception as e:
-        if debug:
-            print(f"    [push] error: {type(e).__name__}: {e}")
-        return False
-
-
 def prompt(text: str, default: Optional[str] = None) -> str:
     if default is not None:
         val = input(f"{text} [{default}]: ").strip()
@@ -5277,15 +6120,31 @@ def prompt_multi_indices(max_n: int, text: str) -> Optional[List[int]]:
 def add_monitor() -> None:
     print("\n--- Add monitor ---")
     print(CHANGES_NOTICE)
-    mode = prompt_with_back("Check mode: smart / storage / ping / port / dns / backup", "smart")
+    mode = prompt_with_back("Check mode: mount / smart / storage / ping / port / dns / backup / service", "mount")
     if mode is None:
         return
-    mode = (mode or "smart").lower()
+    mode = (mode or "mount").lower()
     if mode not in CHECK_MODES:
         print("Invalid mode.")
         return
 
     devices: List[str] = []
+    monitor_mounts: List[Dict[str, str]] = []
+    if mode == "mount":
+        mounts = get_mounts()
+        if not mounts:
+            print("No mounts found.")
+            return
+        print("\nDetected mounts:")
+        for i, (_dev, mpoint, fstype) in enumerate(mounts, 1):
+            print(f"  [{i}] {mpoint} ({fstype})")
+        idxs = prompt_multi_indices(len(mounts), "Select mount(s)")
+        if idxs is None:
+            return
+        monitor_mounts = [
+            {"device": mounts[i - 1][0], "mount_point": mounts[i - 1][1], "fstype": mounts[i - 1][2]}
+            for i in idxs
+        ]
     if mode == "smart":
         detected = _detect_synology_devices()
         candidates = detected["sata"] + detected["block"] + detected["scsi"]
@@ -5303,6 +6162,8 @@ def add_monitor() -> None:
     probe_port = 0
     dns_name = ""
     dns_server = ""
+    service_names = ""
+    service_description_filter = ""
     if mode == "ping":
         probe_host = (prompt_with_back("Ping target host/IP", "") or "").strip()
         if not probe_host:
@@ -5324,6 +6185,12 @@ def add_monitor() -> None:
         if not dns_name:
             print("DNS hostname/domain is required.")
             return
+    if mode == "service":
+        service_names = (prompt_with_back("Service names (comma-separated, optional with description filter)", "") or "").strip()
+        service_description_filter = (prompt_with_back("Service description filter (optional with service names)", "") or "").strip()
+        if not service_names and not service_description_filter:
+            print("Service mode requires service names and/or a description filter.")
+            return
 
     kuma_url = prompt_with_back("Kuma push URL (https://host/api/push/TOKEN)", "")
     if kuma_url is None or not kuma_url:
@@ -5337,10 +6204,13 @@ def add_monitor() -> None:
         print(f"Invalid URL: {err}")
         return
 
-    name = prompt_with_back("Monitor name", f"{mode}-synology-check")
+    name = prompt_with_back("Monitor name", f"{mode}-unix-check")
     if name is None:
         return
-    print(f"\nName: {name}\nMode: {mode}\nDevices: {', '.join(devices) if devices else '(auto)'}\nURL: {kuma_url}")
+    print(
+        f"\nName: {name}\nMode: {mode}\nDevices: {', '.join(devices) if devices else '(auto)'}"
+        f"\nMounts: {', '.join(m['mount_point'] for m in monitor_mounts) if monitor_mounts else '(none)'}\nURL: {kuma_url}"
+    )
     if not confirm_save("Add monitor"):
         print("Discarded.")
         return
@@ -5351,11 +6221,14 @@ def add_monitor() -> None:
             "name": name,
             "check_mode": mode,
             "devices": devices,
+            "mounts": monitor_mounts,
             "kuma_url": kuma_url,
             "probe_host": probe_host,
             "probe_port": probe_port,
             "dns_name": dns_name,
             "dns_server": dns_server,
+            "service_names": service_names,
+            "service_description_filter": service_description_filter,
         }
     )
     save_config(cfg)
@@ -5538,7 +6411,7 @@ def test_push() -> None:
         print("Invalid selection.")
         return
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    msg = f"Test push @ {now} - {BRAND_NAME} synology-monitor connectivity check"
+    msg = f"Test push @ {now} - {BRAND_NAME} unix-monitor connectivity check"
     for m in targets:
         ok = push_to_kuma(m.get("kuma_url", ""), "up", msg, 0, debug=True)
         print(f"  {'ok' if ok else 'x'} {m.get('name', '?')}: push {'OK' if ok else 'FAILED'}")
@@ -5553,20 +6426,113 @@ def toggle_debug() -> None:
     print(f"\n  Debug mode: {'ON' if cfg['debug'] else 'OFF'}")
 
 
+def toggle_update_from_main() -> None:
+    """Toggle update_from_main: when ON, updates fetch from main branch instead of latest release."""
+    cfg = load_config()
+    cfg["update_from_main"] = not cfg.get("update_from_main", False)
+    save_config(cfg, reapply_cron=False)
+    on_off = "ON" if cfg["update_from_main"] else "OFF"
+    print(f"\n  Update from main (testing): {on_off}")
+    print("  Future updates will use " + ("main branch" if cfg["update_from_main"] else "latest release") + ".")
+
+
+def _peering_message_banner(message: str) -> str:
+    if not str(message or "").strip():
+        return ""
+    return f"<div class='ok' style='margin-top:8px;white-space:pre-wrap;'>{html.escape(message)}</div>"
+
+
+def _peering_info_panel(
+    *,
+    peering_message: str,
+    role: str,
+    master_port: int,
+    master_host: str,
+    peering_token: str,
+    sec: Dict[str, Any],
+    approval_status: str = "",
+) -> str:
+    """All peering status/info banners in one place (above action buttons)."""
+    parts: List[str] = []
+    if str(approval_status or "").strip() == "pending":
+        parts.append(
+            "<div style='padding:10px 12px;border:1px solid rgba(245,158,11,.45);border-radius:8px;"
+            "background:rgba(245,158,11,.10);font-size:12px;color:#fbbf24;'>"
+            "<strong>Waiting for master approval.</strong> This agent contacted the hosted master and is listed under "
+            "<em>Pending pairing</em>. Push and register stay blocked until the operator approves (or batch-approves) "
+            "on the master.</div>"
+        )
+    elif str(approval_status or "").strip() == "rejected":
+        parts.append(
+            "<div style='padding:10px 12px;border:1px solid rgba(239,68,68,.45);border-radius:8px;"
+            "background:rgba(239,68,68,.10);font-size:12px;color:#f87171;'>"
+            "<strong>Pairing rejected by master.</strong> Contact the operator or retry sync after they clear the "
+            "rejection — a new contact attempt opens a fresh pending pairing.</div>"
+        )
+    if str(peering_message or "").strip():
+        parts.append(_peering_message_banner(peering_message))
+    if role != "standalone":
+        parts.append(
+            "<div style='padding:8px 10px;border:1px solid rgba(16,185,129,.3);border-radius:8px;"
+            "background:rgba(16,185,129,.06);font-size:11px;color:#10b981;'>"
+            "Peering auto-detects HTTPS and uses it when available."
+            "</div>"
+        )
+    if role == "agent":
+        parts.append(
+            "<div style='padding:10px 12px;border:1px solid rgba(47,128,237,.4);border-radius:8px;"
+            "background:rgba(47,128,237,.08);font-size:12px;'>"
+            "<strong>Agent setup (3 steps):</strong>"
+            "<ol style='margin:6px 0 0 0;padding-left:18px;'>"
+            "<li>On the <b>master</b>, copy the peering token shown there.</li>"
+            "<li>Paste it in the token field above &mdash; it must match the master <i>exactly</i>.</li>"
+            "<li>Confirm master host, callback host, and ports above, then Save.</li>"
+            "</ol></div>"
+        )
+    if role == "master":
+        parts.append(
+            "<div style='padding:10px 12px;border:1px solid rgba(16,185,129,.3);border-radius:8px;"
+            "background:rgba(16,185,129,.06);font-size:12px;'>"
+            "<strong>Master:</strong> Copy this token and share it with each agent. Agents must paste it exactly."
+            "</div>"
+        )
+    if role == "agent" and master_host and peering_token and int(master_port) in (8080, 80, 443):
+        parts.append(
+            "<div class='muted' style='font-size:11px;padding:8px 10px;"
+            "border:1px solid rgba(47,128,237,.35);border-radius:8px;background:rgba(47,128,237,.08);'>"
+            "<strong>Hosted master:</strong> use <b>Test connection</b> then <b>Sync now</b> — certificate is optional. "
+            "Master must listen on LAN (HOSTED_BIND_IP=0.0.0.0), not localhost-only.</div>"
+        )
+    if role == "agent" and master_host and peering_token and not sec.get("instance_cert_ok"):
+        parts.append(
+            "<div class='muted' style='font-size:11px;'>"
+            "CSR signing needs a master with CA enabled. Skip certificate request for hosted token-only peering."
+            "</div>"
+        )
+    if not parts:
+        return ""
+    return (
+        "<div class='peering-info-strip' style='margin-top:12px;display:flex;flex-direction:column;gap:8px;'>"
+        + "".join(parts)
+        + "</div>"
+    )
+
+
 def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering_diagnostics: str = "") -> str:
     instance_id = _get_instance_id(cfg)
     instance_name = str(cfg.get("instance_name", "") or "")
-    role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+    role = _cfg_peer_role(cfg)
     peering_token = str(cfg.get("peering_token", "") or "")
     _master_host, _master_port = _parse_peer_host_port(
-        cfg.get("peer_master_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("peer_master_url", ""), _peer_master_port(cfg)
     )
     _cb_host, _cb_port = _parse_peer_host_port(
-        cfg.get("agent_callback_url", ""), int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+        cfg.get("agent_callback_url", ""), _peer_agent_port(cfg)
     )
     master_host = _master_host
     agent_callback_host = _cb_host
-    peer_port = int(cfg.get("peer_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+    master_port = _peer_master_port(cfg)
+    agent_port = _peer_agent_port(cfg)
     peers = cfg.get("peers", [])
     if not isinstance(peers, list):
         peers = []
@@ -5582,13 +6548,22 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
     sec = _get_mtls_security_status(cfg)
 
     role_opts = ""
-    for r in PEER_ROLES:
+    for r in _peer_roles():
         sel = "selected" if r == role else ""
         role_opts += f"<option value='{r}' {sel}>{r.capitalize()}</option>"
 
     role_lock_reason = _peer_role_change_blocked_reason(cfg)
     role_select_disabled = bool(role_lock_reason)
-    if role_lock_reason == "agent":
+    if _rollout_agent_mode():
+        role_select_block = (
+            "<div class='muted' style='font-size:12px;padding:8px 10px;border:1px solid rgba(47,128,237,.35);"
+            "border-radius:8px;background:rgba(47,128,237,.08);'>"
+            "<strong>Rollout agent</strong> — connects to a hosted master only. "
+            "Standalone and master modes are not available in this edition.</div>"
+            "<input type='hidden' name='peer_role' value='agent'>"
+        )
+        role_lock_note = ""
+    elif role_lock_reason == "agent":
         role_lock_note = (
             "<div class='muted' style='font-size:11px;margin-top:6px;max-width:560px;line-height:1.45;'>"
             "Role is locked while this agent is connected to a master (stored master certificate or a successful sync). "
@@ -5602,7 +6577,9 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
         )
     else:
         role_lock_note = ""
-    if role_select_disabled:
+    if _rollout_agent_mode():
+        pass
+    elif role_select_disabled:
         role_select_block = (
             f"<input type='hidden' name='peer_role' value='{html.escape(role)}'>"
             f"<select aria-disabled='true' disabled "
@@ -5612,7 +6589,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
     else:
         role_select_block = f"<select name='peer_role'>{role_opts}</select>"
     agent_disconnect_html = ""
-    if role == "agent" and _peer_agent_bound_to_master(cfg):
+    if role == "agent" and _peer_agent_bound_to_master(cfg) and not _rollout_agent_mode():
         agent_disconnect_html = (
             "<div style='margin-top:10px;padding:10px 12px;border:1px solid rgba(245,158,11,.35);border-radius:8px;"
             "background:rgba(245,158,11,.06);'>"
@@ -5629,20 +6606,20 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
     now = int(time.time())
     valid_peers = [p for p in peers if _is_valid_peer_instance_id(str(p.get("instance_id", "") or ""))] if peers else []
     online = 0
-    for _vp in valid_peers:
-        _vp_age = now - int(_vp.get("last_seen", 0) or 0) if int(_vp.get("last_seen", 0) or 0) else 9999
-        if _vp_age < PEER_HEALTH_TIMEOUT_SEC:
-            online += 1
-    offline = len(valid_peers) - online
+    offline = 0
     peer_monitor_count = sum(int(p.get("monitor_count", 0) or 0) for p in peers) if peers else 0
     last_sync_ts = int(cfg.get("last_peer_sync", 0) or 0)
     last_sync_txt = time.strftime("%H:%M:%S", time.localtime(last_sync_ts)) if last_sync_ts else "never"
     peer_rows = ""
     if peers:
+        seen_peer_row: set[str] = set()
         for p in peers:
             pid = str(p.get("instance_id", "") or "").strip()
             if not _is_valid_peer_instance_id(pid):
                 continue
+            if pid in seen_peer_row:
+                continue
+            seen_peer_row.add(pid)
             pname = str(p.get("instance_name", "") or pid[:8])
             last_seen = int(p.get("last_seen", 0) or 0)
             age = now - last_seen if last_seen else 9999
@@ -5650,10 +6627,13 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
             mc = int(p.get("monitor_count", 0) or 0)
             p_url = str(p.get("url", "") or "")
             p_latency = p.get("latency_ms")
-            # Do not probe offline peers during HTML rendering.
-            # Live status is refreshed asynchronously via status-json polling.
+            # Keep initial page render non-blocking; status-json polling updates this live.
             p_open_url = _peer_url_for_open(p_url)
             pclass = "ok" if pstatus == "online" else "err"
+            if pstatus == "online":
+                online += 1
+            else:
+                offline += 1
             seen_short = time.strftime("%H:%M:%S", time.localtime(last_seen)) if last_seen else "never"
             lat_txt = f"{p_latency} ms" if p_latency else "-"
             p_version = str(p.get("version", "") or "")
@@ -5707,7 +6687,7 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
                 f"<div class='peer-actions-row'>"
                 f"<form method='post' action='/peer/update-peer-url' style='margin:0;display:flex;gap:4px;align-items:center;min-width:0;'>"
                 f"<input type='hidden' name='peer_id' value='{html.escape(pid)}'>"
-                f"<input name='peer_url' value='{html.escape(_peer_url_for_input_display(p_url))}' placeholder='agent-nas or 192.168.31.10' style='flex:1;padding:4px 6px;font-size:11px;'>"
+                f"<input name='peer_url' value='{html.escape(_peer_url_for_input_display(p_url))}' placeholder='Hostname or host:port' style='flex:1;padding:4px 6px;font-size:11px;'>"
                 f"<button type='submit' style='{pbtn}'>Set URL</button>"
                 f"</form>"
                 f"<form method='post' action='/peer/sync-one' style='margin:0;'>"
@@ -5750,52 +6730,41 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
         )
 
     agent_fields = ""
+    peering_agent_actions_html = ""
+    peering_save_actions_html = ""
     if role == "agent":
         agent_fields = f"""
-          <div style="margin-top:16px;padding:10px 12px;border:1px solid rgba(47,128,237,.4);border-radius:8px;background:rgba(47,128,237,.08);font-size:12px;">
-            <strong>Agent setup (3 steps):</strong>
-            <ol style="margin:6px 0 0 0;padding-left:18px;">
-              <li>On the <b>master</b>, copy the peering token shown there.</li>
-              <li>Paste it below &mdash; it must match the master <i>exactly</i>.</li>
-              <li>Enter master host, your callback host, port (if not 8787), then Save.</li>
-            </ol>
-          </div>
           <label>Master's peering token <span class="muted">(copy from master's Peering card)</span></label>
           <input name="peering_token" value="{html.escape(peering_token)}" placeholder="Paste the master's token here" style="margin-top:6px;">
           <label>Master host <span class="muted">(hostname or IP, no http/https/port)</span></label>
-          <input name="peer_master_url" value="{html.escape(master_host)}" placeholder="master-nas or 192.168.31.32">
+          <input name="peer_master_url" value="{html.escape(master_host)}" placeholder="Hostname or IP of the master">
           <label>Agent callback host <span class="muted">(this NAS hostname or IP for master to reach you)</span></label>
-          <input name="agent_callback_url" value="{html.escape(agent_callback_host)}" placeholder="this-nas or 192.168.31.1">
-          <label>Port <span class="muted">(if not 8787)</span></label>
-          <input name="peer_port" type="number" value="{peer_port}" placeholder="8787" min="1" max="65535" style="max-width:120px;">
-          <div class="button-row" style="margin-top:10px;">
-            <button type="submit">Save peering settings</button>
-          </div>
-        </form>
-        <div class="button-row" style="gap:8px;">
-          <form method="post" action="/peer/test-connection" style="margin:0;">
-            <input type="hidden" name="peer_url" value="{html.escape(f'{master_host}:{peer_port}' if master_host else '')}">
-            <input type="hidden" name="peer_token" value="{html.escape(peering_token)}">
-            <button type="submit">Test connection to master</button>
-          </form>
-          <form method="post" action="/peer/sync-now" style="margin:0;">
+          <input name="agent_callback_url" value="{html.escape(agent_callback_host)}" placeholder="This host's hostname or IP">
+          <label>Master port <span class="muted">(master API/UI, e.g. 8080 for hosted master)</span></label>
+          <input name="peer_master_port" type="number" value="{master_port}" placeholder="Default 8787" min="1" max="65535" style="max-width:120px;">
+          <label>Agent callback port <span class="muted">(this agent's UI/API port)</span></label>
+          <input name="peer_agent_port" type="number" value="{agent_port}" placeholder="Default 8787" min="1" max="65535" style="max-width:120px;">
+        """
+        peering_agent_actions_html = f"""
+        <div class="button-row peering-action-row" style="gap:8px;margin-top:10px;flex-wrap:wrap;">
+          <button type="submit" form="peering-save-form">Save peering settings</button>
+          <button type="submit" form="peering-save-form" formaction="/peer/test-connection" formmethod="post">Test connection to master</button>
+          <form method="post" action="/peer/sync-now" style="margin:0;display:inline-flex;">
             <button type="submit">Sync now</button>
           </form>
         </div>
         """
     elif role == "master":
-        agent_fields = f"""
-          <div class="button-row" style="margin-top:10px;">
-            <button type="submit">Save peering settings</button>
-          </div>
-        </form>
+        peering_save_actions_html = """
+        <div class="button-row peering-action-row" style="margin-top:10px;">
+          <button type="submit" form="peering-save-form">Save peering settings</button>
+        </div>
         """
     else:
-        agent_fields = """
-          <div class="button-row" style="margin-top:10px;">
-            <button type="submit">Save peering settings</button>
-          </div>
-        </form>
+        peering_save_actions_html = """
+        <div class="button-row peering-action-row" style="margin-top:10px;">
+          <button type="submit" form="peering-save-form">Save peering settings</button>
+        </div>
         """
 
     # Build security status panel
@@ -5924,21 +6893,13 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
             _sec_actions_agent = (
                 "<div style='margin-top:8px;'>"
                 "<div class='muted' style='font-size:11px;'>"
-                "Certificate is requested automatically after the master approves pairing and push succeeds.</div>"
+                "Certificate is requested automatically after the master approves pairing and push succeeds. "
+                "Use the button below to retry manually.</div>"
                 "<form method='post' action='/peer/request-cert' style='margin:8px 0 0;'>"
                 "<button type='submit'>Request certificate from master</button>"
                 "</form>"
-                "<div class='muted' style='font-size:11px;margin-top:4px;'>Manual retry — sends a CSR to the master for signing.</div>"
                 "</div>"
             )
-
-    # Connection note (we auto-prefer HTTPS on connect)
-    _http_warn = (
-        "<div style='margin-top:8px;padding:8px 10px;border:1px solid rgba(16,185,129,.3);border-radius:8px;"
-        "background:rgba(16,185,129,.06);font-size:11px;color:#10b981;'>"
-        "Peering auto-detects HTTPS and uses it when available."
-        "</div>"
-    ) if role != "standalone" else ""
 
     security_panel = ""
     if role != "standalone":
@@ -5948,16 +6909,12 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
             f"{_sec_rows}"
             f"{_sec_actions_master}"
             f"{_sec_actions_agent}"
-            f"{_http_warn}"
             f"</div>"
         )
 
     # Token section: role-specific labels and actions
     if role == "master":
         token_section = f"""
-          <div style="margin-top:12px;padding:10px 12px;border:1px solid rgba(16,185,129,.3);border-radius:8px;background:rgba(16,185,129,.06);font-size:12px;">
-            <strong>Master:</strong> Copy this token and share it with each agent. Agents must paste it exactly.
-          </div>
           <label>Peering Token <span class="muted">(agents must use this exact token)</span></label>
           <div style="margin-top:4px;"><code style="word-break:break-all;font-size:11px;">{html.escape(token_display)}</code></div>
           <input name="peering_token" placeholder="Or paste to replace" style="margin-top:6px;">
@@ -6046,28 +7003,39 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
     peering_diagnostics_text = (peering_diagnostics or "").strip() or (
         "Run 'Test connection to master' or 'Sync now' to capture diagnostics."
     )
+    peering_info_html = _peering_info_panel(
+        peering_message=peering_message,
+        role=role,
+        master_port=master_port,
+        master_host=master_host,
+        peering_token=peering_token,
+        sec=sec,
+        approval_status=str(cfg.get("peer_master_approval_status", "") or ""),
+    )
 
     return f"""
       <div class="card" id="peering-card">
-        <h3>Multi-Instance Peering</h3>
-        <div class="muted">Connect multiple instances for cross-network monitoring. Agents push results to a master dashboard.</div>
+        <h3>{"Hosted fleet agent" if _rollout_agent_mode() else "Multi-Instance Peering"}</h3>
+        <div class="muted">{"Push monitor status to your hosted master. Configure master URL and peering token below." if _rollout_agent_mode() else "Connect multiple instances for cross-network monitoring. Agents push results to a master dashboard."}</div>
         <div class="muted" style="margin-top:6px;display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
           <span>Instance ID: <code id="peer-instance-id">{html.escape(_display_peer_instance_id(instance_id))}</code></span>
           <button type="button" class="btn secondary copy-peer-instance-id-btn" style="padding:4px 10px;font-size:12px;line-height:1.2;">Copy</button>
         </div>
-        {_peer_approval_banner_html(str(cfg.get("peer_master_approval_status", "") or ""))}
-        {"<div class='ok' style='margin-top:8px;white-space:pre-wrap;'>" + html.escape(peering_message) + "</div>" if peering_message else ""}
         {security_panel}
-        <form method="post" action="/peer/save-settings">
+        {agent_disconnect_html}
+        <form id="peering-save-form" method="post" action="/peer/save-settings">
           <div>
             <label>Role</label>
             {role_select_block}
             {role_lock_note}
-            {agent_disconnect_html}
           </div>
           {master_peer_actions_html}
           {token_section}
           {agent_fields}
+        </form>
+        {peering_info_html}
+        {peering_agent_actions_html}
+        {peering_save_actions_html}
         <div class="muted" style="margin-top:10px;">Peering diagnostics</div>
         <pre class="code" style="margin-top:6px;max-height:14rem;overflow:auto;">{html.escape(peering_diagnostics_text)}</pre>
         {peer_cleanup_html}
@@ -6087,7 +7055,6 @@ def _render_setup_html(
     log_time_scope: str = "all",
     log_time_from: str = "",
     log_time_to: str = "",
-    log_word: str = "",
     edit_target: str = "",
     create_mode: bool = False,
     diag_view: str = "logs",
@@ -6106,11 +7073,10 @@ def _render_setup_html(
     highlight_channel: str = "",
     log_source: str = "local",
     diagnose_agent: bool = False,
-    server_panel: str = "",
+    open_server_panel: str = "",
     export_backup_error: str = "",
     import_backup_error: str = "",
 ) -> str:
-    # Touchpoint when unix-monitor setup UI/JS changes (playbook sync-check parity).
     cfg = load_config()
     browser_instance_name = str(cfg.get("instance_name", "") or "").strip()
     if not browser_instance_name:
@@ -6123,14 +7089,14 @@ def _render_setup_html(
 
     edit_monitor = _find_monitor_by_name(monitors, edit_target) if edit_target else None
     if create_mode and not edit_monitor:
-        current_name = "smart-synology-check"
+        current_name = "smart-unix-check"
         current_mode = "smart"
         current_url = ""
     else:
         current_name = (
             str(edit_monitor.get("name", ""))
             if edit_monitor
-            else (monitors[0].get("name", "synology-main") if monitors else "synology-main")
+            else (monitors[0].get("name", "unix-main") if monitors else "unix-main")
         )
         current_mode = (
             str(edit_monitor.get("check_mode", "smart"))
@@ -6146,6 +7112,8 @@ def _render_setup_html(
     current_probe_port = str(edit_monitor.get("probe_port", "")) if edit_monitor else ""
     current_dns_name = str(edit_monitor.get("dns_name", "")) if edit_monitor else ""
     current_dns_server = str(edit_monitor.get("dns_server", "")) if edit_monitor else ""
+    current_service_names = str(edit_monitor.get("service_names", "")) if edit_monitor else ""
+    current_service_desc_filter = str(edit_monitor.get("service_description_filter", "")) if edit_monitor else ""
     edit_original_name = str(edit_monitor.get("name", "")) if edit_monitor else ""
     current_interval = int(edit_monitor.get("interval", edit_monitor.get("cron_interval_minutes", cfg.get("cron_interval_minutes", 5)))) if edit_monitor else 5
     current_cron_enabled = bool(edit_monitor.get("cron_enabled", cfg.get("cron_enabled", True))) if edit_monitor else True
@@ -6153,11 +7121,7 @@ def _render_setup_html(
     modal_ph_display = "block" if _cm in ("ping", "port") else "none"
     modal_pp_display = "block" if _cm == "port" else "none"
     modal_dns_display = "block" if _cm == "dns" else "none"
-    internet_check_message = ""
-    top_security_message = security_message
-    if top_security_message.startswith("Internet check settings saved:"):
-        internet_check_message = top_security_message
-        top_security_message = ""
+    modal_service_display = "block" if _cm == "service" else "none"
 
     status_html = ""
     # Elevated check result: only show in Setup & Elevated Access section, not at top
@@ -6171,28 +7135,42 @@ def _render_setup_html(
     if ssl_warning:
         status_html = f"<div class='err'>{html.escape(ssl_warning)}</div>" + status_html
     peer_role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
-    registered_peer_ids = _registered_peer_instance_ids(cfg)
-    peer_snapshots = _load_all_peer_snapshots() if peer_role == "master" else []
-    snapshot_by_id: Dict[str, Dict[str, Any]] = {}
-    for snap in peer_snapshots:
-        snap_id = str(snap.get("instance_id", "") or "").strip()
-        if _is_valid_peer_instance_id(snap_id) and snap_id in registered_peer_ids:
-            snapshot_by_id[snap_id] = snap
-    source_label = (log_source or "local").strip()
-    if peer_role != "master":
-        source_label = "local"
-    elif source_label != "local" and source_label not in snapshot_by_id:
-        source_label = "local"
-    selected_snapshot = snapshot_by_id.get(source_label) if source_label != "local" else None
-    source_is_remote = selected_snapshot is not None
+    local_source_name = browser_instance_name or "Local"
+    available_sources: List[Tuple[str, str]] = [("local", local_source_name)]
+    if peer_role == "master":
+        peer_snapshot_name_by_id: Dict[str, str] = {}
+        for snap in _load_all_peer_snapshots():
+            snap_id = str(snap.get("instance_id", "") or "").strip()
+            if not _is_valid_peer_instance_id(snap_id):
+                continue
+            snap_name = str(snap.get("instance_name", "") or "").strip()
+            if snap_name:
+                peer_snapshot_name_by_id[snap_id] = snap_name
+        seen_peer_src: set[str] = set()
+        for sp in (cfg.get("peers", []) or []):
+            sp_id = str(sp.get("instance_id", "") or "").strip()
+            if not _is_valid_peer_instance_id(sp_id):
+                continue
+            if sp_id in seen_peer_src:
+                continue
+            seen_peer_src.add(sp_id)
+            sp_name = str(peer_snapshot_name_by_id.get(sp_id, "") or sp.get("instance_name", "") or sp_id[:8])
+            available_sources.append((sp_id, sp_name))
+
+    source_map = {sid: sname for sid, sname in available_sources}
+    log_source = (log_source or "local").strip()
+    if log_source not in source_map:
+        log_source = "local"
+    source_label = log_source
+    source_name = source_map.get(source_label, local_source_name)
+    source_is_remote = source_label != "local"
     log_date_norm = _normalize_log_date(log_date)
     log_time_norm = _normalize_log_time_scope(log_time_scope)
     log_time_from_norm = _normalize_log_time_hhmm(log_time_from)
     log_time_to_norm = _normalize_log_time_hhmm(log_time_to)
-    log_word_norm = (log_word or "").strip()[:80]
 
     agent_log_async = False
-    if source_is_remote and diag_view in ("logs", "config", "history", "cache", "system"):
+    if source_is_remote and diag_view in ("logs", "task", "config", "cache", "history", "paths", "system"):
         if diagnose_agent:
             log_text = _diagnose_agent_diag_connection(cfg, source_label)
         else:
@@ -6208,12 +7186,80 @@ def _render_setup_html(
             log_time_scope=log_time_norm,
             log_time_from=log_time_from_norm,
             log_time_to=log_time_to_norm,
-            log_word=log_word_norm,
         )
-    automation_data = _scheduler_status_data(cfg)
+    scheduler_cache_key = (
+        "scheduler:"
+        + str(cfg.get("scheduler_backend", "cron"))
+        + ":"
+        + str(int(cfg.get("cron_interval_minutes", 60) or 60))
+        + ":"
+        + ("1" if bool(cfg.get("cron_enabled", False)) else "0")
+    )
+    automation_data = _get_cached_render_value(
+        scheduler_cache_key,
+        ttl_sec=8,
+        loader=lambda: _scheduler_status_data(cfg),
+        default_value={
+            "raw_text": "Loading scheduler status...",
+            "scheduler_process": "loading",
+            "scheduler_timer": "loading",
+            "timer_next": "loading",
+            "timer_last": "loading",
+        },
+    )
     automation_status = str(automation_data.get("raw_text", ""))
     auth_state = _load_auth_state()
     recovery_unused = _count_unused_recovery(auth_state)
+    request_interface = _request_interface_host()
+    server_ip = request_interface or _get_cached_render_value(
+        "server_ip",
+        ttl_sec=60,
+        loader=lambda: _detect_primary_server_ip(),
+        default_value="n/a",
+    )
+    all_ips = _get_cached_render_value(
+        "system_ips",
+        ttl_sec=60,
+        loader=lambda: _list_system_ips(),
+        default_value=[],
+    )
+    ui_bind_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"), all_ips)
+    ui_bind_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
+    internet_settings = _internet_check_settings_from_cfg(cfg)
+    bind_host_options = _ui_bind_host_options(all_ips)
+    bind_scope_text = (
+        "All interfaces (0.0.0.0)"
+        if ui_bind_host == "0.0.0.0"
+        else ("Localhost only (127.0.0.1)" if ui_bind_host == "127.0.0.1" else f"Specific interface ({ui_bind_host})")
+    )
+    bind_options_html = "".join(
+        f"<option value='{html.escape(ip)}'{' selected' if ip == ui_bind_host else ''}>{html.escape('All interfaces (0.0.0.0)' if ip == '0.0.0.0' else ('Localhost only (127.0.0.1)' if ip == '127.0.0.1' else ip))}</option>"
+        for ip in bind_host_options
+    )
+    ntp_info = _get_cached_render_value(
+        "ntp_sync_details",
+        ttl_sec=120,
+        loader=lambda: _ntp_sync_details(),
+        default_value={"synced": "unknown", "service": "unknown", "source": "unknown", "detail": "Loading NTP details..."},
+    )
+    peer_last_sync = int(cfg.get("last_peer_sync", 0) or 0)
+    peer_last_sync_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(peer_last_sync)) if peer_last_sync else "never"
+    now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    last_login_ip = str(auth_state.get("last_login_ip", "") or "n/a")
+    last_login_at = int(auth_state.get("last_login_at", 0) or 0)
+    last_login_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_login_at)) if last_login_at else "never"
+    login_history = auth_state.get("login_history", []) if isinstance(auth_state.get("login_history", []), list) else []
+    login_lines: List[str] = []
+    for ev in reversed(login_history[-8:]):
+        if not isinstance(ev, dict):
+            continue
+        ts = int(ev.get("ts", 0) or 0)
+        ts_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown"
+        ip = str(ev.get("ip", "unknown") or "unknown")
+        state = str(ev.get("state", "unknown") or "unknown")
+        login_lines.append(f"{ts_text} | {ip} | {state}")
+    if not login_lines:
+        login_lines = ["No login history recorded yet."]
 
     elevated_ok, elevated_msg = get_smart_helper_status()
     elevated_css = "ok" if elevated_ok else "err"
@@ -6234,20 +7280,8 @@ def _render_setup_html(
     setup_state_css = "ok" if elevated_ok else "err"
 
     # Build monitor status map from history.
-    source_history: List[Dict[str, Any]] = []
-    if source_is_remote:
-        snap_hist = selected_snapshot.get("history", []) if selected_snapshot else []
-        source_history = [e for e in snap_hist if isinstance(e, dict)]
-    else:
-        source_history = history
-    source_monitors: List[Dict[str, Any]] = []
-    if source_is_remote:
-        snap_mons = selected_snapshot.get("monitors", []) if selected_snapshot else []
-        source_monitors = [m for m in snap_mons if isinstance(m, dict)]
-    else:
-        source_monitors = [m for m in monitors if isinstance(m, dict)]
     monitor_latest: Dict[str, Dict[str, Any]] = {}
-    for e in source_history:
+    for e in history:
         name = str(e.get("monitor", ""))
         if name:
             monitor_latest[name] = e
@@ -6261,32 +7295,34 @@ def _render_setup_html(
     def status_label(status: str) -> str:
         return status.upper() if status in ("up", "warning", "down") else "UNKNOWN"
 
-    # Overview gauges based on configured channels.
-    channels_order = ("smart", "storage", "ping", "port", "dns", "backup")
-    overview_channels: List[str] = []
-    for m in source_monitors:
-        mode = str(m.get("mode", m.get("check_mode", "smart"))).lower()
-        if mode in channels_order and mode not in overview_channels:
-            overview_channels.append(mode)
-    for e in source_history:
-        ch = str(e.get("channel", "")).lower()
-        if ch in channels_order and ch not in overview_channels:
-            overview_channels.append(ch)
-    overview_channels = [c for c in channels_order if c in overview_channels]
+    # Overview gauges are scoped to the selected source context.
+    source_snapshot = _build_live_snapshot_for_source(source_label)
+    source_label = str(source_snapshot.get("source_id", source_label) or "local")
+    source_name = str(source_snapshot.get("source_name", source_name) or source_name)
+    source_is_remote = source_label != "local"
+    source_channels = source_snapshot.get("channels", {}) if isinstance(source_snapshot.get("channels", {}), dict) else {}
+    source_monitors = source_snapshot.get("monitors", []) if isinstance(source_snapshot.get("monitors", []), list) else []
+    channels_order = ("smart", "storage", "ping", "port", "dns", "backup", "service")
+    source_monitor_channels = {
+        str(m.get("mode", m.get("check_mode", "smart"))).lower()
+        for m in source_monitors
+        if isinstance(m, dict)
+    }
+    overview_channels = [c for c in channels_order if c in source_channels or c in source_monitor_channels]
     if not overview_channels:
         overview_channels = ["smart", "storage"]
 
     channel_cards: List[str] = []
     for channel in overview_channels:
-        items = [e for e in source_history if str(e.get("channel")) == channel]
-        latest = items[-1] if items else {}
-        st = str(latest.get("status", "unknown"))
-        pct = status_pct(st)
-        last_ts = int(latest.get("ts", 0) or 0)
+        ch_data = source_channels.get(channel, {}) if isinstance(source_channels.get(channel, {}), dict) else {}
+        st = str(ch_data.get("status", "unknown"))
+        pct = int(ch_data.get("pct", status_pct(st)) or status_pct(st))
+        last_ts = int(ch_data.get("ts", 0) or 0)
         ts_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_ts)) if last_ts else "n/a"
+        history_statuses = ch_data.get("history_statuses", []) if isinstance(ch_data.get("history_statuses", []), list) else []
         dots = "".join(
-            f"<span class='dot {status_class(str(x.get('status', 'unknown')))}' title='{html.escape(str(x.get('status', 'unknown')))}'></span>"
-            for x in items[-20:]
+            f"<span class='dot {status_class(str(x))}' title='{html.escape(str(x))}'></span>"
+            for x in history_statuses[-20:]
         ) or "<span class='muted'>no history</span>"
         mapped = []
         for m in source_monitors:
@@ -6303,7 +7339,7 @@ def _render_setup_html(
         channel_cards.append(
             f"<div class='overview-card {'hl-channel' if is_hl else ''}' data-channel='{channel}'>"
             f"<h4>{channel.capitalize()} Monitoring</h4>"
-            f"<a class='gauge-link' href='/?view=overview&diag_view=logs&log_filter={channel}&highlight={channel}&log_source={html.escape(source_label)}&log_date={html.escape(log_date_norm)}&log_time_scope={html.escape(log_time_norm)}'>"
+            f"<a class='gauge-link' href='/?view=overview&diag_view=logs&log_filter={channel}&highlight={channel}&source={html.escape(source_label)}&log_date={html.escape(log_date_norm)}&log_time_scope={html.escape(log_time_norm)}'>"
             f"<div class='gauge {status_class(st)}' data-role='gauge' style='--pct:{pct}'>"
             f"<div class='gauge-center'><div class='gauge-value' data-role='gauge-value'>{status_label(st)}</div><div class='gauge-sub' data-role='gauge-sub'>{pct}%</div></div>"
             "</div>"
@@ -6315,221 +7351,31 @@ def _render_setup_html(
         )
     overview_html = "".join(channel_cards)
 
-    # Current Server info for overview (follows selected source)
-    local_source_name = browser_instance_name or "synology-agent"
-    selected_source_name = local_source_name
-    selected_source_platform = "synology"
-    viewed_spk_version = VERSION
-    request_interface = _request_interface_host()
-    server_ip = request_interface or _detect_primary_server_ip()
-    now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    last_login_ip = str(auth_state.get("last_login_ip", "") or "").strip() or "n/a"
-    last_login_at_ts = int(auth_state.get("last_login_at", 0) or 0)
-    last_login_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_login_at_ts)) if last_login_at_ts else "n/a"
-    if source_is_remote and selected_snapshot:
-        selected_source_platform = "unknown"
-        selected_source_name = str(selected_snapshot.get("instance_name", "") or source_label[:8] or "remote")
-        viewed_spk_version = str(selected_snapshot.get("version", "") or "").strip() or viewed_spk_version
-        snap_platform = str(selected_snapshot.get("source_platform", "") or "").strip().lower()
-        if snap_platform in ("synology", "unix"):
-            selected_source_platform = snap_platform
-        else:
-            inferred_platform = _infer_peer_source_platform_for_update(cfg, source_label)
-            if inferred_platform in ("synology", "unix"):
-                selected_source_platform = inferred_platform
-        peer_entry = next((p for p in (cfg.get("peers", []) or []) if str(p.get("instance_id", "") or "").strip() == source_label), None)
-        peer_host, _peer_port = _parse_peer_host_port(str(peer_entry.get("url", "") or ""), PEER_DEFAULT_PORT) if isinstance(peer_entry, dict) else ("", PEER_DEFAULT_PORT)
-        server_ip = peer_host or "remote"
-        pushed_at = int(selected_snapshot.get("pushed_at", 0) or 0)
-        now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pushed_at)) if pushed_at else "n/a"
-        remote_login_ip = str(selected_snapshot.get("last_login_ip", "") or "").strip()
-        remote_login_at = int(selected_snapshot.get("last_login_at", 0) or 0)
-        last_login_ip = remote_login_ip or "n/a (remote)"
-        last_login_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(remote_login_at)) if remote_login_at else "n/a (remote)"
-    login_events = auth_state.get("login_history", []) or []
-    if not isinstance(login_events, list):
-        login_events = []
-    login_lines: List[str] = []
-    for ev in reversed(login_events[-10:]):
-        if isinstance(ev, dict):
-            ts = ev.get("ts", 0) or 0
-            ip = ev.get("ip", "unknown")
-            state = ev.get("state", "unknown")
-            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
-            login_lines.append(f"{ts_str}  {ip}  {state}")
-    login_history_text = "\n".join(login_lines) if login_lines else "No login events recorded."
-    all_ips = _list_system_ips()
-    ui_bind_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"), all_ips)
-    ui_bind_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
-    internet_settings = _internet_check_settings_from_cfg(cfg)
-    bind_host_options = _ui_bind_host_options(all_ips)
-    bind_scope_text = (
-        "All interfaces (0.0.0.0)"
-        if ui_bind_host == "0.0.0.0"
-        else ("Localhost only (127.0.0.1)" if ui_bind_host == "127.0.0.1" else f"Specific interface ({ui_bind_host})")
-    )
-    bind_options_html = "".join(
-        f"<option value='{html.escape(ip)}'{' selected' if ip == ui_bind_host else ''}>{html.escape('All interfaces (0.0.0.0)' if ip == '0.0.0.0' else ('Localhost only (127.0.0.1)' if ip == '127.0.0.1' else ip))}</option>"
-        for ip in bind_host_options
-    )
-    ip_lines: List[str] = []
-    if server_ip and server_ip not in ("n/a", "remote"):
-        ip_lines.append(server_ip)
-    for ip in all_ips:
-        if ip not in ip_lines:
-            ip_lines.append(ip)
-    if not source_is_remote and "127.0.0.1" not in ip_lines:
-        ip_lines.append("127.0.0.1")
+    # Current-server section follows selected source context.
+    display_source_name = source_name if source_name else local_source_name
+    display_server_ip = server_ip
+    display_now_text = now_text
+    display_runtime_version = VERSION
+    display_last_login_ip = last_login_ip
+    display_last_login_at_text = last_login_at_text
     if source_is_remote:
-        ip_list_text = "\n".join(ip_lines) if ip_lines else "No remote communication endpoint available."
-    else:
-        ip_list_text = "\n".join(ip_lines) if ip_lines else "No IP addresses detected."
-    local_specs = _collect_system_specs()
-    spec_cpu = "n/a (remote source)" if source_is_remote else local_specs.get("cpu", "n/a")
-    spec_ram = "n/a (remote source)" if source_is_remote else local_specs.get("ram", "n/a")
-    spec_disk = "n/a (remote source)" if source_is_remote else local_specs.get("disk", "n/a")
-    spec_uptime = "n/a (remote source)" if source_is_remote else local_specs.get("uptime", "n/a")
-    source_scope_text = (
-        f"Viewing remote source: {selected_source_name} (overview and diagnostics scoped to this source)."
-        if source_is_remote
-        else (f"Viewing local source: {selected_source_name}." if peer_role == "master" else "")
-    )
-    cpu_detail_text = (
-        f"CPU: {spec_cpu}\nSource: /proc/cpuinfo model/hardware\n{source_scope_text}"
-        if not source_is_remote
-        else f"CPU: {spec_cpu}\nDetails are available on the selected remote source UI."
-    )
-    ram_detail_text = (
-        f"RAM (Total): {spec_ram}\nSource: /proc/meminfo MemTotal\n{source_scope_text}"
-        if not source_is_remote
-        else f"RAM (Total): {spec_ram}\nDetails are available on the selected remote source UI."
-    )
-    disk_detail_text = (
-        f"Disk (Total / Free): {spec_disk}\nSource: statvfs('/')\n{source_scope_text}"
-        if not source_is_remote
-        else f"Disk (Total / Free): {spec_disk}\nDetails are available on the selected remote source UI."
-    )
-    uptime_detail_text = (
-        f"Uptime: {spec_uptime}\nSource: /proc/uptime\n{source_scope_text}"
-        if not source_is_remote
-        else f"Uptime: {spec_uptime}\nDetails are available on the selected remote source UI."
-    )
-    repo_url = f"https://github.com/{GITHUB_REPO}"
-    package_word = "SPK" if selected_source_platform == "synology" else "addon"
-    package_word_cap = "SPK" if selected_source_platform == "synology" else "Addon"
-    package_label = "Synology SPK Version" if selected_source_platform == "synology" else "Unix Addon Version"
-    package_title = "Synology SPK update" if selected_source_platform == "synology" else "Unix addon update"
-    viewed_spk_version_display = viewed_spk_version
-    if "+" in viewed_spk_version and len(viewed_spk_version) > 28:
-        base, meta = viewed_spk_version.split("+", 1)
-        viewed_spk_version_display = f"{base}+{meta[:8]}..."
-    elif len(viewed_spk_version) > 28:
-        viewed_spk_version_display = viewed_spk_version[:25] + "..."
-    update_hint = (
-        "This checker tracks Synology package (SPK) versions. Reinstall via Package Center, script, or download SPK from GitHub releases."
-        if selected_source_platform == "synology"
-        else "This checker tracks Unix addon versions. Reinstall via script or download release assets from GitHub."
-    )
-    update_from_main = bool(cfg.get("update_from_main", False))
-    selected_channel = "main" if update_from_main else "latest"
-    selected_channel_label = "main branch" if update_from_main else "latest release"
-    update_curl_cmd = (
-        f"curl -sSL https://raw.githubusercontent.com/{GITHUB_REPO}/main/apps/synology-monitor/install.sh"
-        f" | sudo env PUBLIC_REPO={GITHUB_REPO} UNIX_MONITOR_UPDATE_CHANNEL={selected_channel} bash"
-    )
-    update_check = _load_update_check_result()
-    update_check_stale = _update_check_needs_refresh(cfg=cfg, last=update_check)
-    latest_version = str(update_check.get("public_version", "") or update_check.get("latest_version", "") or "").strip() or None
-    cached_channel = str(update_check.get("selected_channel", "") or "")
-    channel_matches_cache = (cached_channel == selected_channel) or (not cached_channel and selected_channel == "latest")
-    if not channel_matches_cache or update_check_stale:
-        latest_version = None
-    update_available = (not update_check_stale) and channel_matches_cache and bool(update_check.get("update_available")) and bool(latest_version and _version_tuple(viewed_spk_version) < _version_tuple(latest_version))
-    update_check_error = str(update_check.get("error", "") or "").strip() or None
-    if not channel_matches_cache or update_check_stale:
-        update_check_error = None
-    update_checked_at = int(update_check.get("checked_at", 0) or 0)
-    update_checked_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(update_checked_at)) if update_checked_at else None
-    update_download_url = str(update_check.get("download_url", "") or "").strip() or None
-    package_badge = ""
-    if update_available and latest_version:
-        package_badge = f" <span class='update-badge'>Update: {html.escape(latest_version)}</span>"
-    from_main_enable_class = "autoupdate-btn autoupdate-btn-active" if update_from_main else "autoupdate-btn"
-    from_main_disable_class = "autoupdate-btn autoupdate-btn-active" if not update_from_main else "autoupdate-btn"
-    package_source_controls = (
-        "<div class='autoupdate-row'>"
-        "<form method='post' action='/settings/save-update-from-main' class='autoupdate-form' style='display:inline;'>"
-        "<input type='hidden' name='update_from_main' value='1'>"
-        "<button type='submit' class='" + from_main_enable_class + "'>Update from main</button></form>"
-        " <form method='post' action='/settings/save-update-from-main' class='autoupdate-form' style='display:inline;'>"
-        "<input type='hidden' name='update_from_main' value='0'>"
-        "<button type='submit' class='" + from_main_disable_class + "'>Update from latest</button></form>"
-        "<span class='autoupdate-hint'>Update source controls which public SPK version is checked.</span></div>"
-    )
-    package_panel_lines: List[str] = []
-    if update_checked_text:
-        package_panel_lines.append(f"Last checked: {update_checked_text}")
-    if update_check_error:
-        package_panel_lines.append(f"Check error: {update_check_error}")
-    if update_available and latest_version:
-        package_panel_lines.append(f"{package_word_cap} update available: {latest_version} (current {package_word}: {viewed_spk_version})")
-        if update_download_url:
-            package_panel_lines.append(f"Download: {update_download_url}")
-    elif latest_version and not update_available:
-        package_panel_lines.append(f"{package_word_cap} up to date ({viewed_spk_version})")
-    if not package_panel_lines:
-        if update_check_stale or not channel_matches_cache:
-            package_panel_lines.append("Checking selected source for updates...")
-        else:
-            package_panel_lines.append("Update status unknown. Use Recheck for updates.")
-    package_panel_lines.append(
-        f"Selected source: {selected_channel_label} | Current {package_word_cap} ({selected_source_name}): {viewed_spk_version} | Public {package_word_cap} ({selected_channel}): {latest_version or 'unknown'}"
-    )
-    package_panel_lines.append("")
-    package_panel_lines.append(update_hint)
-    package_panel_html = "<pre>" + html.escape("\n".join(package_panel_lines)) + "</pre>"
-    update_ready_banner = ""
-    if update_available and update_download_url and latest_version:
-        update_ready_banner = (
-            "<div class='update-ready-banner'>"
-            "<span>New " + package_word + " version available (v" + html.escape(latest_version) + "). </span>"
-            "<a class='btn-inline' href='" + html.escape(update_download_url) + "' target='_blank' rel='noopener noreferrer'>Download " + package_word_cap + "</a>"
-            "</div>"
+        remote_snap = _load_peer_snapshot(source_label)
+        peer_cfg = next(
+            (p for p in (cfg.get("peers", []) or []) if str(p.get("instance_id", "") or "").strip() == source_label),
+            None,
         )
-    package_download_btn = ""
-    if update_available and update_download_url:
-        package_download_btn = f"<div class='button-row'><a class='btn-inline' href='{html.escape(update_download_url)}' target='_blank' rel='noopener noreferrer'>Download {package_word_cap} ({html.escape(latest_version)})</a></div>"
-    server_panel = str(server_panel or "").strip().lower()
-    if server_panel not in {"name", "ip", "time", "cpu", "ram", "disk", "uptime", "package", "login", "login-time"}:
-        server_panel = ""
-    server_info_card_html = (
-        "<div class='server-info-grid'>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(selected_source_name)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(server_ip)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(now_text)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='cpu'><span class='muted'>CPU</span><strong>{html.escape(spec_cpu)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='ram'><span class='muted'>RAM (Total)</span><strong>{html.escape(spec_ram)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='disk'><span class='muted'>Disk (Total / Free)</span><strong>{html.escape(spec_disk)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='uptime'><span class='muted'>Uptime</span><strong>{html.escape(spec_uptime)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>{html.escape(package_label)}</span><strong title='{html.escape(viewed_spk_version)}'>{html.escape(viewed_spk_version_display)}</strong>{package_badge}</button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(last_login_ip)}</strong></button>"
-        f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(last_login_at_text)}</strong></button>"
-        "</div>"
-        "<div class='server-action-panels'>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'name' else ''}' data-server-panel='name'><h4>Change server name</h4><form method='post' action='/settings/save-instance-name'><label>Instance Name</label><input name='instance_name' value='{html.escape(str(cfg.get('instance_name', '') or ''))}' placeholder='e.g. GSIARR01-AGENT'><div class='button-row'><button type='submit'>Save name</button></div></form></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'ip' else ''}' data-server-panel='ip'><h4>System IP addresses</h4><div class='muted'>Current web UI bind: {html.escape(bind_scope_text)} on port {ui_bind_port}</div><pre>{html.escape(ip_list_text)}</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'time' else ''}' data-server-panel='time'><h4>Time</h4><pre>Current time: {html.escape(now_text)}\n(System time on this NAS)</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'cpu' else ''}' data-server-panel='cpu'><h4>CPU details</h4><pre>{html.escape(cpu_detail_text)}</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'ram' else ''}' data-server-panel='ram'><h4>RAM details</h4><pre>{html.escape(ram_detail_text)}</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'disk' else ''}' data-server-panel='disk'><h4>Disk details</h4><pre>{html.escape(disk_detail_text)}</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'uptime' else ''}' data-server-panel='uptime'><h4>Uptime details</h4><pre>{html.escape(uptime_detail_text)}</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'package' else ''}' data-server-panel='package'><h4>{html.escape(package_title)}</h4>{update_ready_banner}{package_source_controls}<div class='button-row'><a class='btn-inline' href='{html.escape(repo_url)}' target='_blank' rel='noopener noreferrer'>Open GitHub repository</a> <form method='post' action='/settings/recheck-updates' style='display:inline;'><button type='submit' class='btn-inline btn-inline-muted'>Recheck for updates</button></form></div>{package_download_btn}{package_panel_html}<pre>{html.escape(update_curl_cmd)}</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'login' else ''}' data-server-panel='login'><h4>Recent login events (IP + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
-        f"<div class='card server-action-panel{' open' if server_panel == 'login-time' else ''}' data-server-panel='login-time'><h4>Recent login events (time + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
-        "</div>"
-    )
-
-    peer_role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+        peer_url = str(peer_cfg.get("url", "") or "") if isinstance(peer_cfg, dict) else ""
+        peer_host, _peer_port = _parse_peer_host_port(peer_url, PEER_DEFAULT_PORT)
+        display_server_ip = peer_host or "remote"
+        remote_version = str((remote_snap or {}).get("version", "") or "").strip()
+        if remote_version:
+            display_runtime_version = remote_version
+        pushed_at = int((remote_snap or {}).get("pushed_at", 0) or 0)
+        display_now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pushed_at)) if pushed_at else "n/a"
+        remote_login_ip = str((remote_snap or {}).get("last_login_ip", "") or "").strip()
+        remote_login_at = int((remote_snap or {}).get("last_login_at", 0) or 0)
+        display_last_login_ip = remote_login_ip or "n/a (remote)"
+        display_last_login_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(remote_login_at)) if remote_login_at else "n/a (remote)"
 
     # Setup steps with integrated screenshots.
     guide_images = get_task_guide_images()
@@ -6620,10 +7466,42 @@ def _render_setup_html(
         )
 
     # Remote / agent monitor cards (grouped by agent host / origin).
-    remote_by_host: Dict[str, List[str]] = {}
+    remote_by_host: Dict[str, Dict[str, Any]] = {}
     if peer_role == "master":
-        for snap in peer_snapshots:
+        reg_peer_ids = _registered_peer_instance_ids(cfg)
+        peers_list_for_remote = cfg.get("peers", []) if isinstance(cfg.get("peers", []), list) else []
+        for tp in peers_list_for_remote:
+            if not isinstance(tp, dict):
+                continue
+            tp_id = str(tp.get("instance_id", "") or "").strip()
+            if not tp_id or tp_id not in reg_peer_ids:
+                continue
+            tp_name = str(tp.get("instance_name", "") or tp_id[:8])
+            remote_by_host.setdefault(
+                tp_id,
+                {
+                    "name": tp_name,
+                    "legacy": _is_legacy_peer(tp),
+                    "platform": str(tp.get("source_platform", "") or "unknown"),
+                    "cards": [],
+                },
+            )
+        for snap in _load_all_peer_snapshots():
+            snap_iid = str(snap.get("instance_id", "") or "").strip()
+            if not snap_iid or snap_iid not in reg_peer_ids:
+                continue
             snap_name = str(snap.get("instance_name", "") or str(snap.get("instance_id", ""))[:8])
+            peer_row = _peer_entry_for_instance_id(cfg, snap_iid) or {}
+            group = remote_by_host.setdefault(
+                snap_iid,
+                {
+                    "name": snap_name,
+                    "legacy": _is_legacy_peer(peer_row),
+                    "platform": str(peer_row.get("source_platform", "") or "unknown"),
+                    "cards": [],
+                },
+            )
+            group["name"] = snap_name
             snap_history = snap.get("history", [])
             snap_state_raw = snap.get("state", {})
             snap_state: Dict[str, Dict[str, Any]] = {}
@@ -6684,21 +7562,57 @@ def _render_setup_html(
                     + "</div>"
                     + "</div>"
                 )
-                remote_by_host.setdefault(snap_name, []).append(card_html)
+                group["cards"].append(card_html)
     local_monitors_html = "".join(local_cards) if local_cards else "<p class='muted'>No local monitors configured yet.</p>"
     remote_monitors_html = ""
     if peer_role == "master":
-        remote_total = sum(len(v) for v in remote_by_host.values())
+        legacy_peer_names = [
+            str(g.get("name", "") or "")
+            for g in remote_by_host.values()
+            if bool(g.get("legacy"))
+        ]
+        remote_total = sum(len(g.get("cards", [])) for g in remote_by_host.values())
+        legacy_banner = ""
+        if legacy_peer_names:
+            legacy_banner = (
+                "<div class='info-callout legacy-warning-callout' style='margin-bottom:12px;'>"
+                f"<strong>{len(legacy_peer_names)} legacy agent(s) connected</strong> via token peering ("
+                + html.escape(", ".join(legacy_peer_names))
+                + "). Monitors appear after the agent pushes a snapshot. Use <strong>Create monitor</strong> "
+                "and confirm the legacy warning when targeting a legacy agent.</div>"
+            )
         if not remote_by_host:
-            remote_grid = "<p class='muted'>No agent monitors synced yet. Create a monitor on an agent or wait for the next sync.</p>"
+            remote_grid = (
+                "<div class='monitor-grid'><div class='monitor-card'>"
+                "<div class='monitor-head'><span class='monitor-title'>No agents connected</span>"
+                "<span class='badge st-unknown'>offline</span></div>"
+                "<div class='monitor-meta'>Pair or register an agent in <strong>Settings</strong>, then wait for the next push sync.</div>"
+                "</div></div>"
+            )
         else:
             host_sections: List[str] = []
-            for host in sorted(remote_by_host.keys(), key=lambda x: str(x).lower()):
-                hcards = remote_by_host[host]
+            for host_id in sorted(remote_by_host.keys(), key=lambda x: str(remote_by_host[x].get("name", x)).lower()):
+                group = remote_by_host[host_id]
+                hcards = group.get("cards", [])
+                host_name = str(group.get("name", host_id[:8]))
+                legacy_badge = "<span class='badge st-warning'>legacy</span>" if group.get("legacy") else ""
+                platform = str(group.get("platform", "") or "").strip()
+                platform_badge = f"<span class='badge muted-badge'>{html.escape(platform)}</span>" if platform and platform != "unknown" else ""
+                if hcards:
+                    cards_html = "".join(hcards)
+                else:
+                    cards_html = (
+                        "<div class='monitor-card'><div class='monitor-head'>"
+                        "<span class='monitor-title'>Waiting for monitor data</span>"
+                        "<span class='badge st-warning'>pending</span></div>"
+                        "<div class='monitor-meta'>Agent registered but no monitors in the latest push yet. "
+                        "Trigger a sync on the agent or create a monitor above.</div></div>"
+                    )
                 host_sections.append(
-                    f"<div class='agent-host-monitor-group' data-agent-host='{html.escape(host)}'>"
-                    f"<h4 class='agent-host-heading'>{html.escape(host)} <span class='badge muted-badge'>{len(hcards)}</span></h4>"
-                    f"<div class='monitor-grid'>{''.join(hcards)}</div>"
+                    f"<div class='agent-host-monitor-group' data-agent-host='{html.escape(host_name)}'>"
+                    f"<h4 class='agent-host-heading'>{html.escape(host_name)} "
+                    f"<span class='badge muted-badge'>{len(hcards)}</span> {legacy_badge} {platform_badge}</h4>"
+                    f"<div class='monitor-grid'>{cards_html}</div>"
                     f"</div>"
                 )
             remote_grid = f"<div class='agent-monitors-by-host'>{''.join(host_sections)}</div>"
@@ -6707,12 +7621,13 @@ def _render_setup_html(
             f"<h3>Agent Monitors <span class='badge muted-badge'>{remote_total}</span></h3>"
             f"<div class='muted' style='margin-bottom:8px;'>Monitors running on remote agent instances. Status is updated via peering sync. "
             f"Kuma push is handled by the master.</div>"
+            f"{legacy_banner}"
             f"{remote_grid}"
             f"</div>"
         )
 
     checked_cron = "checked" if current_cron_enabled else ""
-    filter_label = {"all": "all", "smart": "smart", "storage": "storage", "ping": "ping", "port": "port", "dns": "dns", "backup": "backup"}.get((log_filter or "all").lower(), "all")
+    filter_label = {"all": "all", "smart": "smart", "storage": "storage", "ping": "ping", "port": "port", "dns": "dns", "backup": "backup", "service": "service"}.get((log_filter or "all").lower(), "all")
     diag_label = {
         "logs": "logs",
         "task": "task",
@@ -6723,22 +7638,74 @@ def _render_setup_html(
         "system": "system",
     }.get((diag_view or "logs").lower(), "logs")
     log_bytes, log_lines_total = get_ui_log_stats()
-    diag_view_labels = {"logs": "Logs", "task": "Task", "cache": "Cache", "config": "Config", "history": "History", "paths": "Paths", "system": "System"}
-    event_labels = {"all": "All events", "smart": "Smart", "storage": "Storage", "ping": "Ping", "port": "Port", "dns": "DNS", "backup": "Backup"}
+    diag_view_labels = {
+        "logs": "Logs",
+        "task": "Task",
+        "cache": "Cache",
+        "config": "Config",
+        "history": "History",
+        "paths": "Paths",
+        "system": "System",
+    }
+    event_labels = {
+        "all": "All events",
+        "smart": "Smart",
+        "storage": "Storage",
+        "ping": "Ping",
+        "port": "Port",
+        "dns": "DNS",
+        "backup": "Backup",
+        "service": "Service",
+    }
     date_labels = {"all": "Any date", "today": "Today", "yesterday": "Yesterday"}
-    time_labels = {"all": "Any time", "15m": "Last 15 minutes", "1h": "Last hour", "6h": "Last 6 hours", "24h": "Last 24 hours"}
+    time_labels = {
+        "all": "Any time",
+        "15m": "Last 15 minutes",
+        "1h": "Last hour",
+        "6h": "Last 6 hours",
+        "24h": "Last 24 hours",
+    }
+    _dv_human = diag_view_labels.get(diag_label, diag_label)
+    _ev_human = event_labels.get(filter_label, filter_label)
+    _date_human = date_labels.get(log_date_norm, log_date_norm)
+    _time_human = time_labels.get(log_time_norm, log_time_norm)
+    _time_exact_human = (
+        (log_time_from_norm or "--:--") + " to " + (log_time_to_norm or "--:--")
+        if (log_time_from_norm or log_time_to_norm)
+        else "full day"
+    )
+    log_diag_banner = (
+        "<div class='log-diag-active-banner' role='status'><strong>Viewing:</strong> "
+        + html.escape(_dv_human)
+        + " · "
+        + html.escape(_ev_human)
+        + " · "
+        + html.escape(_date_human)
+        + " · "
+        + html.escape(_time_human + " · exact " + _time_exact_human)
+        + "</div>"
+    )
+    if source_label == "local" and diag_label == "logs":
+        log_diag_stats = (
+            "<div class='log-diag-meta'>UI log file: "
+            + html.escape(_fmt_ui_log_size(log_bytes))
+            + f" · {log_lines_total:,} lines on disk · rolling window: up to {UI_LOG_DISPLAY_LINES} newest matching lines (scroll).</div>"
+        )
+    elif source_label != "local" and diag_label == "logs":
+        log_diag_stats = (
+            "<div class='log-diag-meta'>UI log file: remote agent (" + html.escape(source_name) + ") · size/line count shown on agent UI · rolling window: up to " + str(UI_LOG_DISPLAY_LINES) + " newest matching lines (scroll).</div>"
+        )
+    else:
+        log_diag_stats = ""
     _dvo = "".join(
         f"<option value='{html.escape(v)}'{' selected' if diag_label == v else ''}>{html.escape(diag_view_labels[v])}</option>"
         for v in ("logs", "task", "cache", "config", "history", "paths", "system")
     )
     _evo = "".join(
         f"<option value='{html.escape(v)}'{' selected' if filter_label == v else ''}>{html.escape(event_labels[v])}</option>"
-        for v in ("all", "smart", "storage", "ping", "port", "dns", "backup")
+        for v in ("all", "smart", "storage", "ping", "port", "dns", "backup", "service")
     )
-    _dto = "".join(
-        f"<option value='{html.escape(v)}'{' selected' if log_date_norm == v else ''}>{html.escape(date_labels.get(v, v))}</option>"
-        for v in ("all", "today", "yesterday")
-    )
+    _date_value = "" if log_date_norm == "all" else log_date_norm
     _tto = "".join(
         f"<option value='{html.escape(v)}'{' selected' if log_time_norm == v else ''}>{html.escape(time_labels[v])}</option>"
         for v in ("all", "15m", "1h", "6h", "24h")
@@ -6747,48 +7714,111 @@ def _render_setup_html(
     _is_logs_view = diag_label == "logs"
     _event_options_html = _evo if _is_logs_view else f"<option value='all' selected>Not available for {html.escape(_diag_view_human)}</option>"
     _time_options_html = _tto if _is_logs_view else f"<option value='all' selected>Not available for {html.escape(_diag_view_human)}</option>"
-    event_select_disabled_attr = "" if _is_logs_view else " disabled"
-    time_select_disabled_attr = "" if _is_logs_view else " disabled"
-    advanced_inputs_disabled_attr = "" if _is_logs_view else " disabled"
+    _event_disabled_attr = "" if _is_logs_view else " disabled"
+    _time_disabled_attr = "" if _is_logs_view else " disabled"
+    _advanced_inputs_disabled_attr = "" if _is_logs_view else " disabled"
     _advanced_summary_text = "Advanced filtering" if _is_logs_view else f"Advanced filtering (not available for {_diag_view_human})"
     _filter_note_text = (
         f"All filters are available for {_diag_view_human} view."
         if _is_logs_view
         else f"{_diag_view_human} view does not support filters. Switch to Logs view to use filtering."
     )
+    log_diag_filter_form = (
+        "<form method='get' action='/' class='log-diag-filter-form'>"
+        "<input type='hidden' name='view' value='overview'>"
+        f"<input type='hidden' name='source' value='{html.escape(source_label)}'>"
+        "<div class='log-diag-filter-grid'>"
+        "<div><label for='diag-view-sel'>Diagnostic view</label>"
+        f"<select id='diag-view-sel' name='diag_view'>{_dvo}</select></div>"
+        "<div><label for='log-filter-sel'>Event / channel</label>"
+        f"<select id='log-filter-sel' name='log_filter'{_event_disabled_attr}>{_event_options_html}</select></div>"
+        "<div><label for='log-time-sel'>Time window</label>"
+        f"<select id='log-time-sel' name='log_time_scope'{_time_disabled_attr}>{_time_options_html}</select></div>"
+        "</div>"
+        "<details data-advanced-filtering='1' style='margin-top:10px;'>"
+        f"<summary data-advanced-summary='1' style='cursor:pointer;'>{html.escape(_advanced_summary_text)}</summary>"
+        "<div class='log-diag-filter-grid' style='margin-top:8px;'>"
+        "<div><label for='log-date-inp'>Date (calendar)</label>"
+        f"<input id='log-date-inp' type='date' name='log_date' value='{html.escape(_date_value)}'{_advanced_inputs_disabled_attr}></div>"
+        "<div><label for='log-time-from'>Time from</label>"
+        f"<input id='log-time-from' type='time' name='log_time_from' value='{html.escape(log_time_from_norm)}'{_advanced_inputs_disabled_attr}></div>"
+        "<div><label for='log-time-to'>Time to</label>"
+        f"<input id='log-time-to' type='time' name='log_time_to' value='{html.escape(log_time_to_norm)}'{_advanced_inputs_disabled_attr}></div>"
+        "</div></details>"
+        f"<div class='muted' data-log-filter-note='1' style='margin-top:6px;'>{html.escape(_filter_note_text)}</div>"
+        "<div class='button-row' style='margin-top:8px;'>"
+        "<button type='submit'>Apply filter</button>"
+        f"<a class='btn-inline btn-inline-muted' href='/?view=overview&diag_view=logs&log_filter=all&log_date=all&log_time_scope=all&log_time_from=&log_time_to=&source={html.escape(source_label)}'>Clear filters</a>"
+        "</div>"
+        "</form>"
+    )
+    log_diag_clear_top = ""
+    if diag_label == "logs":
+        log_diag_clear_top = (
+            "<form method='post' action='/clear-logs' class='log-diag-clear-form' style='display:inline;margin:0;'>"
+            "<button type='submit' onclick=\"return confirm('Clear local logs on this instance?');\" style='border-color:#ef4444;color:#ef4444;'>Clear local logs</button></form>"
+        )
+        if source_label != "local":
+            log_diag_clear_top += (
+                "<form method='post' action='/clear-logs-remote' class='log-diag-clear-form' style='display:inline;margin:0 0 0 8px;'>"
+                "<input type='hidden' name='source' value='" + html.escape(source_label) + "'>"
+                "<button type='submit' onclick=\"return confirm('Clear logs on the selected remote agent?');\" style='border-color:#ef4444;color:#ef4444;'>Clear selected agent logs</button></form>"
+            )
+    elif diag_label == "task":
+        log_diag_clear_top = (
+            "<form method='post' action='/clear-task-status' class='log-diag-clear-form' style='display:inline;margin:0;'>"
+            "<button type='submit' style='border-color:#ef4444;color:#ef4444;'>Clear task data</button></form>"
+        )
+    elif diag_label == "cache":
+        log_diag_clear_top = (
+            "<form method='post' action='/clear-cache' class='log-diag-clear-form' style='display:inline;margin:0;'>"
+            "<button type='submit' style='border-color:#ef4444;color:#ef4444;'>Clear cache</button></form>"
+        )
+    elif diag_label == "history":
+        log_diag_clear_top = (
+            "<form method='post' action='/clear-history' class='log-diag-clear-form' style='display:inline;margin:0;'>"
+            "<button type='submit' style='border-color:#ef4444;color:#ef4444;'>Clear history</button></form>"
+        )
+    elif diag_label == "system":
+        log_diag_clear_top = (
+            "<form method='post' action='/clear-system-cache' class='log-diag-clear-form' style='display:inline;margin:0;'>"
+            "<button type='submit' style='border-color:#ef4444;color:#ef4444;'>Clear system logs</button></form>"
+        )
     _log_pre_attrs = ""
     if agent_log_async:
         _log_pre_attrs = (
-            ' data-agent-fetch="1" data-peer-id="' + html.escape(source_label)
-            + '" data-view="' + html.escape(diag_label)
-            + '" data-log-filter="' + html.escape(filter_label)
-            + '" data-log-date="' + html.escape(log_date_norm)
-            + '" data-log-time-scope="' + html.escape(log_time_norm)
-            + '" data-log-time-from="' + html.escape(log_time_from_norm)
-            + '" data-log-time-to="' + html.escape(log_time_to_norm) + '"'
-            + ' data-log-word="' + html.escape(log_word_norm) + '"'
+            ' data-agent-fetch="1" data-peer-id="'
+            + html.escape(source_label)
+            + '" data-view="'
+            + html.escape(diag_label)
+            + '" data-log-filter="'
+            + html.escape(filter_label)
+            + '" data-log-date="'
+            + html.escape(log_date_norm)
+            + '" data-log-time-scope="'
+            + html.escape(log_time_norm)
+            + '" data-log-time-from="'
+            + html.escape(log_time_from_norm)
+            + '" data-log-time-to="'
+            + html.escape(log_time_to_norm)
+            + '"'
         )
     source_tabs_html = ""
     if peer_role == "master":
         q_base = (
             f"view=overview&amp;diag_view={diag_label}&amp;log_filter={filter_label}"
             f"&amp;log_date={html.escape(log_date_norm)}&amp;log_time_scope={html.escape(log_time_norm)}"
-            f"&amp;log_word={html.escape(log_word_norm)}"
         )
-        src_chips = [f"<a class='chip {'active' if source_label=='local' else ''}' href='?{q_base}&amp;log_source=local'>Local</a>"]
-        for sp in (cfg.get("peers", []) or []):
-            sp_id = str(sp.get("instance_id", "") or "").strip()
-            if not _is_valid_peer_instance_id(sp_id):
-                continue
-            snap_name = str((snapshot_by_id.get(sp_id, {}) or {}).get("instance_name", "") or "").strip()
-            sp_name = snap_name or str(sp.get("instance_name", "") or sp_id[:8])
+        src_chips = []
+        for sid, sname in available_sources:
             src_chips.append(
-                f"<a class='chip {'active' if source_label==sp_id else ''}' "
-                f"href='?{q_base}&amp;log_source={html.escape(sp_id)}'>"
-                f"{html.escape(sp_name)}</a>"
+                f"<a class='chip {'active' if source_label==sid else ''}' "
+                f"href='?{q_base}&amp;source={html.escape(sid)}'>"
+                f"{html.escape(sname)}"
+                "</a>"
             )
         source_tabs_html = (
-            "<div class='chip-row source-tabs' style='flex-wrap:wrap;'>"
+            "<div class='chip-row source-tabs' style='margin-top:8px;'>"
             + "".join(src_chips)
             + "</div>"
         )
@@ -6811,7 +7841,12 @@ def _render_setup_html(
                 continue
             seen_target_ids.add(tp_id)
             tp_name = str(tp.get("instance_name", "") or tp_id[:8])
-            target_options += f"<option value='{html.escape(tp_id)}'>{html.escape(tp_name)}</option>"
+            legacy_suffix = " — legacy" if _is_legacy_peer(tp) else ""
+            legacy_flag = "1" if _is_legacy_peer(tp) else "0"
+            target_options += (
+                f"<option value='{html.escape(tp_id)}' data-legacy-peer='{legacy_flag}'>"
+                f"{html.escape(tp_name)}{legacy_suffix}</option>"
+            )
     ui_view = (ui_view or "overview").strip().lower()
     if ui_view not in ("overview", "setup", "settings"):
         ui_view = "overview"
@@ -6846,14 +7881,6 @@ def _render_setup_html(
     """
     setup_popup_card = setup_card.replace(f'<details class="card"{setup_open_attr}>', '<details class="card" open>')
 
-    first_start = (len(monitors) == 0 and len(history) == 0)
-    show_guide_button = (not elevated_ok) or first_start
-    setup_header_action = (
-        "<form method='post' action='/open-setup-popup' style='display:inline;margin:0;'>"
-        "<button type='submit'>Elevation access guide</button></form>"
-        if show_guide_button
-        else ""
-    )
     popup_status_html = ""
     if show_setup_popup:
         if message:
@@ -6872,27 +7899,177 @@ def _render_setup_html(
     )
     nav_html = (
         "<div class='card'><div class='chip-row nav-tabs'>"
-        + f"<a class='chip {'active' if ui_view=='overview' else ''}' href='/?view=overview&diag_view={diag_label}&log_filter={filter_label}&log_source={html.escape(source_label)}&log_date={html.escape(log_date_norm)}&log_time_scope={html.escape(log_time_norm)}&log_word={html.escape(log_word_norm)}'>Overview</a>"
+        + f"<a class='chip {'active' if ui_view=='overview' else ''}' href='/?view=overview&diag_view={diag_label}&log_filter={filter_label}&source={html.escape(source_label)}&log_date={html.escape(log_date_norm)}&log_time_scope={html.escape(log_time_norm)}'>Overview</a>"
         + f"<a class='chip {'active' if ui_view=='setup' else ''}' href='/?view=setup'>Monitor Setup</a>"
         + f"<a class='chip {'active' if ui_view=='settings' else ''}' href='/?view=settings'>Settings</a>"
         + "</div>"
         + (source_tabs_html if ui_view == "overview" else "")
         + "</div>"
     )
-    log_diag_clear_actions_html = ""
-    if diag_label == "logs":
-        log_diag_clear_actions_html = (
-            "<form method='post' action='/clear-logs' style='margin:0;'>"
-            "<button type='submit' onclick=\"return confirm('Clear local logs on this instance?');\" "
-            "style='border-color:#ef4444;color:#ef4444;'>Clear local logs</button></form>"
-        )
-        if source_label != "local":
-            log_diag_clear_actions_html += (
-                "<form method='post' action='/clear-logs-remote' style='margin:0 0 0 8px;'>"
-                "<input type='hidden' name='source' value='" + html.escape(source_label) + "'>"
-                "<button type='submit' onclick=\"return confirm('Clear logs on the selected remote agent?');\" "
-                "style='border-color:#ef4444;color:#ef4444;'>Clear selected agent logs</button></form>"
+    source_scope_text = (
+        f"Viewing remote source: {source_name} (gauges and diagnostics are scoped to this source)."
+        if source_is_remote
+        else (f"Viewing local source: {source_name}." if peer_role == "master" else "")
+    )
+    update_channel = "main" if bool(cfg.get("update_from_main", False)) else "latest"
+    update_curl_cmd = (
+        f"curl -sSL https://raw.githubusercontent.com/{PUBLIC_GITHUB_REPO}/main/apps/unix-monitor/install.sh"
+        f" | sudo env PUBLIC_REPO={PUBLIC_GITHUB_REPO} UNIX_MONITOR_UPDATE_CHANNEL={update_channel} bash"
+    )
+    has_update_helper = get_update_helper_path().exists()
+    has_backup = (get_script_path().parent / "unix-monitor.py.prev").exists()
+    autoupdate_enabled = bool(cfg.get("autoupdate_enabled", False))
+    update_from_main = bool(cfg.get("update_from_main", False))
+    selected_channel = "main" if update_from_main else "latest"
+    selected_channel_label = "main" if update_from_main else "latest release"
+    update_check_result = _load_update_check_result() if not source_is_remote else {}
+    update_check_stale = (not source_is_remote) and _update_check_needs_refresh(cfg=cfg, last=update_check_result)
+    latest_version = str(update_check_result.get("public_version", "") or update_check_result.get("latest_version", "") or "")
+    cached_channel = str(update_check_result.get("selected_channel", "") or "")
+    effective_ref = str(update_check_result.get("effective_ref", "") or update_check_result.get("selected_ref", "") or selected_channel)
+    public_label = f"{selected_channel} via {effective_ref}" if effective_ref and effective_ref != selected_channel else selected_channel
+    channel_matches_cache = (cached_channel == selected_channel) or (not cached_channel and selected_channel == "latest")
+    if update_check_stale or not channel_matches_cache:
+        latest_version = ""
+    display_runtime_version_short = _version_display_short(display_runtime_version)
+    latest_version_short = _version_display_short(latest_version or "unknown")
+    # Only show update available if cache says so AND current VERSION is actually older (stale cache fix after manual update)
+    update_available = (not update_check_stale) and channel_matches_cache and bool(update_check_result.get("update_available")) and (
+        latest_version and _version_tuple(VERSION) < _version_tuple(latest_version)
+    )
+    update_status_text = "checking..." if (update_check_stale or not channel_matches_cache) else "unknown (use Recheck for updates)"
+    if latest_version:
+        update_status_text = "update available" if update_available else "up to date"
+    update_confirm = (
+        f"Update now from {selected_channel_label} to v{latest_version}? Current local version is v{VERSION}. "
+        "Config and data will be preserved. Page will reload after update."
+        if latest_version
+        else f"Run update from {selected_channel_label}? Config and data will be preserved. Page will reload after update."
+    )
+    package_update_btns = ""
+    if not source_is_remote:
+        update_ready_banner = ""
+        if autoupdate_enabled and update_available and has_update_helper:
+            ver_text = f" (v{html.escape(latest_version)})" if latest_version else ""
+            update_ready_banner = (
+                "<div class='update-ready-banner'>"
+                "<span>An update is available" + ver_text + ". </span>"
+                "<form method='post' action='/self-update' style='display:inline;' onsubmit='return confirm(\"" + html.escape(update_confirm) + "\");'>"
+                "<button type='submit' class='btn-inline'>Update now</button></form>"
+                " <form method='post' action='/settings/request-autoupdate-on-logout' style='display:inline;'>"
+                "<button type='submit' class='btn-inline btn-inline-muted'>Update after logout</button></form>"
+                "</div>"
             )
+        enable_btn_class = "autoupdate-btn autoupdate-btn-active" if autoupdate_enabled else "autoupdate-btn"
+        disable_btn_class = "autoupdate-btn autoupdate-btn-active" if not autoupdate_enabled else "autoupdate-btn"
+        from_main_enable_class = "autoupdate-btn autoupdate-btn-active" if update_from_main else "autoupdate-btn"
+        from_main_disable_class = "autoupdate-btn autoupdate-btn-active" if not update_from_main else "autoupdate-btn"
+        autoupdate_form = (
+            update_ready_banner
+            + "<div class='autoupdate-row'>"
+            "<form method='post' action='/settings/save-autoupdate' class='autoupdate-form' style='display:inline;'>"
+            "<input type='hidden' name='autoupdate_enabled' value='1'>"
+            "<button type='submit' class='" + enable_btn_class + "'>Enable autoupdate</button></form>"
+            " <form method='post' action='/settings/save-autoupdate' class='autoupdate-form' style='display:inline;'>"
+            "<input type='hidden' name='autoupdate_enabled' value='0'>"
+            "<button type='submit' class='" + disable_btn_class + "'>Disable autoupdate</button></form>"
+            "<span class='autoupdate-hint'>Check on each visit, apply if newer.</span></div>"
+            + "<div class='autoupdate-row'>"
+            "<form method='post' action='/settings/save-update-from-main' class='autoupdate-form' style='display:inline;'>"
+            "<input type='hidden' name='update_from_main' value='1'>"
+            "<button type='submit' class='" + from_main_enable_class + "'>Update from main</button></form>"
+            " <form method='post' action='/settings/save-update-from-main' class='autoupdate-form' style='display:inline;'>"
+            "<input type='hidden' name='update_from_main' value='0'>"
+            "<button type='submit' class='" + from_main_disable_class + "'>Update from latest</button></form>"
+            "<span class='autoupdate-hint'>Update source controls which public version is checked/applied.</span></div>"
+        )
+        package_update_btns = autoupdate_form
+        if has_update_helper:
+            package_update_btns += "<div class='button-row' style='margin-bottom:8px;'><form method='post' action='/self-update' style='display:inline;' onsubmit='return confirm(\"" + html.escape(update_confirm) + "\");'><button type='submit' class='btn-inline'>Update now</button></form>"
+        if has_backup and has_update_helper:
+            package_update_btns += " <form method='post' action='/self-rollback' style='display:inline;' onsubmit='return confirm(\"Restore previous version?\");'><button type='submit' class='btn-inline' style='border-color:#ef4444;color:#ef4444;'>Rollback</button></form>"
+        if "button-row" in package_update_btns:
+            package_update_btns += "</div>"
+    ip_lines: List[str] = []
+    if display_server_ip and display_server_ip not in ("n/a", "remote"):
+        ip_lines.append(display_server_ip)
+    if source_is_remote:
+        if display_server_ip and display_server_ip not in ("n/a", "remote"):
+            ip_lines.append("(communication endpoint used for this selected source)")
+        ip_list_text = "\n".join(ip_lines) if ip_lines else "No remote communication endpoint available."
+    else:
+        for ip in all_ips:
+            if ip not in ip_lines:
+                ip_lines.append(ip)
+        if "127.0.0.1" not in ip_lines:
+            ip_lines.append("127.0.0.1")
+        ip_list_text = "\n".join(ip_lines) if ip_lines else "No IP addresses detected."
+    login_history_text = "\n".join(login_lines)
+    local_specs = _collect_system_specs()
+    spec_cpu = "n/a (remote source)" if source_is_remote else local_specs.get("cpu", "n/a")
+    spec_ram = "n/a (remote source)" if source_is_remote else local_specs.get("ram", "n/a")
+    spec_disk = "n/a (remote source)" if source_is_remote else local_specs.get("disk", "n/a")
+    spec_uptime = "n/a (remote source)" if source_is_remote else local_specs.get("uptime", "n/a")
+    cpu_detail_text = (
+        f"CPU: {spec_cpu}\nSource: /proc/cpuinfo model/hardware\n{source_scope_text}"
+        if not source_is_remote
+        else f"CPU: {spec_cpu}\nDetails are available on the selected remote source UI."
+    )
+    ram_detail_text = (
+        f"RAM (Total): {spec_ram}\nSource: /proc/meminfo MemTotal\n{source_scope_text}"
+        if not source_is_remote
+        else f"RAM (Total): {spec_ram}\nDetails are available on the selected remote source UI."
+    )
+    disk_detail_text = (
+        f"Disk (Total / Free): {spec_disk}\nSource: statvfs('/')\n{source_scope_text}"
+        if not source_is_remote
+        else f"Disk (Total / Free): {spec_disk}\nDetails are available on the selected remote source UI."
+    )
+    uptime_detail_text = (
+        f"Uptime: {spec_uptime}\nSource: /proc/uptime\n{source_scope_text}"
+        if not source_is_remote
+        else f"Uptime: {spec_uptime}\nDetails are available on the selected remote source UI."
+    )
+    package_panel_open = " open" if open_server_panel == "package" else ""
+    package_panel_html = (
+        "<div class='card server-action-panel" + package_panel_open + "' data-server-panel='package'>"
+        "<h4>Unix runtime update</h4>"
+        + package_update_btns
+        + "<div class='button-row'>"
+        + "<a class='btn-inline' href='" + html.escape(REPO_URL) + "' target='_blank' rel='noopener noreferrer'>Open GitHub repository</a>"
+        + (" <form method='post' action='/settings/recheck-updates' style='display:inline;'><button type='submit' class='btn-inline btn-inline-muted'>Recheck for updates</button></form>" if not source_is_remote else "")
+        + "</div>"
+        + "<div class='muted'>Selected source: " + html.escape(selected_channel_label) + " | Current Unix runtime (" + html.escape(display_source_name) + "): <span title='" + html.escape(display_runtime_version) + "'>" + html.escape(display_runtime_version_short) + "</span> | Public Unix runtime (" + html.escape(public_label) + "): <span title='" + html.escape(latest_version or 'unknown') + "'>" + html.escape(latest_version_short) + "</span> | Status: " + html.escape(update_status_text) + "</div>"
+        + "<pre>" + html.escape(update_curl_cmd) + "</pre>"
+        + "<div class='muted'>Update: backs up, downloads latest, validates, replaces. On failure restores previous. Config and data preserved.</div>"
+        + "<div class='muted'>" + html.escape(source_scope_text) + "</div></div>"
+    )
+    server_info_card_html = (
+        "<div class='server-info-grid'>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='name'><span class='muted'>Name</span><strong>{html.escape(display_source_name)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='ip'><span class='muted'>IP</span><strong>{html.escape(display_server_ip)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='time'><span class='muted'>Time</span><strong>{html.escape(display_now_text)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='cpu'><span class='muted'>CPU</span><strong>{html.escape(spec_cpu)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='ram'><span class='muted'>RAM (Total)</span><strong>{html.escape(spec_ram)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='disk'><span class='muted'>Disk (Total / Free)</span><strong>{html.escape(spec_disk)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='uptime'><span class='muted'>Uptime</span><strong>{html.escape(spec_uptime)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='package'><span class='muted'>Unix Runtime Version</span><strong title='{html.escape(display_runtime_version)}'>{html.escape(display_runtime_version_short)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='login'><span class='muted'>Last Login Source IP</span><strong>{html.escape(display_last_login_ip)}</strong></button>"
+        f"<button type='button' class='server-info-item server-info-action' data-server-action='login-time'><span class='muted'>Last Login Time</span><strong>{html.escape(display_last_login_at_text)}</strong></button>"
+        "</div>"
+        "<div class='server-action-panels'>"
+        f"<div class='card server-action-panel' data-server-panel='name'><h4>Change server name</h4><form method='post' action='/settings/save-instance-name'><label>Instance Name</label><input name='instance_name' value='{html.escape(str(cfg.get('instance_name', '') or ''))}' placeholder='e.g. HQ-NAS'><div class='button-row'><button type='submit'>Save name</button></div></form></div>"
+        f"<div class='card server-action-panel' data-server-panel='ip'><h4>System IP addresses</h4><div class='muted'>Current web UI bind: {html.escape(bind_scope_text)} on port {ui_bind_port}</div><pre>{html.escape(ip_list_text)}</pre></div>"
+        f"<div class='card server-action-panel' data-server-panel='time'><h4>Time sync details</h4><pre>Current time: {html.escape(now_text)}\nLast peer sync: {html.escape(peer_last_sync_text)}\nNTP synced: {html.escape(ntp_info.get('synced', 'unknown'))}\nNTP service: {html.escape(ntp_info.get('service', 'unknown'))}\nNTP source: {html.escape(ntp_info.get('source', 'unknown'))}\n\n{html.escape(ntp_info.get('detail', ''))}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='cpu'><h4>CPU details</h4><pre>{html.escape(cpu_detail_text)}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='ram'><h4>RAM details</h4><pre>{html.escape(ram_detail_text)}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='disk'><h4>Disk details</h4><pre>{html.escape(disk_detail_text)}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='uptime'><h4>Uptime details</h4><pre>{html.escape(uptime_detail_text)}</pre></div>"
+        + package_panel_html
+        + f"<div class='card server-action-panel' data-server-panel='login'><h4>Recent login events (IP + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
+        + f"<div class='card server-action-panel' data-server-panel='login-time'><h4>Recent login events (time + state)</h4><pre>{html.escape(login_history_text)}</pre></div>"
+        + "</div>"
+    )
     internet_probe = _get_cached_render_value(
         "internet_probe",
         ttl_sec=15,
@@ -6914,16 +8091,7 @@ def _render_setup_html(
         if internet_required
         else "Standalone mode supports local monitoring without internet. Internet is only required when remote push to Kuma, server sync, or update workflows are used."
     )
-    overview_view_html = f"""
-      <div class="card">
-        <h3>Current Server <span class="badge muted-badge">{html.escape(selected_source_name)}</span></h3>
-        <div class="muted" style="margin-bottom:8px;">{html.escape(source_scope_text)}</div>
-        {server_info_card_html}
-      </div>
-      <div class="card">
-        <h3>Monitoring Overview</h3>
-        <div class="overview-grid">{overview_html}</div>
-      </div>
+    overview_internet_card_html = f"""
       <div class="card">
         <h3>Internet Check</h3>
         <div class="server-info-grid">
@@ -6943,23 +8111,43 @@ def _render_setup_html(
           </div>
         </div>
       </div>
+    """
+    overview_view_html = f"""
+      {overview_internet_card_html}
+      <div class="card">
+        <h3>Current Server <span class="badge muted-badge">{html.escape(display_source_name)}</span></h3>
+        <div class="muted" style="margin-bottom:8px;">{html.escape(source_scope_text)}</div>
+        {server_info_card_html}
+      </div>
+      <div class="card">
+        <h3>Monitoring Overview</h3>
+        <div class="overview-grid">{overview_html}</div>
+      </div>
       <div class="card">
         <h3>Logs & Diagnostics</h3>
-        <div class='log-diag-active-banner'><strong>Viewing:</strong> {html.escape(diag_view_labels.get(diag_label, diag_label))} · {html.escape(event_labels.get(filter_label, filter_label))} · {html.escape(time_labels.get(log_time_norm, log_time_norm))} · date {html.escape(date_labels.get(log_date_norm, log_date_norm))} · exact {html.escape((log_time_from_norm or '--:--') + ' to ' + (log_time_to_norm or '--:--')) if (log_time_from_norm or log_time_to_norm) else 'full day'} · word {html.escape(log_word_norm or '(any)')}</div>
-        {"<div class='log-diag-meta'>UI log file: " + html.escape(_fmt_ui_log_size(log_bytes)) + f" · {log_lines_total:,} lines on disk · rolling window: up to {UI_LOG_DISPLAY_LINES} newest matching lines.</div>" if diag_label == "logs" and source_label == "local" else ("<div class='log-diag-meta'>UI log file: remote agent (" + html.escape(selected_source_name) + ") · size/line count shown on agent UI · rolling window: up to " + str(UI_LOG_DISPLAY_LINES) + " newest matching lines.</div>" if diag_label == "logs" else "")}
-        <form method="get" action="/" class="log-diag-filter-form"><input type="hidden" name="view" value="overview"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><div class="log-diag-filter-grid"><div><label for="diag-view-sel">Diagnostic view</label><select id="diag-view-sel" name="diag_view">{_dvo}</select></div><div><label for="log-filter-sel">Event / channel</label><select id="log-filter-sel" name="log_filter"{event_select_disabled_attr}>{_event_options_html}</select></div><div><label for="log-time-sel">Time window</label><select id="log-time-sel" name="log_time_scope"{time_select_disabled_attr}>{_time_options_html}</select></div></div><details data-advanced-filtering="1" style="margin-top:10px;"><summary data-advanced-summary="1" style="cursor:pointer;">{html.escape(_advanced_summary_text)}</summary><div class="log-diag-filter-grid" style="margin-top:8px;"><div><label for="log-date-inp">Date (calendar)</label><input id="log-date-inp" type="date" name="log_date" value="{html.escape('' if log_date_norm == 'all' else log_date_norm)}"{advanced_inputs_disabled_attr}></div><div><label for="log-time-from">Time from</label><input id="log-time-from" type="time" name="log_time_from" value="{html.escape(log_time_from_norm)}"{advanced_inputs_disabled_attr}></div><div><label for="log-time-to">Time to</label><input id="log-time-to" type="time" name="log_time_to" value="{html.escape(log_time_to_norm)}"{advanced_inputs_disabled_attr}></div><div><label for="log-word-inp">Contains word</label><input id="log-word-inp" type="text" name="log_word" value="{html.escape(log_word_norm)}" placeholder="e.g. timeout, failed, dns"{advanced_inputs_disabled_attr}></div></div></details><div class='muted' data-log-filter-note='1' style='margin-top:6px;'>{html.escape(_filter_note_text)}</div><div class='button-row' style='margin-top:8px;'><button type='submit'>Apply filter</button><a class='btn-inline btn-inline-muted' href='/?view=overview&diag_view=logs&log_filter=all&log_date=all&log_time_scope=all&log_time_from=&log_time_to=&log_word=&log_source={html.escape(source_label)}'>Clear filters</a></div></form>
-        <div class="log-diag-toolbar"><div class="log-diag-toolbar-left">{log_diag_clear_actions_html}</div><div class="button-row" style="margin:0;"><form method="get" action="/"><input type="hidden" name="view" value="overview"><input type="hidden" name="diag_view" value="{html.escape(diag_label)}"><input type="hidden" name="log_filter" value="{html.escape(filter_label)}"><input type="hidden" name="log_date" value="{html.escape(log_date_norm)}"><input type="hidden" name="log_time_scope" value="{html.escape(log_time_norm)}"><input type="hidden" name="log_time_from" value="{html.escape(log_time_from_norm)}"{advanced_inputs_disabled_attr}><input type="hidden" name="log_time_to" value="{html.escape(log_time_to_norm)}"{advanced_inputs_disabled_attr}><input type="hidden" name="log_word" value="{html.escape(log_word_norm)}"><input type="hidden" name="log_source" value="{html.escape(source_label)}"><button type="submit">Refresh</button></form>{("<form method='get' action='/' style='margin-left:auto;'><input type='hidden' name='view' value='overview'><input type='hidden' name='diag_view' value='" + html.escape(diag_label) + "'><input type='hidden' name='log_filter' value='" + html.escape(filter_label) + "'><input type='hidden' name='log_date' value='" + html.escape(log_date_norm) + "'><input type='hidden' name='log_time_scope' value='" + html.escape(log_time_norm) + "'><input type='hidden' name='log_time_from' value='" + html.escape(log_time_from_norm) + "'><input type='hidden' name='log_time_to' value='" + html.escape(log_time_to_norm) + "'><input type='hidden' name='log_word' value='" + html.escape(log_word_norm) + "'><input type='hidden' name='log_source' value='" + html.escape(source_label) + "'><input type='hidden' name='diagnose' value='1'><button type='submit'>Diagnose connection</button></form>") if source_label != "local" else ""}</div></div>
+        {log_diag_banner}
+        {log_diag_stats}
+        {log_diag_filter_form}
+        <div class="log-diag-toolbar">
+          <div class="log-diag-toolbar-left">{log_diag_clear_top}</div>
+          <div class="button-row" style="margin:0;">
+            <form method="get" action="/"><input type="hidden" name="view" value="overview"><input type="hidden" name="diag_view" value="{html.escape(diag_label)}"><input type="hidden" name="log_filter" value="{html.escape(filter_label)}"><input type="hidden" name="log_date" value="{html.escape(log_date_norm)}"><input type="hidden" name="log_time_scope" value="{html.escape(log_time_norm)}"><input type="hidden" name="log_time_from" value="{html.escape(log_time_from_norm)}"><input type="hidden" name="log_time_to" value="{html.escape(log_time_to_norm)}"><input type="hidden" name="source" value="{html.escape(source_label)}"><button type="submit">Refresh</button></form>
+            {("<form method='get' action='/' style='margin-left:auto;'><input type='hidden' name='view' value='overview'><input type='hidden' name='diag_view' value='" + html.escape(diag_label) + "'><input type='hidden' name='log_filter' value='" + html.escape(filter_label) + "'><input type='hidden' name='log_date' value='" + html.escape(log_date_norm) + "'><input type='hidden' name='log_time_scope' value='" + html.escape(log_time_norm) + "'><input type='hidden' name='log_time_from' value='" + html.escape(log_time_from_norm) + "'><input type='hidden' name='log_time_to' value='" + html.escape(log_time_to_norm) + "'><input type='hidden' name='source' value='" + html.escape(source_label) + "'><input type='hidden' name='diagnose' value='1'><button type='submit'>Diagnose connection</button></form>") if source_label != "local" else ""}
+          </div>
+        </div>
         <pre id="log-diag-pre"{_log_pre_attrs}>{html.escape(log_text)}</pre>
       </div>
     """
     auto_rows = [
+        ("Scheduler backend", str(automation_data.get("backend", "n/a") or "n/a")),
         ("Automatic checks (global)", "yes" if automation_data.get("global_enabled") else "no"),
-        ("Global fallback interval", f"{int(automation_data.get('global_interval_minutes', 60) or 60)} minute(s)"),
+        ("Global interval", f"{int(automation_data.get('global_interval_minutes', 60) or 60)} minute(s)"),
         ("Last scheduled run", str(automation_data.get("last_scheduled_run", "never") or "never")),
         ("Due now", str(automation_data.get("is_due", "n/a") or "n/a")),
         ("Scheduler process", str(automation_data.get("scheduler_process", "n/a") or "n/a")),
+        ("Scheduler timer", str(automation_data.get("scheduler_timer", "n/a") or "n/a")),
+        ("Timer next trigger", str(automation_data.get("timer_next", "n/a") or "n/a")),
         ("SMART elevated cache", ("active" if automation_data.get("smart_cache_active") else "inactive") + " | " + str(automation_data.get("smart_cache_message", "n/a") or "n/a")),
-        ("Scheduler service script", str(automation_data.get("service_script", "n/a") or "n/a")),
     ]
     automation_summary_html = (
         "<div class='server-info-grid'>"
@@ -7001,7 +8189,6 @@ def _render_setup_html(
       </div>
       <div class="card">
         <h3>Monitor Setup</h3>
-        <div class="button-row">{setup_header_action}</div>
         <div class="muted">Create, edit, and delete monitors from this view.</div>
         <form method="post" action="/open-create" style="margin-top:10px;">
           <button type="submit">Create monitor</button>
@@ -7013,7 +8200,7 @@ def _render_setup_html(
     settings_view_html = f"""
       <div class="card" id="settings">
         <h3>Application Settings & Security</h3>
-        {"<div class='ok'>" + html.escape(top_security_message) + "</div>" if top_security_message else ""}
+        {"<div class='ok'>" + html.escape(security_message) + "</div>" if security_message else ""}
         {"<pre>" + html.escape(security_output) + "</pre>" if security_output else ""}
         <form method="post" action="/settings/save-instance-name">
           <div class="field">
@@ -7031,7 +8218,7 @@ def _render_setup_html(
             <label>Web UI port</label>
             <input name="ui_bind_port" type="number" min="1" max="65535" value="{ui_bind_port}">
           </div>
-          <div class="muted">Applies after restarting the Synology monitor UI/service.</div>
+          <div class="muted">Applies after restarting the Unix monitor UI/service.</div>
           <div class="button-row"><button type="submit">Save web UI binding</button></div>
         </form>
         <form method="post" action="/settings/save-internet-check">
@@ -7068,7 +8255,6 @@ def _render_setup_html(
             <input name="internet_check_timeout_ms" type="number" min="250" max="15000" value="{int(internet_settings.get("timeout_ms", 1500))}">
           </div>
           <div class="muted">Used by the Internet Check card and login connectivity probe API.</div>
-          {"<div class='ok'>" + html.escape(internet_check_message) + "</div>" if internet_check_message else ""}
           <div class="button-row"><button type="submit">Save internet check settings</button></div>
         </form>
         <form method="post" action="/auth/change-password">
@@ -7076,10 +8262,19 @@ def _render_setup_html(
           <label>Change password</label>
           <div class="muted">Unused recovery codes: {recovery_unused}</div>
           <div class="row">
-            <div><input name="current_password" type="password" autocomplete="current-password" placeholder="Current password" required></div>
-            <div><input name="new_password" type="password" autocomplete="new-password" minlength="10" placeholder="New password" required></div>
+            <div class="input-with-action">
+              <input id="security-current-password" name="current_password" type="password" autocomplete="current-password" placeholder="Current password" required>
+              <button type="button" class="btn-icon toggle-password-btn" data-target="security-current-password" aria-label="Show password">Show</button>
+            </div>
+            <div class="input-with-action">
+              <input id="security-new-password" name="new_password" type="password" autocomplete="new-password" minlength="10" placeholder="New password" required>
+              <button type="button" class="btn-icon toggle-password-btn" data-target="security-new-password" aria-label="Show password">Show</button>
+            </div>
           </div>
-          <input name="new_password_confirm" type="password" autocomplete="new-password" minlength="10" placeholder="Confirm new password" required>
+          <div class="input-with-action">
+            <input id="security-confirm-password" name="new_password_confirm" type="password" autocomplete="new-password" minlength="10" placeholder="Confirm new password" required>
+            <button type="button" class="btn-icon toggle-password-btn" data-target="security-confirm-password" aria-label="Show password">Show</button>
+          </div>
           <div class="button-row"><button type="submit">Update password</button></div>
         </form>
         <div class="button-row">
@@ -7102,7 +8297,10 @@ def _render_setup_html(
           <div class="muted" style="margin-top:4px;">Full encrypted backup or public-only settings.</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;">
             <form method="post" action="/auth/export-backup" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0;">
-              <input name="backup_key" id="backup_key" type="password" placeholder="Encryption key (min 12 chars)" style="min-width:200px;" minlength="12" required>
+              <div class="input-with-action" style="min-width:200px;">
+                <input name="backup_key" id="backup_key" type="password" placeholder="Encryption key (min 12 chars)" minlength="12" required>
+                <button type="button" class="btn-icon toggle-password-btn" data-target="backup_key" aria-label="Show password">Show</button>
+              </div>
               <button type="button" onclick="var k=document.getElementById('backup_key');k.value=Array.from(crypto.getRandomValues(new Uint8Array(24))).map(b=>b.toString(16).padStart(2,'0')).join('');k.type='text';k.select();">Generate key</button>
               <button type="submit">Export Encrypted Backup</button>
             </form>
@@ -7116,7 +8314,10 @@ def _render_setup_html(
           <label>Import settings backup</label>
           <div class="muted" style="margin-top:4px;">Encrypted backups require the decryption key. Paste JSON or choose file.</div>
           <label>Decryption key <span class="muted">(required for encrypted backups)</span></label>
-          <input name="backup_key" type="password" placeholder="Enter the key you saved during export" style="margin-top:4px;">
+          <div class="input-with-action">
+            <input id="backup-import-key" name="backup_key" type="password" placeholder="Enter the key you saved during export" style="margin-top:4px;">
+            <button type="button" class="btn-icon toggle-password-btn" data-target="backup-import-key" aria-label="Show password">Show</button>
+          </div>
           <label>Backup JSON</label>
           <textarea name="import_payload" rows="5" style="width:100%;margin-top:6px;box-sizing:border-box;border:1px solid #30405b;border-radius:8px;background:#0f1726;color:#d7e2f0;padding:8px;" placeholder="Paste backup JSON or use file below"></textarea>
           <label>Or import from file</label>
@@ -7161,6 +8362,7 @@ def _render_setup_html(
     .main-col, .side-col {{ min-width: 0; }}
     .card {{ background: rgba(18,29,47,0.94); border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin-bottom: 14px; box-shadow: 0 14px 30px rgba(0,0,0,.28); backdrop-filter: blur(4px); }}
     .danger-zone-card {{ border-color: rgba(239,68,68,.35); }}
+    /* Stack above the following settings cards so peer dropdowns are not covered (e.g. Danger Zone). */
     #peering-card {{ position: relative; z-index: 30; }}
     #peer-live-panel {{ overflow: visible; position: relative; }}
     h2 {{ margin: 0 0 6px 0; color: #e7f0ff; font-size: 22px; }}
@@ -7169,8 +8371,13 @@ def _render_setup_html(
     label {{ display: block; margin-top: 10px; font-weight: 600; color: #c8d8ee; }}
     input, select {{ width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; border: 1px solid #30405b; border-radius: 6px; background: #0f1726; color: var(--text); }}
     .row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .input-with-action {{ display:flex; align-items:center; gap:8px; }}
+    .input-with-action > input {{ flex:1 1 auto; min-width:0; }}
+    .btn-icon {{ padding: 8px 12px; white-space: nowrap; flex: 0 0 auto; }}
     .button-row {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; margin-bottom: 12px; }}
     .button-row:last-child {{ margin-bottom: 0; }}
+    .peering-action-row button {{ white-space: nowrap; }}
+    .peering-action-row form {{ display: inline-flex; margin: 0; }}
     form {{ margin: 0; }}
     button {{ margin: 0; padding: 9px 14px; border: 1px solid #36517a; background: transparent; color: #c8dbf8; border-radius: 8px; cursor: pointer; font-weight: 600; line-height: 1.2; font-size: 13px; }}
     button:hover {{ background: rgba(54,81,122,.25); }}
@@ -7195,19 +8402,82 @@ def _render_setup_html(
     .overview-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-top: 12px; }}
     .overview-card {{ border: 1px solid var(--border); border-radius: 10px; background: var(--card-soft); padding: 10px; }}
     .overview-card.hl-channel {{ border-color: #4c8ff6; box-shadow: 0 0 0 1px rgba(76,143,246,0.45) inset; }}
+    .gauge-link {{ text-decoration: none; }}
+    .gauge {{ width: 140px; height: 140px; border-radius: 50%; margin: 8px auto; position: relative; background: conic-gradient(var(--gauge-color, var(--unknown)) calc(var(--pct, 0) * 1%), #263143 0); }}
+    .gauge::after {{ content: ""; position: absolute; inset: 14px; border-radius: 50%; background: #0f1726; border: 1px solid #30405a; }}
+    .gauge-center {{ position: absolute; inset: 0; display: grid; place-content: center; z-index: 1; text-align: center; }}
+    .gauge-value {{ font-size: 12px; font-weight: 700; }}
+    .gauge-sub {{ font-size: 11px; color: var(--muted); }}
+    .st-up {{ --gauge-color: var(--green); color: #93efb7; }}
+    .st-warning {{ --gauge-color: var(--yellow); color: #ffd58a; }}
+    .st-down {{ --gauge-color: var(--red); color: #ffafaf; }}
+    .st-unknown {{ --gauge-color: var(--unknown); color: #b8c6d8; }}
+    .history-dots {{ margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; min-height: 12px; }}
+    .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
+    .monitor-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }}
+    .agent-monitors-by-host {{ display: flex; flex-direction: column; gap: 18px; }}
+    .info-callout {{ border: 1px solid rgba(47,128,237,.35); background: rgba(47,128,237,.08); border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.45; }}
+    .legacy-warning-callout {{ border-color: rgba(245,158,11,.45); background: rgba(245,158,11,.1); color: #f8e4c0; }}
+    .agent-host-heading {{ margin: 0 0 8px 0; font-size: 15px; font-weight: 700; color: #b8cae3; }}
+    .monitor-card {{ border: 1px solid var(--border); border-radius: 10px; background: var(--card-soft); padding: 12px; display: flex; flex-direction: column; }}
+    .monitor-card .button-row {{ margin-top: auto; padding-top: 14px; }}
+    .monitor-card .btn-remove {{ background: transparent; border: 1px solid #ef4444; color: #ef4444; }}
+    .monitor-card .btn-remove:hover {{ background: rgba(239,68,68,.12); }}
+    .monitor-card.hl-monitor {{ border-color: #4c8ff6; box-shadow: 0 0 0 1px rgba(76,143,246,0.45) inset; }}
+    .monitor-head {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
+    .monitor-title {{ font-weight: 700; color: #d8e8ff; }}
+    .badge {{ font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid transparent; }}
+    .badge.st-up {{ background: rgba(34,197,94,.15); border-color: rgba(34,197,94,.35); }}
+    .badge.st-warning {{ background: rgba(245,158,11,.16); border-color: rgba(245,158,11,.4); }}
+    .badge.st-down {{ background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.4); }}
+    .badge.st-unknown {{ background: rgba(100,116,139,.2); border-color: rgba(100,116,139,.4); }}
+    .badge.muted-badge {{ background: rgba(100,116,139,.15); border-color: rgba(100,116,139,.35); color: var(--muted); font-size:.7rem; }}
+    .badge.ok {{ background: rgba(34,197,94,.15); border-color: rgba(34,197,94,.35); }}
+    .badge.err {{ background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.4); }}
+    .monitor-meta {{ margin-top: 8px; font-size: 12px; color: #9fb2cc; line-height: 1.35; }}
+    .monitor-meta.token-row {{ margin-bottom: 10px; }}
+    .monitor-meta code {{ display: inline-block; padding: 3px 6px; margin-left: 4px; line-height: 1.2; overflow-wrap: anywhere; }}
+    .monitor-card .button-row {{ margin-bottom: 0; }}
+    .pulse-hit {{ animation: pulseGlow 900ms ease; }}
+    @keyframes pulseGlow {{
+      0% {{ box-shadow: 0 0 0 0 rgba(47,128,237,0.65); transform: scale(1); }}
+      45% {{ box-shadow: 0 0 0 8px rgba(47,128,237,0.0); transform: scale(1.01); }}
+      100% {{ box-shadow: 0 0 0 0 rgba(47,128,237,0.0); transform: scale(1); }}
+    }}
+    .chip {{ display: inline-block; padding: 7px 14px; border-radius: 10px; border: 1px solid #3f5f88; color: #c5dcff; text-decoration: none; font-size: 12px; font-weight: 600; transition: all 140ms ease; line-height: 1.2; }}
+    .chip:hover {{ border-color: #5aa1ff; color: #e6f2ff; }}
+    .chip.active {{ background: linear-gradient(180deg, rgba(87,156,255,.35), rgba(47,128,237,.28)); border-color: #67abff; color: #eaf4ff; box-shadow: 0 0 0 1px rgba(103,171,255,.2) inset; }}
+    .chip-row {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; margin-bottom: 4px; }}
+    #log-diag-pre {{ max-height: 22rem; overflow: auto; font-size: 11px; line-height: 1.35; }}
+    .log-diag-active-banner {{ margin: 0 0 10px 0; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(76,143,246,0.45); background: rgba(47,128,237,0.12); color: #d2e4ff; font-size: 13px; }}
+    .log-diag-meta {{ margin: 0 0 10px 0; font-size: 12px; color: var(--muted); }}
+    .log-diag-toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 10px; }}
+    .log-diag-toolbar-left {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .log-diag-filter-form {{ margin: 0 0 12px 0; }}
+    .log-diag-filter-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }}
+    .log-diag-filter-grid label {{ margin-top: 0; font-size: 11px; }}
+    .log-diag-filter-grid select {{ margin-top: 2px; }}
+    .nav-tabs {{ justify-content: center; gap: 12px; }}
+    .source-tabs {{ justify-content: center; }}
     .server-info-grid {{ display:grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap:8px; }}
     .server-info-item {{ border:1px solid var(--border); border-radius:10px; background:var(--card-soft); padding:10px; display:flex; flex-direction:column; gap:4px; align-items:center; justify-content:center; text-align:center; }}
     .server-info-action {{ text-align:center; width:100%; cursor:pointer; transition:all .16s ease; }}
-    .server-info-action:hover {{ border-color:#4c8ff6; background:rgba(76,143,246,.08); }}
+    .server-info-action:hover {{ border-color:#4c8ff6; box-shadow:0 0 0 1px rgba(76,143,246,.35) inset; transform: translateY(-1px); }}
     .server-action-panels {{ margin-top:10px; }}
     .server-action-panel {{ display:none; border-color:rgba(76,143,246,.3); }}
     .server-action-panel.open {{ display:block; }}
     .server-action-panel[data-server-panel='package'] {{ text-align:left; }}
+    .autoupdate-row {{ margin-bottom:12px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }}
+    .autoupdate-form {{ margin:0; }}
+    .autoupdate-btn {{ padding:8px 14px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; border:1px solid #36517a; background:transparent; color:#8fa1b8; transition:all .15s ease; }}
+    .autoupdate-btn:hover {{ background:rgba(54,81,122,.25); color:#c8dbf8; }}
+    .autoupdate-btn-active {{ background:linear-gradient(180deg,rgba(87,156,255,.35),rgba(47,128,237,.28)); border-color:#4c8ff6; color:#eaf4ff; }}
+    .autoupdate-btn-active:hover {{ background:linear-gradient(180deg,rgba(87,156,255,.45),rgba(47,128,237,.38)); }}
+    .autoupdate-hint {{ font-size:12px; color:var(--muted); margin-left:4px; }}
     .server-action-panel[data-server-panel='package'] .button-row {{ justify-content:flex-start; }}
     .btn-inline {{ display:inline-block; padding:9px 14px; border:1px solid #36517a; border-radius:8px; text-decoration:none; color:#c8dbf8; font-weight:600; }}
     .btn-inline:hover {{ background: rgba(54,81,122,.25); }}
-    .btn-inline-muted {{ color: #8fa1b8; border-color: #2f425e; }}
-    .btn-inline-muted:hover {{ background: rgba(47,66,94,.28); color: #c4d7f1; }}
+    .btn-inline-muted {{ border-color:#3f5f88; color:#8fa1b8; }}
     .peer-actions-row {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto auto minmax(7.25rem, auto) minmax(3.75rem, auto) auto;
@@ -7255,71 +8525,8 @@ def _render_setup_html(
       box-shadow:0 8px 24px rgba(0,0,0,.35);
     }}
     .peer-update-policy-submit {{ margin-top: 0; }}
-    .autoupdate-row {{ margin-bottom:12px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }}
-    .autoupdate-form {{ margin:0; }}
-    .autoupdate-btn {{ padding:8px 14px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; border:1px solid #36517a; background:transparent; color:#8fa1b8; transition:all .15s ease; }}
-    .autoupdate-btn:hover {{ background:rgba(54,81,122,.25); color:#c8dbf8; }}
-    .autoupdate-btn-active {{ background:linear-gradient(180deg,rgba(87,156,255,.35),rgba(47,128,237,.28)); border-color:#4c8ff6; color:#eaf4ff; }}
-    .autoupdate-btn-active:hover {{ background:linear-gradient(180deg,rgba(87,156,255,.45),rgba(47,128,237,.38)); }}
-    .autoupdate-hint {{ font-size:12px; color:var(--muted); margin-left:4px; }}
     .update-ready-banner {{ margin-bottom:12px; padding:10px 12px; background:rgba(47,128,237,.12); border:1px solid rgba(76,143,246,.35); border-radius:8px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }}
     .server-info-item strong {{ font-size:13px; color:#d9e8ff; }}
-    .update-badge {{ display:inline-block; margin-left:6px; padding:2px 6px; font-size:11px; font-weight:600; color:#4c8ff6; background:rgba(76,143,246,.15); border-radius:6px; }}
-    .gauge-link {{ text-decoration: none; }}
-    .gauge {{ width: 140px; height: 140px; border-radius: 50%; margin: 8px auto; position: relative; background: conic-gradient(var(--gauge-color, var(--unknown)) calc(var(--pct, 0) * 1%), #263143 0); }}
-    .gauge::after {{ content: ""; position: absolute; inset: 14px; border-radius: 50%; background: #0f1726; border: 1px solid #30405a; }}
-    .gauge-center {{ position: absolute; inset: 0; display: grid; place-content: center; z-index: 1; text-align: center; }}
-    .gauge-value {{ font-size: 12px; font-weight: 700; }}
-    .gauge-sub {{ font-size: 11px; color: var(--muted); }}
-    .st-up {{ --gauge-color: var(--green); color: #93efb7; }}
-    .st-warning {{ --gauge-color: var(--yellow); color: #ffd58a; }}
-    .st-down {{ --gauge-color: var(--red); color: #ffafaf; }}
-    .st-unknown {{ --gauge-color: var(--unknown); color: #b8c6d8; }}
-    .history-dots {{ margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; min-height: 12px; }}
-    .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
-    .monitor-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }}
-    .agent-monitors-by-host {{ display: flex; flex-direction: column; gap: 18px; }}
-    .agent-host-heading {{ margin: 0 0 8px 0; font-size: 15px; font-weight: 700; color: #b8cae3; }}
-    .monitor-card {{ border: 1px solid var(--border); border-radius: 10px; background: var(--card-soft); padding: 12px; display: flex; flex-direction: column; }}
-    .monitor-card .button-row {{ margin-top: auto; padding-top: 14px; }}
-    .monitor-card .btn-remove {{ background: transparent; border: 1px solid #ef4444; color: #ef4444; }}
-    .monitor-card .btn-remove:hover {{ background: rgba(239,68,68,.12); }}
-    .monitor-card.hl-monitor {{ border-color: #4c8ff6; box-shadow: 0 0 0 1px rgba(76,143,246,0.45) inset; }}
-    .monitor-head {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
-    .monitor-title {{ font-weight: 700; color: #d8e8ff; }}
-    .badge {{ font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid transparent; }}
-    .badge.st-up {{ background: rgba(34,197,94,.15); border-color: rgba(34,197,94,.35); }}
-    .badge.st-warning {{ background: rgba(245,158,11,.16); border-color: rgba(245,158,11,.4); }}
-    .badge.st-down {{ background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.4); }}
-    .badge.st-unknown {{ background: rgba(100,116,139,.2); border-color: rgba(100,116,139,.4); }}
-    .badge.muted-badge {{ background: rgba(100,116,139,.15); border-color: rgba(100,116,139,.35); color: var(--muted); font-size:.7rem; }}
-    .badge.ok {{ background: rgba(34,197,94,.15); border-color: rgba(34,197,94,.35); }}
-    .badge.err {{ background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.4); }}
-    .monitor-meta {{ margin-top: 8px; font-size: 12px; color: #9fb2cc; line-height: 1.35; }}
-    .monitor-meta.token-row {{ margin-bottom: 10px; }}
-    .monitor-meta code {{ display: inline-block; padding: 3px 6px; margin-left: 4px; line-height: 1.2; overflow-wrap: anywhere; }}
-    .monitor-card .button-row {{ margin-bottom: 0; }}
-    .pulse-hit {{ animation: pulseGlow 900ms ease; }}
-    @keyframes pulseGlow {{
-      0% {{ box-shadow: 0 0 0 0 rgba(47,128,237,0.65); transform: scale(1); }}
-      45% {{ box-shadow: 0 0 0 8px rgba(47,128,237,0.0); transform: scale(1.01); }}
-      100% {{ box-shadow: 0 0 0 0 rgba(47,128,237,0.0); transform: scale(1); }}
-    }}
-    .chip {{ display: inline-block; padding: 7px 14px; border-radius: 10px; border: 1px solid #3f5f88; color: #c5dcff; text-decoration: none; font-size: 12px; font-weight: 600; transition: all 140ms ease; line-height: 1.2; }}
-    .chip:hover {{ border-color: #5aa1ff; color: #e6f2ff; }}
-    .chip.active {{ background: linear-gradient(180deg, rgba(87,156,255,.35), rgba(47,128,237,.28)); border-color: #67abff; color: #eaf4ff; box-shadow: 0 0 0 1px rgba(103,171,255,.2) inset; }}
-    .chip-row {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; margin-bottom: 4px; }}
-    #log-diag-pre {{ max-height: 22rem; overflow: auto; font-size: 11px; line-height: 1.35; }}
-    .log-diag-active-banner {{ margin: 0 0 10px 0; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(76,143,246,0.45); background: rgba(47,128,237,0.12); color: #d2e4ff; font-size: 13px; }}
-    .log-diag-meta {{ margin: 0 0 10px 0; font-size: 12px; color: var(--muted); }}
-    .log-diag-toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 10px; }}
-    .log-diag-toolbar-left {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
-    .log-diag-filter-form {{ margin: 0 0 12px 0; }}
-    .log-diag-filter-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }}
-    .log-diag-filter-grid label {{ margin-top: 0; font-size: 11px; }}
-    .log-diag-filter-grid select {{ margin-top: 2px; }}
-    .source-tabs {{ justify-content: center; }}
-    .nav-tabs {{ justify-content: center; gap: 12px; }}
     .modal-backdrop {{ position: fixed; inset: 0; background: rgba(5,10,20,.74); display: none; align-items: center; justify-content: center; z-index: 2000; }}
     .modal-backdrop.open {{ display: flex; }}
     .modal {{ width: min(640px, 96vw); max-height: 92vh; overflow: auto; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }}
@@ -7362,11 +8569,12 @@ def _render_setup_html(
       .row {{ grid-template-columns: 1fr; }}
       .button-row {{ flex-direction: column; align-items: stretch; }}
       button {{ width: 100%; }}
+      .input-with-action .btn-icon {{ width: auto; }}
     }}
   </style>
 </head>
-<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-date="{html.escape(log_date_norm)}" data-log-time-scope="{html.escape(log_time_norm)}" data-log-time-from="{html.escape(log_time_from_norm)}" data-log-time-to="{html.escape(log_time_to_norm)}" data-log-word="{html.escape(log_word_norm)}" data-log-source="{html.escape(source_label)}" data-peer-role="{html.escape(peer_role)}" data-show-monitor-target="{('1' if show_monitor_target_selector else '0')}" data-form-error="{('1' if error and modal_open else '0')}" data-monitor-modal-open="{('1' if modal_open else '0')}">
-  <div class="container">
+<body data-ui-view="{html.escape(ui_view)}" data-diag-view="{html.escape(diag_label)}" data-log-filter="{html.escape(filter_label)}" data-log-date="{html.escape(log_date_norm)}" data-log-time-scope="{html.escape(log_time_norm)}" data-log-time-from="{html.escape(log_time_from_norm)}" data-log-time-to="{html.escape(log_time_to_norm)}" data-log-source="{html.escape(source_label)}" data-peer-role="{html.escape(peer_role)}" data-show-monitor-target="{('1' if show_monitor_target_selector else '0')}" data-form-error="{('1' if error and modal_open else '0')}" data-monitor-modal-open="{('1' if modal_open else '0')}">
+  <div class="container" data-source="{html.escape(source_label)}">
     <div class="card">
       <div class="brand-head">
         <div class="top-actions">
@@ -7374,7 +8582,7 @@ def _render_setup_html(
         </div>
         <div class="brand-center">
           <a href="{html.escape(BRAND_URL)}" target="_blank" rel="noopener noreferrer"><img class="brand-logo" src="{html.escape(BRAND_LOGO_URL)}" alt="{html.escape(BRAND_NAME)} logo"></a>
-          <div class="brand-summary">EasySystem - Monitoring</div>
+          <div class="brand-summary">All-in-one Unix monitoring: SMART, storage, backup, ping, port, DNS, secure peering, and instant Uptime Kuma alerts.</div>
         </div>
       </div>
       {status_html}
@@ -7385,9 +8593,9 @@ def _render_setup_html(
         <h3>{html.escape(modal_title)}</h3>
         <form method="post" action="/save" novalidate id="monitor-form">
           <input type="hidden" name="edit_original_name" value="{html.escape(edit_original_name)}">
-          {"<div id='target-peer-wrap'><label>Target Instance</label><select id='target_peer' name='target_peer' onchange='window._onTargetChange && window._onTargetChange()'>" + target_options + "</select><div id='agent-kuma-info' class='muted' style='margin-top:4px;display:none;border:1px solid rgba(47,128,237,.3);background:rgba(47,128,237,.08);border-radius:6px;padding:6px 10px;font-size:12px;'>Kuma Push URL will be added to this master. The master pushes status to Kuma on behalf of the agent.</div></div>" if show_monitor_target_selector else ""}
+          {"<div id='target-peer-wrap'><label>Target Instance</label><select id='target_peer' name='target_peer' onchange='window._onTargetChange && window._onTargetChange()'>" + target_options + "</select><div id='agent-kuma-info' class='muted' style='margin-top:4px;display:none;border:1px solid rgba(47,128,237,.3);background:rgba(47,128,237,.08);border-radius:6px;padding:6px 10px;font-size:12px;'>Kuma Push URL will be added to this master. The master pushes status to Kuma on behalf of the agent.</div><div id='legacy-peer-warning' class='info-callout legacy-warning-callout' style='display:none;margin-top:10px;'><strong>Legacy agent warning</strong><p style='margin:8px 0 0;'>This target connected via legacy token peering. Creating a monitor pushes <code>/api/peer/create-monitor</code> to the agent callback URL. The agent must be reachable from this master.</p><label style='display:flex;gap:8px;align-items:flex-start;margin-top:10px;'><input type='checkbox' name='acknowledge_legacy' id='acknowledge_legacy' value='1' style='width:auto;margin-top:3px;'><span>I understand this is a legacy peer and want to create the monitor anyway.</span></label></div></div>" if show_monitor_target_selector else ""}
           <label>Monitor Name <span class="required-asterisk">*</span></label>
-          <input id="name" name="name" value="{html.escape(current_name)}" required minlength="2" placeholder="e.g. smart-synology-check">
+          <input id="name" name="name" value="{html.escape(current_name)}" required minlength="2" placeholder="e.g. smart-unix-check">
           <label>Kuma Push URL <span class="required-asterisk">*</span></label>
           <input name="kuma_url" value="{html.escape(current_url)}" required placeholder="https://kuma.example.com/api/push/TOKEN">
           <div class="row">
@@ -7400,6 +8608,7 @@ def _render_setup_html(
                 <option value="port" {"selected" if current_mode == "port" else ""}>port</option>
                 <option value="dns" {"selected" if current_mode == "dns" else ""}>dns</option>
                 <option value="backup" {"selected" if current_mode == "backup" else ""}>backup</option>
+                <option value="service" {"selected" if current_mode == "service" else ""}>service</option>
               </select>
             </div>
             <div>
@@ -7423,6 +8632,14 @@ def _render_setup_html(
             <label>DNS Server (optional)</label>
             <input name="dns_server" value="{html.escape(current_dns_server)}" placeholder="8.8.8.8">
           </div>
+          <div id="service-names-wrap" style="display:{modal_service_display};">
+            <label>Service names (for service mode)</label>
+            <input name="service_names" value="{html.escape(current_service_names)}" placeholder="nginx, sshd, docker">
+          </div>
+          <div id="service-filter-wrap" style="display:{modal_service_display};">
+            <label>Service description filter (optional)</label>
+            <input name="service_description_filter" value="{html.escape(current_service_desc_filter)}" placeholder="proxy, database">
+          </div>
           <div class="modal-toggle-row">
             <label class="toggle-label"><input type="checkbox" name="cron_enabled" value="1" {checked_cron}> <span>Enable automatic checks</span></label>
           </div>
@@ -7445,20 +8662,25 @@ def _render_setup_html(
           var ppw = modal.querySelector("#probe-port-wrap");
           var dnw = modal.querySelector("#dns-name-wrap");
           var dsw = modal.querySelector("#dns-server-wrap");
+          var snw = modal.querySelector("#service-names-wrap");
+          var sfw = modal.querySelector("#service-filter-wrap");
           if (!modeEl) return;
           var m = (modeEl.value || "smart").toLowerCase();
           var showHost = (m === "ping" || m === "port");
           var showPort = (m === "port");
           var showDns = (m === "dns");
+          var showService = (m === "service");
           if (phw) {{ phw.style.display = showHost ? "block" : "none"; var inp = phw.querySelector("input"); if (inp) inp.disabled = !showHost; }}
           if (ppw) {{ ppw.style.display = showPort ? "block" : "none"; var inp = ppw.querySelector("input"); if (inp) inp.disabled = !showPort; }}
           if (dnw) {{ dnw.style.display = showDns ? "block" : "none"; var inp = dnw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
           if (dsw) {{ dsw.style.display = showDns ? "block" : "none"; var inp = dsw.querySelector("input"); if (inp) inp.disabled = !showDns; }}
+          if (snw) {{ snw.style.display = showService ? "block" : "none"; var inp = snw.querySelector("input"); if (inp) inp.disabled = !showService; }}
+          if (sfw) {{ sfw.style.display = showService ? "block" : "none"; var inp = sfw.querySelector("input"); if (inp) inp.disabled = !showService; }}
           if (nameEl) {{
             var cur = (nameEl.value || "").trim().toLowerCase();
-            var autoPattern = /^(smart|storage|ping|port|dns|backup|service)-synology-check$/;
-            if (!cur || autoPattern.test(cur) || cur === "synology-main") {{
-              nameEl.value = (modeEl.value || "smart") + "-synology-check";
+            var autoPattern = /^(smart|storage|ping|port|dns|backup|service)-unix-check$/;
+            if (!cur || autoPattern.test(cur) || cur === "unix-main") {{
+              nameEl.value = (modeEl.value || "smart") + "-unix-check";
             }}
           }}
         }};
@@ -7491,7 +8713,6 @@ def _render_setup_html(
             hid("log_time_scope", b.getAttribute("data-log-time-scope") || "all");
             hid("log_time_from", b.getAttribute("data-log-time-from") || "");
             hid("log_time_to", b.getAttribute("data-log-time-to") || "");
-            hid("log_word", b.getAttribute("data-log-word") || "");
             var src = b.getAttribute("data-log-source") || "local";
             hid("source", src);
             hid("log_source", src);
@@ -7511,12 +8732,15 @@ def _render_setup_html(
             var probeHost = ((monForm.querySelector("input[name='probe_host']") || {{}}).value || "").trim();
             var probePort = parseInt((monForm.querySelector("input[name='probe_port']") || {{}}).value || "0", 10) || 0;
             var dnsName = ((monForm.querySelector("input[name='dns_name']") || {{}}).value || "").trim();
+            var serviceNames = ((monForm.querySelector("input[name='service_names']") || {{}}).value || "").trim();
+            var serviceFilter = ((monForm.querySelector("input[name='service_description_filter']") || {{}}).value || "").trim();
             if (mode === "ping" && !probeHost) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Ping mode requires a probe host."); return; }}
             if (mode === "port") {{
               if (!probeHost) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Port mode requires a probe host."); return; }}
               if (probePort < 1 || probePort > 65535) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Port mode requires a valid TCP port (1-65535)."); return; }}
             }}
             if (mode === "dns" && !dnsName) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("DNS mode requires a DNS name/domain."); return; }}
+            if (mode === "service" && !serviceNames && !serviceFilter) {{ e.preventDefault(); e.stopImmediatePropagation(); _showModalErr("Service mode requires service names and/or a description filter."); return; }}
             var urlCheck = kuma;
             if (!/^https?:\\/\\//i.test(urlCheck)) urlCheck = "https://" + urlCheck;
             try {{
@@ -7550,7 +8774,7 @@ def _render_setup_html(
           <label>Agent Instance ID <span class="muted">(from the agent's peering card)</span></label>
           <input name="agent_id" placeholder="e.g. a1b2c3d4-..." required>
           <label>Agent host <span class="muted">(optional, hostname or IP; port 8787 if omitted)</span></label>
-          <input name="agent_url" placeholder="agent-nas or 192.168.31.10">
+          <input name="agent_url" placeholder="Hostname or IP (port if not 8787)">
           <div class="button-row">
             <button type="submit">Add agent</button>
             <button type="button" class="close-link" onclick="document.getElementById('add-agent-modal').classList.remove('open')">Cancel</button>
@@ -7570,6 +8794,12 @@ def _render_setup_html(
         </div>
       </div>
     </div>
+    <div class="modal-backdrop" id="update-modal">
+      <div class="modal">
+        <h3>Package update</h3>
+        <div id="update-modal-content"></div>
+      </div>
+    </div>
     <div class="modal-backdrop" id="agent-update-modal">
       <div class="modal">
         <h3>Agent update</h3>
@@ -7582,6 +8812,18 @@ def _render_setup_html(
     </div>
     <script>
       (function () {{
+        document.addEventListener("click", function (ev) {{
+          var btn = ev && ev.target && ev.target.closest ? ev.target.closest(".toggle-password-btn[data-target]") : null;
+          if (!btn) return;
+          var targetId = btn.getAttribute("data-target") || "";
+          var input = targetId ? document.getElementById(targetId) : null;
+          if (!input) return;
+          var show = input.type === "password";
+          input.type = show ? "text" : "password";
+          btn.textContent = show ? "Hide" : "Show";
+          btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+        }});
+
         function copyTextToClipboard(text) {{
           if (navigator.clipboard && window.isSecureContext) {{
             return navigator.clipboard.writeText(text);
@@ -7630,7 +8872,6 @@ def _render_setup_html(
         var logTimeScope = bodyMeta ? (bodyMeta.getAttribute("data-log-time-scope") || "all") : "all";
         var logTimeFrom = bodyMeta ? (bodyMeta.getAttribute("data-log-time-from") || "") : "";
         var logTimeTo = bodyMeta ? (bodyMeta.getAttribute("data-log-time-to") || "") : "";
-        var logWord = bodyMeta ? (bodyMeta.getAttribute("data-log-word") || "") : "";
         var logSource = bodyMeta ? (bodyMeta.getAttribute("data-log-source") || "local") : "local";
         var qs = new URLSearchParams();
         qs.set("view", uiView);
@@ -7640,9 +8881,8 @@ def _render_setup_html(
         qs.set("log_time_scope", logTimeScope);
         qs.set("log_time_from", logTimeFrom);
         qs.set("log_time_to", logTimeTo);
-        qs.set("log_word", logWord);
-        qs.set("log_source", logSource);
         qs.set("source", logSource);
+        qs.set("log_source", logSource);
         var canonicalPath = "/?" + qs.toString();
         try {{
           if (window.location.pathname !== "/" || window.location.search !== ("?" + qs.toString())) {{
@@ -7671,9 +8911,8 @@ def _render_setup_html(
           var lt = logPre.getAttribute("data-log-time-scope") || "all";
           var ltf = logPre.getAttribute("data-log-time-from") || "";
           var ltt = logPre.getAttribute("data-log-time-to") || "";
-          var lw = logPre.getAttribute("data-log-word") || "";
           if (peerId) {{
-            var url = "/api/agent-diag?peer_id=" + encodeURIComponent(peerId) + "&view=" + encodeURIComponent(view) + "&log_filter=" + encodeURIComponent(lf) + "&log_date=" + encodeURIComponent(ld) + "&log_time_scope=" + encodeURIComponent(lt) + "&log_time_from=" + encodeURIComponent(ltf) + "&log_time_to=" + encodeURIComponent(ltt) + "&log_word=" + encodeURIComponent(lw);
+            var url = "/api/agent-diag?peer_id=" + encodeURIComponent(peerId) + "&view=" + encodeURIComponent(view) + "&log_filter=" + encodeURIComponent(lf) + "&log_date=" + encodeURIComponent(ld) + "&log_time_scope=" + encodeURIComponent(lt) + "&log_time_from=" + encodeURIComponent(ltf) + "&log_time_to=" + encodeURIComponent(ltt);
             fetch(url, {{ credentials: "same-origin" }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
               if (data && data.text !== undefined) logPre.textContent = data.text;
               try {{ logPre.scrollTop = logPre.scrollHeight; }} catch (e) {{}}
@@ -7789,7 +9028,6 @@ def _render_setup_html(
           ensureHiddenField("log_time_scope", logTimeScope);
           ensureHiddenField("log_time_from", logTimeFrom);
           ensureHiddenField("log_time_to", logTimeTo);
-          ensureHiddenField("log_word", logWord);
           ensureHiddenField("source", logSource);
           ensureHiddenField("log_source", logSource);
         }}
@@ -7814,7 +9052,7 @@ def _render_setup_html(
             }}
           }} catch (e) {{}}
         }}, true);
-        var SERVER_PANEL_STATE_KEY = "synology_monitor_open_server_panel";
+        var SERVER_PANEL_STATE_KEY = "unix_monitor_open_server_panel";
         function setOpenServerPanelKey(key) {{
           try {{
             if (key) localStorage.setItem(SERVER_PANEL_STATE_KEY, key);
@@ -7829,19 +9067,16 @@ def _render_setup_html(
           }}
         }}
         function restoreOpenServerPanel() {{
-          var key = getOpenServerPanelKey();
-          if (!key) return;
-          var panel = document.querySelector(".server-action-panel[data-server-panel='" + key + "']");
-          if (!panel) return;
+          // Default UX: keep server action panel collapsed on fresh page load.
+          setOpenServerPanelKey("");
           document.querySelectorAll(".server-action-panel.open").forEach(function(p) {{
-            if (p !== panel) p.classList.remove("open");
+            p.classList.remove("open");
           }});
-          panel.classList.add("open");
         }}
         restoreOpenServerPanel();
         // Ensure source chips (Local, agent names) navigate reliably when clicked (handles subpath + edge cases)
         document.addEventListener("click", function(ev) {{
-          var a = ev.target && ev.target.closest ? ev.target.closest("a.chip[href*='log_source']") : null;
+          var a = ev.target && ev.target.closest ? ev.target.closest("a.chip[href*='source=']") : null;
           if (a && a.getAttribute("href")) {{
             ev.preventDefault();
             window.location.href = a.getAttribute("href");
@@ -7892,6 +9127,103 @@ def _render_setup_html(
             var openPanelKey = openPanel.getAttribute("data-server-panel") || "";
             setOpenServerPanelKey(openPanelKey);
             ensureSubmitHidden("server_panel", openPanelKey);
+          }}
+        }}, true);
+        // Intercept POST forms: fetch and update page without reload (except auth, danger, exports)
+        document.addEventListener("submit", async function(ev) {{
+          var form = ev && ev.target ? ev.target : null;
+          if (!form || !form.getAttribute) return;
+          if ((form.getAttribute("method") || "get").toLowerCase() !== "post") return;
+          if (form.id === "monitor-form") return;
+          var act = (form.getAttribute("action") || "") + "";
+          var skip = /\\/(auth\\/(logout|login|setup|verify-2fa|recovery|import|export))|\\/danger-(restart|reset)|\\/self-rollback/.test(act) || (form.enctype || "").toLowerCase().indexOf("multipart") >= 0;
+          if (skip) return;
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          ensureUiViewField(form);
+          var submitBtn = form.querySelector("button[type='submit']");
+          if (submitBtn) {{ submitBtn.disabled = true; submitBtn.textContent = (submitBtn.textContent || "").replace(/…$/, "") + "…"; }}
+          var isSelfUpdate = (act || "").indexOf("/self-update") >= 0;
+          if (isSelfUpdate) {{
+            var m = document.getElementById("update-modal");
+            var mContent = document.getElementById("update-modal-content");
+            if (m && mContent) {{
+              m.classList.add("open");
+              mContent.innerHTML = "<p>Updating…</p><p class='muted'>Downloading latest version, validating, replacing.</p>";
+            }}
+          }}
+          try {{
+            var fd = new FormData(form);
+            var params = new URLSearchParams();
+            fd.forEach(function(v, k) {{ params.append(k, v); }});
+            var r = await fetch(act, {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+              body: params.toString()
+            }});
+            var txt = await r.text();
+            if (r.redirected && (r.url || "").indexOf("auth") >= 0) {{ location.href = r.url; return; }}
+            if (isSelfUpdate) {{
+              var doc = new DOMParser().parseFromString(txt, "text/html");
+              var errEl = doc.querySelector(".err");
+              var okEl = doc.querySelector(".ok");
+              var preEl = doc.querySelector("pre");
+              var m = document.getElementById("update-modal");
+              var mContent = document.getElementById("update-modal-content");
+              if (m && mContent) {{
+                var status = "Update complete.";
+                if (errEl) status = (errEl.textContent || "").trim();
+                else if (okEl) status = (okEl.textContent || "").trim();
+                var output = preEl ? (preEl.textContent || "").trim() : "";
+                var kind = errEl ? "err" : "ok";
+                var preBlock = "";
+                if (output) preBlock = "<pre>" + escapeHtml(output) + "</pre>";
+                mContent.innerHTML = "<p class='" + kind + "'>" + escapeHtml(status) + "</p>" + preBlock + "<p class='muted'>Reloading page in 5 seconds…</p>";
+                setTimeout(function() {{ location.reload(); }}, 5000);
+              }} else {{
+                _updatePageFromResponse(txt);
+              }}
+            }} else {{
+              _updatePageFromResponse(txt);
+            }}
+            var addAgentModal = document.getElementById("add-agent-modal");
+            if (addAgentModal) addAgentModal.classList.remove("open");
+          }} catch (e) {{
+            if (isSelfUpdate) {{
+              var m = document.getElementById("update-modal");
+              var mContent = document.getElementById("update-modal-content");
+              if (m && mContent) {{
+                var overviewPath = "/?view=overview";
+                mContent.innerHTML = "<p class='err'>Update failed: " + escapeHtml(String(e)) + "</p>"
+                  + "<p style='margin-top:12px;'><button type='button' class='close-link' onclick='window.location.href=\\\"" + overviewPath + "\\\"'>Return to overview</button></p>";
+              }} else {{
+                location.reload();
+              }}
+            }} else {{
+              location.reload();
+            }}
+          }} finally {{
+            if (submitBtn) {{ submitBtn.disabled = false; submitBtn.textContent = (submitBtn.textContent || "").replace("…", ""); }}
+          }}
+        }}, true);
+        document.addEventListener("submit", function(ev) {{
+          var form = ev && ev.target ? ev.target : null;
+          if (!form || !form.getAttribute) return;
+          var method = (form.getAttribute("method") || "get").toLowerCase();
+          if (method === "post") {{
+            ensureUiViewField(form);
+            try {{
+              sessionStorage.setItem("synmon_scroll_y", String(Math.max(0, Math.round(window.scrollY || 0))));
+            }} catch (e) {{}}
+            return;
+          }}
+          if (method === "get") {{
+            var cls = form.classList;
+            var isDiagNav = (cls && cls.contains("log-diag-filter-form")) || (form.closest && form.closest(".log-diag-toolbar"));
+            if (!isDiagNav) return;
+            try {{
+              sessionStorage.setItem("synmon_scroll_y", String(Math.max(0, Math.round(window.scrollY || 0))));
+            }} catch (e) {{}}
           }}
         }}, true);
         document.addEventListener("click", async function(ev) {{
@@ -7970,7 +9302,7 @@ def _render_setup_html(
                   html += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
                   mContent.innerHTML = html;
                   btn.disabled = false;
-                  if (stage === "done" && typeof refreshLive === "function") setTimeout(function() {{ refreshLive(); }}, 3000);
+                  if (stage === "done") setTimeout(function() {{ refreshLive && refreshLive(); }}, 3000);
                 }}
               }} catch (e) {{
                 mContent.innerHTML += "<p class='err'>Poll error: " + escapeHtml(String(e)) + "</p>";
@@ -7980,60 +9312,6 @@ def _render_setup_html(
             mContent.innerHTML = "<p class='err'>" + escapeHtml(String(e)) + "</p>";
             mContent.innerHTML += "<p><button type='button' class='close-link' onclick=\\"document.getElementById('agent-update-modal').classList.remove('open')\\">Close</button></p>";
             btn.disabled = false;
-          }}
-        }}, true);
-        // Intercept POST forms: fetch and update page without reload (except auth, danger, exports)
-        document.addEventListener("submit", async function(ev) {{
-          var form = ev && ev.target ? ev.target : null;
-          if (!form || !form.getAttribute) return;
-          if ((form.getAttribute("method") || "get").toLowerCase() !== "post") return;
-          if (form.id === "monitor-form") return;
-          var act = (form.getAttribute("action") || "") + "";
-          var skip = /\\/(auth\\/(logout|login|setup|verify-2fa|recovery|import|export))|\\/danger-(restart|reset)/.test(act) || (form.enctype || "").toLowerCase().indexOf("multipart") >= 0;
-          if (skip) return;
-          ev.preventDefault();
-          ev.stopImmediatePropagation();
-          ensureUiViewField(form);
-          var submitBtn = form.querySelector("button[type='submit']");
-          if (submitBtn) {{ submitBtn.disabled = true; submitBtn.textContent = (submitBtn.textContent || "").replace(/…$/, "") + "…"; }}
-          try {{
-            var fd = new FormData(form);
-            var params = new URLSearchParams();
-            fd.forEach(function(v, k) {{ params.append(k, v); }});
-            var r = await fetch(act, {{
-              method: "POST",
-              headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
-              body: params.toString()
-            }});
-            var txt = await r.text();
-            if (r.redirected && (r.url || "").indexOf("auth") >= 0) {{ location.href = r.url; return; }}
-            _updatePageFromResponse(txt);
-            var addAgentModal = document.getElementById("add-agent-modal");
-            if (addAgentModal) addAgentModal.classList.remove("open");
-          }} catch (e) {{
-            location.reload();
-          }} finally {{
-            if (submitBtn) {{ submitBtn.disabled = false; submitBtn.textContent = (submitBtn.textContent || "").replace("…", ""); }}
-          }}
-        }}, true);
-        document.addEventListener("submit", function(ev) {{
-          var form = ev && ev.target ? ev.target : null;
-          if (!form || !form.getAttribute) return;
-          var method = (form.getAttribute("method") || "get").toLowerCase();
-          if (method === "post") {{
-            ensureUiViewField(form);
-            try {{
-              sessionStorage.setItem("synmon_scroll_y", String(Math.max(0, Math.round(window.scrollY || 0))));
-            }} catch (e) {{}}
-            return;
-          }}
-          if (method === "get") {{
-            var cls = form.classList;
-            var isDiagNav = (cls && cls.contains("log-diag-filter-form")) || (form.closest && form.closest(".log-diag-toolbar"));
-            if (!isDiagNav) return;
-            try {{
-              sessionStorage.setItem("synmon_scroll_y", String(Math.max(0, Math.round(window.scrollY || 0))));
-            }} catch (e) {{}}
           }}
         }}, true);
 
@@ -8183,7 +9461,7 @@ def _render_setup_html(
               if (wantMonitorOpen) mm.classList.add("open");
               else mm.classList.remove("open");
             }}
-            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-date", "data-log-time-scope", "data-log-time-from", "data-log-time-to", "data-log-word", "data-log-source", "data-peer-role", "data-show-monitor-target", "data-form-error", "data-monitor-modal-open"].forEach(function(attr) {{
+            ["data-ui-view", "data-diag-view", "data-log-filter", "data-log-date", "data-log-time-scope", "data-log-time-from", "data-log-time-to", "data-log-source", "data-peer-role", "data-show-monitor-target", "data-form-error", "data-monitor-modal-open"].forEach(function(attr) {{
               var v = newBody.getAttribute(attr);
               if (v !== null) document.body.setAttribute(attr, v);
             }});
@@ -8198,8 +9476,7 @@ def _render_setup_html(
             logTimeScope = (newBody && newBody.getAttribute("data-log-time-scope")) || logTimeScope || curQs.get("log_time_scope") || "all";
             logTimeFrom = (newBody && newBody.getAttribute("data-log-time-from")) || logTimeFrom || curQs.get("log_time_from") || "";
             logTimeTo = (newBody && newBody.getAttribute("data-log-time-to")) || logTimeTo || curQs.get("log_time_to") || "";
-            logWord = (newBody && newBody.getAttribute("data-log-word")) || logWord || curQs.get("log_word") || "";
-            logSource = (newBody && newBody.getAttribute("data-log-source")) || logSource || curQs.get("log_source") || "local";
+            logSource = (newBody && newBody.getAttribute("data-log-source")) || logSource || curQs.get("source") || curQs.get("log_source") || "local";
             var nextQs = new URLSearchParams();
             nextQs.set("view", uiView);
             nextQs.set("diag_view", diagView);
@@ -8208,9 +9485,8 @@ def _render_setup_html(
             nextQs.set("log_time_scope", logTimeScope);
             nextQs.set("log_time_from", logTimeFrom);
             nextQs.set("log_time_to", logTimeTo);
-            nextQs.set("log_word", logWord);
-            nextQs.set("log_source", logSource);
             nextQs.set("source", logSource);
+            nextQs.set("log_source", logSource);
             history.replaceState({{}}, "", path + "?" + nextQs.toString());
           }} catch (e) {{}}
           _hookModalSave();
@@ -8218,6 +9494,10 @@ def _render_setup_html(
             restoreOpenServerPanel();
           }} catch (e) {{}}
           if (typeof refreshLive === "function") refreshLive();
+          try {{
+            var lp = document.getElementById("log-diag-pre");
+            if (lp) lp.scrollTop = lp.scrollHeight;
+          }} catch (e) {{}}
         }}
       }}
 
@@ -8240,7 +9520,16 @@ def _render_setup_html(
         var agentInfo = modal.querySelector("#agent-kuma-info");
         function _onTarget() {{
           if (!targetEl || !agentInfo) return;
-          agentInfo.style.display = (targetEl.value && targetEl.value !== "local") ? "block" : "none";
+          var isRemote = !!(targetEl.value && targetEl.value !== "local");
+          agentInfo.style.display = isRemote ? "block" : "none";
+          var legacyWarn = modal.querySelector("#legacy-peer-warning");
+          var legacyAck = modal.querySelector("#acknowledge_legacy");
+          if (legacyWarn) {{
+            var opt = targetEl.options[targetEl.selectedIndex];
+            var isLegacy = isRemote && opt && opt.getAttribute("data-legacy-peer") === "1";
+            legacyWarn.style.display = isLegacy ? "block" : "none";
+            if (legacyAck && !isLegacy) legacyAck.checked = false;
+          }}
         }}
         if (targetEl) {{
           targetEl.addEventListener("change", _onTarget);
@@ -8260,6 +9549,8 @@ def _render_setup_html(
           var probeHost = (form.querySelector("input[name='probe_host']") || {{}}).value.trim();
           var probePort = parseInt((form.querySelector("input[name='probe_port']") || {{}}).value, 10) || 0;
           var dnsName = (form.querySelector("input[name='dns_name']") || {{}}).value.trim();
+          var serviceNames = (form.querySelector("input[name='service_names']") || {{}}).value.trim();
+          var serviceFilter = (form.querySelector("input[name='service_description_filter']") || {{}}).value.trim();
           if (!name || name.length < 2) {{
             e.preventDefault();
             showFormError("Monitor name is required (min 2 characters).");
@@ -8299,6 +9590,24 @@ def _render_setup_html(
             showFormError("DNS mode requires a DNS name/domain.");
             return;
           }}
+          if (mode === "service" && !serviceNames && !serviceFilter) {{
+            e.preventDefault();
+            showFormError("Service mode requires service names and/or a description filter.");
+            return;
+          }}
+          var targetPeerEl = form.querySelector("#target_peer");
+          var legacyWarn = form.querySelector("#legacy-peer-warning");
+          var legacyAck = form.querySelector("#acknowledge_legacy");
+          if (targetPeerEl && legacyWarn && targetPeerEl.value && targetPeerEl.value !== "local") {{
+            var opt = targetPeerEl.options[targetPeerEl.selectedIndex];
+            var isLegacy = opt && opt.getAttribute("data-legacy-peer") === "1";
+            if (isLegacy && legacyAck && !legacyAck.checked) {{
+              e.preventDefault();
+              showFormError("Confirm the legacy agent warning before creating a monitor for this peer.");
+              legacyWarn.style.display = "block";
+              return;
+            }}
+          }}
           ensureUiViewField(form);
         }});
       }}
@@ -8306,8 +9615,17 @@ def _render_setup_html(
       window._onTargetChange = function() {{
         var sel = document.getElementById("target_peer");
         var info = document.getElementById("agent-kuma-info");
-        if (!sel || !info) return;
-        info.style.display = (sel.value && sel.value !== "local") ? "block" : "none";
+        var legacyWarn = document.getElementById("legacy-peer-warning");
+        var legacyAck = document.getElementById("acknowledge_legacy");
+        if (!sel) return;
+        var isRemote = !!(sel.value && sel.value !== "local");
+        if (info) info.style.display = isRemote ? "block" : "none";
+        if (legacyWarn) {{
+          var opt = sel.options[sel.selectedIndex];
+          var isLegacy = isRemote && opt && opt.getAttribute("data-legacy-peer") === "1";
+          legacyWarn.style.display = isLegacy ? "block" : "none";
+          if (legacyAck && !isLegacy) legacyAck.checked = false;
+        }}
       }};
       if (document.getElementById("target_peer")) window._onTargetChange();
 
@@ -8439,7 +9757,7 @@ def _render_setup_html(
             var defPort = 8787;
             function peerUrlForInput(u) {{
               if (!u) return "";
-              var m = u.match(/^(.+):([0-9]+)$/);
+              var m = u.match(/^(.+):(\\d+)$/);
               if (m && parseInt(m[2], 10) === defPort) return m[1];
               return u;
             }}
@@ -8517,7 +9835,7 @@ def _render_setup_html(
                 + "<div class='peer-actions-row'>"
                 + "<form method='post' action='/peer/update-peer-url' style='margin:0;display:flex;gap:4px;align-items:center;min-width:0;'>"
                 + "<input type='hidden' name='peer_id' value='" + pid + "'>"
-                + "<input name='peer_url' value='" + escapeHtml(pUrlDisplay) + "' placeholder='agent-nas or 192.168.31.10' style='flex:1;padding:4px 6px;font-size:11px;'>"
+                + "<input name='peer_url' value='" + escapeHtml(pUrlDisplay) + "' placeholder='Hostname or host:port' style='flex:1;padding:4px 6px;font-size:11px;'>"
                 + "<button type='submit' style='" + pbs + "'>Set URL</button>"
                 + "</form>"
                 + "<form method='post' action='/peer/sync-one' style='margin:0;'>"
@@ -8537,7 +9855,9 @@ def _render_setup_html(
 
       async function refreshLive() {{
         try {{
-          var r = await fetch("/status-json", {{ cache: "no-store" }});
+          var srcEl = document.querySelector(".container[data-source]");
+          var activeSource = (srcEl && srcEl.getAttribute("data-source")) ? srcEl.getAttribute("data-source") : "local";
+          var r = await fetch("/status-json?source=" + encodeURIComponent(activeSource), {{ cache: "no-store" }});
           if (!r.ok) return;
           var data = await r.json();
           applyLiveSnapshot(data);
@@ -8677,7 +9997,6 @@ def _parse_internet_check_targets(
                 parsed_items.append(parsed)
     pairs: List[Tuple[str, int]] = []
     seen: set[Tuple[str, int]] = set()
-
     profile = _normalize_internet_check_port_profile(port_profile)
     cport = _normalize_internet_check_custom_port(custom_port)
     for parsed in parsed_items:
@@ -8812,20 +10131,8 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
     label {{ display:block; margin-top:10px; font-weight:600; }}
     input {{ width:100%; box-sizing:border-box; margin-top:4px; padding:9px; border:1px solid #334861; border-radius:6px; background:#0d1524; color:#e6eef8; }}
     .input-with-action {{ display:flex; align-items:center; gap:8px; }}
-    .input-with-action input {{ flex:1; }}
-    .btn-icon {{
-      border:1px solid #36517a;
-      border-radius:8px;
-      padding:7px 10px;
-      background:transparent;
-      color:#c8dbf8;
-      font-weight:600;
-      font-size:12px;
-      cursor:pointer;
-      margin-top:4px;
-      white-space:nowrap;
-    }}
-    .btn-icon:hover {{ background:rgba(54,81,122,.25); }}
+    .input-with-action > input {{ flex:1 1 auto; min-width:0; }}
+    .btn-icon {{ padding:8px 12px; white-space: nowrap; flex: 0 0 auto; }}
     .button-row {{ margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }}
     button, .btn {{ border:1px solid #36517a; border-radius:8px; padding:9px 14px; background:transparent; color:#c8dbf8; font-weight:600; font-size:13px; cursor:pointer; text-decoration:none; }}
     button:hover, .btn:hover {{ background:rgba(54,81,122,.25); }}
@@ -8857,7 +10164,7 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
           </a>
         </div>
         <div class="hero-tagline">EasySystem - Monitoring</div>
-        <div class="muted" style="text-align:center;margin-top:10px;">Recommendation: publish this UI behind Synology Reverse Proxy with HTTPS.</div>
+        <div class="muted" style="text-align:center;margin-top:10px;">Recommendation: publish this UI behind reverse proxy with HTTPS.</div>
       </div>
       <div class="card">
         <h3>{html.escape(title)}</h3>
@@ -8870,6 +10177,18 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
   </div>
   <script>
   (function () {{
+    document.addEventListener("click", function (ev) {{
+      var btn = ev && ev.target && ev.target.closest ? ev.target.closest(".toggle-password-btn[data-target]") : null;
+      if (!btn) return;
+      var targetId = btn.getAttribute("data-target") || "";
+      var input = targetId ? document.getElementById(targetId) : null;
+      if (!input) return;
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.textContent = show ? "Hide" : "Show";
+      btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+    }});
+
     function focusAuthPrimary() {{
       var el = document.getElementById("auth-password")
         || document.getElementById("auth-totp-token")
@@ -8878,18 +10197,6 @@ def _render_auth_shell(title: str, body_html: str, info: str = "", error: str = 
       if (!el || !el.focus) return;
       try {{ el.focus({{ preventScroll: true }}); }} catch (e) {{ el.focus(); }}
     }}
-    document.addEventListener("click", function (ev) {{
-      var btn = ev.target && ev.target.closest ? ev.target.closest(".toggle-password-btn") : null;
-      if (!btn) return;
-      var targetId = btn.getAttribute("data-target") || "";
-      if (!targetId) return;
-      var input = document.getElementById(targetId);
-      if (!input) return;
-      var show = input.type === "password";
-      input.type = show ? "text" : "password";
-      btn.textContent = show ? "Hide" : "Show";
-      btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
-    }});
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", focusAuthPrimary);
     else focusAuthPrimary();
   }})();
@@ -8927,23 +10234,51 @@ def _render_auth_setup_page(
           <a class="btn" href="/auth/login">Continue to Login</a>
         </div>
         <script>
+        function copyText(text) {{
+          if (navigator.clipboard && window.isSecureContext) {{
+            return navigator.clipboard.writeText(text);
+          }}
+          return new Promise(function(resolve, reject) {{
+            try {{
+              var ta = document.createElement('textarea');
+              ta.value = text;
+              ta.setAttribute('readonly', '');
+              ta.style.position = 'fixed';
+              ta.style.opacity = '0';
+              ta.style.left = '-9999px';
+              document.body.appendChild(ta);
+              ta.focus();
+              ta.select();
+              var ok = document.execCommand('copy');
+              document.body.removeChild(ta);
+              if (ok) resolve();
+              else reject(new Error('copy command failed'));
+            }} catch (e) {{
+              reject(e);
+            }}
+          }});
+        }}
         function copyTotpSecret(btn) {{
           var el = document.getElementById('totp-secret');
           if (!el) return;
-          navigator.clipboard.writeText(el.textContent).then(function() {{
+          copyText(el.textContent || '').then(function() {{
             var t = btn.textContent;
             btn.textContent = 'Copied!';
             setTimeout(function() {{ btn.textContent = t; }}, 1500);
-          }}).catch(function() {{ alert('Failed to copy'); }});
+          }}).catch(function() {{
+            alert('Failed to copy. Please copy manually from the field.');
+          }});
         }}
         function copyRecoveryCodes(btn) {{
           var el = document.getElementById('recovery-codes');
           if (!el) return;
-          navigator.clipboard.writeText(el.textContent.trim()).then(function() {{
+          copyText((el.textContent || '').trim()).then(function() {{
             var t = btn.textContent;
             btn.textContent = 'Copied!';
             setTimeout(function() {{ btn.textContent = t; }}, 1500);
-          }}).catch(function() {{ alert('Failed to copy'); }});
+          }}).catch(function() {{
+            alert('Failed to copy. Please copy manually from the field.');
+          }});
         }}
         </script>
         """
@@ -8960,8 +10295,8 @@ def _render_auth_setup_page(
           </div>
           <label>Confirm password</label>
           <div class="input-with-action">
-            <input id="auth-setup-password-confirm" name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
-            <button type="button" class="btn-icon toggle-password-btn" data-target="auth-setup-password-confirm" aria-label="Show password">Show</button>
+            <input id="auth-setup-password2" name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
+            <button type="button" class="btn-icon toggle-password-btn" data-target="auth-setup-password2" aria-label="Show password">Show</button>
           </div>
           <div class="button-row">
             <button type="submit">Initialize Security</button>
@@ -9006,7 +10341,7 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
         var infoToggle = document.getElementById("auth-internet-info-toggle");
         var ignoreWrap = document.getElementById("auth-internet-ignore-wrap");
         var ignore = document.getElementById("auth-internet-ignore");
-        var ignoreStorageKey = "synology-monitor-auth-ignore-internet-warning";
+        var ignoreStorageKey = "unix-monitor-auth-ignore-internet-warning";
         if (!msg || !statusText || !info) return;
         function getIgnored() {
           try { return window.localStorage && localStorage.getItem(ignoreStorageKey) === "1"; }
@@ -9019,11 +10354,10 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
             else localStorage.removeItem(ignoreStorageKey);
           } catch (e) {}
         }
-        function showWarning(title, text, level) {
-          var cls = (level === "muted") ? "muted" : (getIgnored() ? "muted" : "err");
-          msg.className = cls;
+        function showWarning(text) {
+          msg.className = getIgnored() ? "muted" : "err";
           msg.classList.remove("hidden");
-          statusText.textContent = String(title || "No Internet Connectivity");
+          statusText.textContent = "No Internet Connectivity";
           info.textContent = String(text || "Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode.");
           if (ignoreWrap) { ignoreWrap.style.display = "flex"; }
         }
@@ -9050,27 +10384,17 @@ def _render_auth_login_page(info: str = "", error: str = "", ssl_warning: str = 
             var data = await r.json().catch(function () { return {}; });
             if (!r.ok) throw new Error(data.detail || data.error || ("HTTP " + r.status));
             var ok = !!data.reachable;
-            var required = !!data.internet_required;
             var detail = String(data.detail || (ok ? "Internet reachable." : "Internet not reachable."));
-            if (ok || !required) {
+            if (ok) {
               hideWarning();
             } else {
-              showWarning(
-                "No Internet Connectivity",
-                "Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode. " + detail,
-                "err"
-              );
+              showWarning("Internet is required for push to Kuma, peering/sync, and update checks. Local checks can still run in standalone mode. " + detail);
             }
           } catch (e) {
-            showWarning(
-              "Connectivity check unavailable",
-              "Internet probe could not be completed right now. This is often temporary; the page will retry automatically.",
-              "muted"
-            );
+            showWarning("Internet check unavailable right now. Internet is required for push to Kuma, peering/sync, and update checks; local standalone checks can still run.");
           }
         }
         refreshInternetStatus();
-        window.setInterval(refreshInternetStatus, 30000);
         window.addEventListener("online", refreshInternetStatus);
         window.addEventListener("offline", refreshInternetStatus);
       })();
@@ -9196,13 +10520,15 @@ def _ui_test_push(target_monitor: Optional[str] = None, initiated_by: str = "loc
             return f"Monitor not found: {target_monitor}"
         monitors = [target]
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    msg = f"Test push @ {now} - {BRAND_NAME} synology-monitor connectivity check"
+    lines: List[str] = []
     triggered_by_master = str(initiated_by or "").strip().lower() == "master"
     trigger_suffix = " (triggered by master)" if triggered_by_master else ""
-    if triggered_by_master:
-        msg += " (triggered by master)"
-    lines: List[str] = []
     for m in monitors:
+        source_platform = _monitor_source_platform(m)
+        flavor = "synology-monitor" if source_platform == "synology" else "unix-monitor"
+        msg = f"Test push @ {now} - {BRAND_NAME} {flavor} connectivity check"
+        if triggered_by_master:
+            msg += " (triggered by master)"
         ok = push_to_kuma(m.get("kuma_url", ""), "up", msg, 0, debug=bool(cfg.get("debug", False)))
         line = f"{'ok' if ok else 'x'} {m.get('name', '?')}: push {'OK' if ok else 'FAILED'}"
         lines.append(line)
@@ -9246,6 +10572,7 @@ def _ui_run_scheduled_now() -> str:
         append_ui_log("automation | run-scheduled-now | skipped | automatic checks disabled")
         return "Automatic checks are disabled in monitor settings."
     output = _ui_run_check_now()
+    # Match run_scheduled() schedule state: global + per-monitor, so "due" and Kuma heartbeats stay aligned.
     for m in cfg.get("monitors", []):
         if isinstance(m, dict):
             n = str(m.get("name", "") or "").strip()
@@ -9257,7 +10584,11 @@ def _ui_run_scheduled_now() -> str:
 
 
 def _ui_repair_automation() -> str:
+    cfg = load_config()
     details: List[str] = []
+    backend = str(cfg.get("scheduler_backend", "cron")).strip().lower()
+    if backend not in ("systemd", "cron"):
+        backend = "cron"
     service_script = _scheduler_service_path()
     if service_script.exists():
         rc, out = _run_cmd([str(service_script), "start"], timeout_sec=12)
@@ -9267,25 +10598,73 @@ def _ui_repair_automation() -> str:
     else:
         details.append(f"service script missing: {service_script}")
 
-    # Best-effort user-level crontab fallback.
-    helper = str(get_smart_helper_script_path())
-    sched = "/var/packages/synology-monitor/target/monitor-scheduler.sh"
-    for line in (
-        f"*/5 * * * * {helper} # synology-monitor smart helper auto",
-        f"* * * * * {sched} # synology-monitor scheduled checks auto",
-    ):
-        rc, out = _run_cmd(["crontab", "-l"], timeout_sec=8)
-        current = out if rc == 0 else ""
-        if line not in current:
-            new_cron = (current.rstrip() + "\n" + line + "\n").lstrip("\n")
-            try:
-                p = subprocess.Popen(["crontab", "-"], stdin=subprocess.PIPE, text=True)
-                p.communicate(new_cron)
-                details.append(f"crontab install {'ok' if p.returncode == 0 else 'failed'} for: {line}")
-            except OSError as e:
-                details.append(f"crontab error for {line}: {type(e).__name__}: {e}")
+    if backend == "systemd":
+        if not Path("/run/systemd/system").exists():
+            details.append("systemd backend selected but systemd runtime not detected.")
         else:
-            details.append(f"crontab already has: {line}")
+            # Legacy timers used OnUnitActiveSec with Type=oneshot; systemd can stop scheduling (elapsed / no next).
+            timer_path = Path("/etc/systemd/system/unix-monitor-scheduler.timer")
+            if timer_path.is_file():
+                try:
+                    cur_timer = timer_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    cur_timer = ""
+                if "OnUnitActiveSec=" in cur_timer and "OnUnitInactiveSec=" not in cur_timer:
+                    sched_min = max(1, min(int(cfg.get("cron_interval_minutes", 60) or 60), 1440))
+                    new_timer = (
+                        "[Unit]\n"
+                        f"Description=Run {PRODUCT_NAME} checks every {sched_min} minute(s)\n\n"
+                        "[Timer]\n"
+                        "OnBootSec=2min\n"
+                        f"OnUnitInactiveSec={sched_min}min\n"
+                        "AccuracySec=30s\n"
+                        "Persistent=true\n\n"
+                        "[Install]\n"
+                        "WantedBy=timers.target\n"
+                    )
+                    try:
+                        timer_path.write_text(new_timer, encoding="utf-8")
+                        timer_path.chmod(0o644)
+                        rc_dr, _ = _run_cmd(["systemctl", "daemon-reload"], timeout_sec=20)
+                        details.append(
+                            "unix-monitor-scheduler.timer: migrated OnUnitActiveSec -> OnUnitInactiveSec "
+                            f"(interval={sched_min}m, daemon-reload={'ok' if rc_dr == 0 else f'rc={rc_dr}'})"
+                        )
+                    except OSError as e:
+                        details.append(f"scheduler.timer migrate failed: {type(e).__name__}: {e}")
+            for unit in (
+                "unix-monitor-scheduler.timer",
+                "unix-monitor-smart-helper.timer",
+                "unix-monitor-backup-helper.timer",
+                "unix-monitor-system-log-helper.timer",
+            ):
+                rc, out = _run_cmd(["systemctl", "enable", "--now", unit], timeout_sec=15)
+                details.append(f"{unit}: {'ok' if rc == 0 else f'failed rc={rc}'}")
+                if rc != 0 and out.strip():
+                    details.append(out.strip().replace("\n", " ")[:240])
+            rc, out = _run_cmd(["systemctl", "start", "unix-monitor-scheduler.service"], timeout_sec=20)
+            details.append(f"unix-monitor-scheduler.service start: {'ok' if rc == 0 else f'failed rc={rc}'}")
+            if rc != 0 and out.strip():
+                details.append(out.strip().replace("\n", " ")[:240])
+    else:
+        # Cron backend: install deterministic entries based on the active script path.
+        helper = str(get_smart_helper_script_path())
+        interval = int(cfg.get("cron_interval_minutes", 60) or 60)
+        sched_line = build_cron_line(get_script_path(), interval)
+        helper_line = f"*/5 * * * * {helper} # unix-monitor smart helper auto"
+        for line in (helper_line, sched_line):
+            rc, out = _run_cmd(["crontab", "-l"], timeout_sec=8)
+            current = out if rc == 0 else ""
+            if line not in current:
+                new_cron = (current.rstrip() + "\n" + line + "\n").lstrip("\n")
+                try:
+                    p = subprocess.Popen(["crontab", "-"], stdin=subprocess.PIPE, text=True)
+                    p.communicate(new_cron)
+                    details.append(f"crontab install {'ok' if p.returncode == 0 else 'failed'} for: {line}")
+                except OSError as e:
+                    details.append(f"crontab error for {line}: {type(e).__name__}: {e}")
+            else:
+                details.append(f"crontab already has: {line}")
 
     append_ui_log("automation | repair | " + " | ".join(details))
     return "\n".join(details)
@@ -9330,6 +10709,33 @@ class _DualProtocolSocket:
 def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
     class Handler(BaseHTTPRequestHandler):
         _tls_available = False
+
+        def _client_source_ip(self) -> str:
+            xff = str(self.headers.get("X-Forwarded-For", "") or "").strip()
+            if xff:
+                first = xff.split(",")[0].strip()
+                if first:
+                    return first
+            xrip = str(self.headers.get("X-Real-IP", "") or "").strip()
+            if xrip:
+                return xrip
+            try:
+                return str(self.client_address[0] or "").strip() or "unknown"
+            except Exception:
+                return "unknown"
+
+        def _connected_interface_host(self) -> str:
+            """Host/interface used to access this UI request."""
+            xfh = str(self.headers.get("X-Forwarded-Host", "") or "").strip()
+            if xfh:
+                return xfh.split(",")[0].strip()
+            host = str(self.headers.get("Host", "") or "").strip()
+            if host:
+                return host
+            try:
+                return str(self.server.server_address[0] or "").strip()
+            except Exception:
+                return ""
 
         def _redirect_http_to_https(self) -> bool:
             """If TLS is active but this request arrived over plain HTTP, redirect to HTTPS.
@@ -9433,33 +10839,6 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 out[k] = m.value
             return out
 
-        def _client_source_ip(self) -> str:
-            xff = str(self.headers.get("X-Forwarded-For", "") or "").strip()
-            if xff:
-                first = xff.split(",")[0].strip()
-                if first:
-                    return first
-            xrip = str(self.headers.get("X-Real-IP", "") or "").strip()
-            if xrip:
-                return xrip
-            try:
-                return str(self.client_address[0] or "").strip() or "unknown"
-            except Exception:
-                return "unknown"
-
-        def _connected_interface_host(self) -> str:
-            """Host/interface used to access this UI request."""
-            xfh = str(self.headers.get("X-Forwarded-Host", "") or "").strip()
-            if xfh:
-                return xfh.split(",")[0].strip()
-            host = str(self.headers.get("Host", "") or "").strip()
-            if host:
-                return host
-            try:
-                return str(self.server.server_address[0] or "").strip()
-            except Exception:
-                return ""
-
         def _ssl_warning_text(self) -> str:
             if isinstance(self.connection, ssl.SSLSocket):
                 return ""
@@ -9469,7 +10848,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             host = self.headers.get("Host", "")
             return (
                 f"Connection appears to be plain HTTP ({host or 'direct access'}). "
-                "Use Synology Reverse Proxy with HTTPS to protect login credentials and 2FA codes."
+                "Use reverse proxy with HTTPS to protect login credentials and 2FA codes."
             )
 
         def _view_from_referer(self) -> str:
@@ -9483,14 +10862,14 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 return "overview"
             return v if v in ("overview", "setup", "settings") else "overview"
 
-        def _ui_context_from_referer(self) -> Tuple[str, str, str, str, str, str, str, str, str]:
+        def _ui_context_from_referer(self) -> Tuple[str, str, str, str, str, str, str, str]:
             ref = self.headers.get("Referer", "")
             if not ref:
-                return ("overview", "logs", "all", "local", "all", "all", "", "", "")
+                return ("overview", "logs", "all", "local", "all", "all", "", "")
             try:
                 q = parse_qs(urlparse(ref).query)
             except Exception:
-                return ("overview", "logs", "all", "local", "all", "all", "", "", "")
+                return ("overview", "logs", "all", "local", "all", "all", "", "")
             ui_view = (q.get("ui_view", [q.get("view", ["overview"])[0]])[0] or "overview").strip().lower()
             if ui_view not in ("overview", "setup", "settings"):
                 ui_view = "overview"
@@ -9498,22 +10877,19 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             if diag_view not in ("logs", "task", "cache", "config", "history", "paths", "system"):
                 diag_view = "logs"
             log_filter = (q.get("log_filter", ["all"])[0] or "all").strip().lower()
-            if log_filter not in ("all", "smart", "storage", "ping", "port", "dns", "backup"):
+            if log_filter not in ("all", "smart", "storage", "ping", "port", "dns", "backup", "service"):
                 log_filter = "all"
             log_source = (q.get("source", [q.get("log_source", ["local"])[0]])[0] or "local").strip() or "local"
             log_date = _normalize_log_date((q.get("log_date", ["all"])[0] or "all").strip().lower())
             log_time_scope = _normalize_log_time_scope((q.get("log_time_scope", ["all"])[0] or "all").strip().lower())
             log_time_from = _normalize_log_time_hhmm((q.get("log_time_from", [""])[0] or "").strip())
             log_time_to = _normalize_log_time_hhmm((q.get("log_time_to", [""])[0] or "").strip())
-            server_panel = (q.get("server_panel", [""])[0] or "").strip().lower()
-            if server_panel not in ("name", "ip", "time", "package", "login", "login-time"):
-                server_panel = ""
-            return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel)
+            return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to)
 
-        def _resolve_ui_context(self, form: Optional[Dict[str, List[str]]] = None) -> Tuple[str, str, str, str, str, str, str, str, str]:
-            ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._ui_context_from_referer()
+        def _resolve_ui_context(self, form: Optional[Dict[str, List[str]]] = None) -> Tuple[str, str, str, str, str, str, str, str]:
+            ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._ui_context_from_referer()
             if not isinstance(form, dict):
-                return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel)
+                return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to)
             form_view = (form.get("ui_view", [form.get("view", [ui_view])[0]])[0] or ui_view).strip().lower()
             if form_view in ("overview", "setup", "settings"):
                 ui_view = form_view
@@ -9521,25 +10897,22 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             if form_diag in ("logs", "task", "cache", "config", "history", "paths", "system"):
                 diag_view = form_diag
             form_filter = (form.get("log_filter", [log_filter])[0] or log_filter).strip().lower()
-            if form_filter in ("all", "smart", "storage", "ping", "port", "dns", "backup"):
+            if form_filter in ("all", "smart", "storage", "ping", "port", "dns", "backup", "service"):
                 log_filter = form_filter
             form_source = (form.get("source", [form.get("log_source", [log_source])[0]])[0] or log_source).strip()
             if form_source:
                 log_source = form_source
-            form_log_date = (form.get("log_date", [log_date])[0] or log_date).strip().lower()
-            if form_log_date:
-                log_date = _normalize_log_date(form_log_date)
-            form_log_time = (form.get("log_time_scope", [log_time_scope])[0] or log_time_scope).strip().lower()
-            if form_log_time:
-                log_time_scope = _normalize_log_time_scope(form_log_time)
-            form_log_time_from = (form.get("log_time_from", [log_time_from])[0] or log_time_from).strip()
-            log_time_from = _normalize_log_time_hhmm(form_log_time_from)
-            form_log_time_to = (form.get("log_time_to", [log_time_to])[0] or log_time_to).strip()
-            log_time_to = _normalize_log_time_hhmm(form_log_time_to)
-            form_panel = (form.get("server_panel", [server_panel])[0] or server_panel).strip().lower()
-            if form_panel in ("name", "ip", "time", "package", "login", "login-time"):
-                server_panel = form_panel
-            return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel)
+            fd_ld = (form.get("log_date", [log_date])[0] or log_date).strip().lower()
+            if fd_ld:
+                log_date = _normalize_log_date(fd_ld)
+            fd_lt = (form.get("log_time_scope", [log_time_scope])[0] or log_time_scope).strip().lower()
+            if fd_lt:
+                log_time_scope = _normalize_log_time_scope(fd_lt)
+            fd_ltf = (form.get("log_time_from", [log_time_from])[0] or log_time_from).strip()
+            log_time_from = _normalize_log_time_hhmm(fd_ltf)
+            fd_ltt = (form.get("log_time_to", [log_time_to])[0] or log_time_to).strip()
+            log_time_to = _normalize_log_time_hhmm(fd_ltt)
+            return (ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to)
 
         def _is_authenticated(self) -> bool:
             auth = _load_auth_state()
@@ -9590,6 +10963,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
 
         def _require_peer_mtls(self, allow_token_only: bool = False) -> bool:
             if allow_token_only or not self._peer_mtls_enforced():
+                return True
+            # Client certificates are only available on TLS connections. Plain HTTP
+            # peering uses Bearer token + encrypted payloads (same bootstrap model as register).
+            if not isinstance(self.connection, ssl.SSLSocket):
                 return True
             if self._peer_client_cert_present():
                 return True
@@ -9705,9 +11082,9 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     return
                 self._check_get_signature()
                 cfg = load_config()
-                auth = _load_auth_state()
                 history = _load_history()
                 state = _load_monitor_state()
+                auth = load_auth()
                 self._reply_peer_json({
                     "instance_id": _get_instance_id(cfg),
                     "instance_name": str(cfg.get("instance_name", "") or ""),
@@ -9751,10 +11128,9 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 lt = _normalize_log_time_scope(str(qs.get("log_time_scope", ["all"])[0] or "all").strip().lower())
                 ltf = _normalize_log_time_hhmm(str(qs.get("log_time_from", [""])[0] or "").strip())
                 ltt = _normalize_log_time_hhmm(str(qs.get("log_time_to", [""])[0] or "").strip())
-                lw = str(qs.get("log_word", [""])[0] or "").strip()[:80]
                 cfg = load_config()
                 history = _load_history()
-                text = _build_diag_text(cfg, history, diag_view=view, log_filter=lf, log_date=ld, log_time_scope=lt, log_time_from=ltf, log_time_to=ltt, log_word=lw)
+                text = _build_diag_text(cfg, history, diag_view=view, log_filter=lf, log_date=ld, log_time_scope=lt, log_time_from=ltf, log_time_to=ltt)
                 self._reply_peer_json({"text": text}, 200)
                 return
             if parsed.path == "/api/peer/update-status":
@@ -9763,10 +11139,21 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 if not self._verify_peer_token():
                     self._reply_json({"error": "unauthorized"}, 401)
                     return
+                self._check_get_signature()
+                qs = parse_qs(parsed.query)
+                session_id = str(qs.get("session_id", [""])[0] or "").strip()
+                sess = _load_agent_update_session()
+                if not session_id or sess.get("session_id") != session_id:
+                    self._reply_peer_json({"error": "session not found", "stage": "unknown"}, 404)
+                    return
                 self._reply_peer_json({
-                    "error": "Synology packages do not support remote script updates.",
-                    "stage": "unsupported"
-                }, 404)
+                    "session_id": sess.get("session_id"),
+                    "stage": sess.get("stage", "unknown"),
+                    "log": sess.get("log", []),
+                    "error": sess.get("error"),
+                    "started_at": sess.get("started_at"),
+                    "updated_at": sess.get("updated_at"),
+                }, 200)
                 return
             if parsed.path == "/api/public/internet":
                 cfg = load_config()
@@ -9886,7 +11273,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 self._reply_json(
                     payload,
                     200,
-                    extra_headers=[("Content-Disposition", 'attachment; filename="synology-monitor-settings-export.json"')],
+                    extra_headers=[("Content-Disposition", 'attachment; filename="unix-monitor-settings-export.json"')],
                 )
                 return
             if not _auth_initialized(auth):
@@ -9896,7 +11283,9 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 self._redirect("/auth/login")
                 return
             if parsed.path == "/status-json":
-                self._reply_json(_build_live_snapshot(), 200)
+                qs = parse_qs(parsed.query)
+                source_ctx = (qs.get("source", ["local"])[0] or "local").strip()
+                self._reply_json(_build_live_snapshot_for_source(source_ctx), 200)
                 return
             if parsed.path == "/api/agent-update-status":
                 if not self._is_authenticated():
@@ -9924,7 +11313,6 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 log_time_scope = _normalize_log_time_scope((qs.get("log_time_scope", ["all"])[0] or "all").strip().lower())
                 log_time_from = _normalize_log_time_hhmm((qs.get("log_time_from", [""])[0] or "").strip())
                 log_time_to = _normalize_log_time_hhmm((qs.get("log_time_to", [""])[0] or "").strip())
-                log_word = (qs.get("log_word", [""])[0] or "").strip()[:80]
                 if not peer_id:
                     self._reply_json({"error": "Missing peer_id"}, 400)
                     return
@@ -9938,7 +11326,6 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     log_time_scope=log_time_scope,
                     log_time_from=log_time_from,
                     log_time_to=log_time_to,
-                    log_word=log_word,
                     resolve_timeout=5,
                     fetch_timeout=10,
                 )
@@ -9955,37 +11342,68 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 except OSError:
                     self._reply_html(_render_setup_html(error=f"Guide image missing in package: {name}"), 500)
                 return
+            if parsed.path == "/peer/sync-now":
+                self._reply_html(_render_setup_html(
+                    peering_message=(
+                        "Sync uses POST only. Use the Sync now or Sync all agents button on this page "
+                        "— do not open this address directly in the browser."
+                    ),
+                    ui_view="settings",
+                    ssl_warning=ssl_warning,
+                ))
+                return
             qs = parse_qs(parsed.query)
             log_filter = (qs.get("log_filter", ["all"])[0] or "all").strip().lower()
             diag_view = (qs.get("diag_view", ["logs"])[0] or "logs").strip().lower()
             ui_view = (qs.get("view", ["overview"])[0] or "overview").strip().lower()
             highlight = (qs.get("highlight", [""])[0] or "").strip().lower()
-            log_source = (qs.get("log_source", ["local"])[0] or "local").strip()
+            source_ctx = (qs.get("source", [qs.get("log_source", ["local"])[0]])[0] or "local").strip()
+            diagnose = (qs.get("diagnose", ["0"])[0] or "0").strip().lower() in ("1", "true", "yes")
             log_date = _normalize_log_date((qs.get("log_date", ["all"])[0] or "all").strip().lower())
             log_time_scope = _normalize_log_time_scope((qs.get("log_time_scope", ["all"])[0] or "all").strip().lower())
             log_time_from = _normalize_log_time_hhmm((qs.get("log_time_from", [""])[0] or "").strip())
             log_time_to = _normalize_log_time_hhmm((qs.get("log_time_to", [""])[0] or "").strip())
-            log_word = (qs.get("log_word", [""])[0] or "").strip()[:80]
-            diagnose = (qs.get("diagnose", ["0"])[0] or "0").strip().lower() in ("1", "true", "yes")
-            if highlight not in ("smart", "storage", "ping", "port", "dns", "backup"):
+            if highlight not in ("smart", "storage", "ping", "port", "dns", "backup", "service"):
                 highlight = ""
-            _ensure_fresh_update_check_async(cfg=load_config(), force=False, ttl_sec=UPDATE_CHECK_INTERVAL_SEC)
-            self._reply_html(
-                _render_setup_html(
+            profile_render = (qs.get("render_profile", ["0"])[0] or "0").strip().lower() in ("1", "true", "yes")
+            threading.Thread(target=_maybe_run_autoupdate, daemon=True).start()
+            render_started = time.perf_counter()
+            if profile_render:
+                profiler = cProfile.Profile()
+                profiler.enable()
+            rendered_html = _render_setup_html(
                     log_filter=log_filter,
                     log_date=log_date,
                     log_time_scope=log_time_scope,
                     log_time_from=log_time_from,
                     log_time_to=log_time_to,
-                    log_word=log_word,
                     diag_view=diag_view,
                     ui_view=ui_view,
                     highlight_channel=highlight,
-                    log_source=log_source,
+                    log_source=source_ctx,
                     diagnose_agent=diagnose,
                     ssl_warning=ssl_warning,
                 )
-            )
+            if profile_render:
+                profiler.disable()
+            render_ms = (time.perf_counter() - render_started) * 1000.0
+            extra_headers: List[Tuple[str, str]] = [("X-Render-Ms", f"{render_ms:.1f}")]
+            if profile_render:
+                extra_headers.append(("X-Render-Profile", "1"))
+                try:
+                    stats_out = StringIO()
+                    pstats.Stats(profiler, stream=stats_out).sort_stats("cumulative").print_stats(25)
+                    lines = [ln.strip() for ln in stats_out.getvalue().splitlines() if ln.strip()]
+                    append_ui_log(
+                        "render-prof | "
+                        f"view={ui_view} source={source_ctx or 'local'} diag={diag_view} "
+                        f"total_ms={render_ms:.1f}"
+                    )
+                    for ln in lines[:20]:
+                        append_ui_log(f"render-prof | {ln[:220]}")
+                except Exception as exc:
+                    append_ui_log(f"render-prof | failed to summarize: {type(exc).__name__}: {exc}")
+            self._reply_html(rendered_html, extra_headers=extra_headers)
 
         def do_POST(self) -> None:  # noqa: N802
             _set_request_display_host(self._connected_interface_host())
@@ -10022,6 +11440,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         p["last_seen"] = int(time.time())
                         p["monitor_count"] = len(data.get("monitors", []))
                         p["version"] = str(data.get("version", "") or "")
+                        p["platform"] = str(data.get("platform", "") or "")
                         p["status"] = "online"
                         existing_url = str(p.get("url", "") or "").strip()
                         # Preserve a manually set URL; only auto-fill from callback when unlocked.
@@ -10074,6 +11493,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         p["monitor_count"] = int(data.get("monitor_count", 0) or 0)
                         p["version"] = str(data.get("version", "") or "")
                         p["status"] = "online"
+                        if not str(p.get("enrollment", "") or "").strip():
+                            p["enrollment"] = "legacy-peer"
                         found = True
                         break
                 if not found:
@@ -10085,6 +11506,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         "version": str(data.get("version", "") or ""),
                         "status": "online",
                         "role": "agent",
+                        "enrollment": "legacy-peer",
                     })
                 csr_pem = str(data.get("csr_pem", "") or "").strip()
                 signed_cert = ""
@@ -10157,7 +11579,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     self._reply_json({"error": f"monitor '{m_name}' already exists"}, 409)
                     return
                 new_mon: Dict[str, Any] = {"name": m_name, "check_mode": m_mode, "kuma_url": m_url}
-                for extra_key in ("probe_host", "probe_port", "dns_name", "dns_server"):
+                for extra_key in ("probe_host", "probe_port", "dns_name", "dns_server", "service_names", "service_description_filter", "source_platform"):
                     val = str(data.get(extra_key, "") or "").strip()
                     if val:
                         new_mon[extra_key] = val
@@ -10169,14 +11591,33 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 self._reply_peer_json({"status": "ok", "created": m_name}, 201)
                 return
             if self.path == "/api/peer/update":
-                if not self._require_peer_mtls():
-                    return
-                if not self._verify_peer_token():
-                    self._reply_json({"error": "unauthorized"}, 401)
-                    return
-                self._reply_peer_json({
-                    "error": "Synology packages are updated via Package Center. Download the SPK from GitHub releases and install manually."
-                }, 400)
+                append_ui_log("peer-update | request received from master")
+                try:
+                    append_ui_log("peer-update | checking mTLS")
+                    if not self._require_peer_mtls(allow_token_only=True):
+                        append_ui_log("peer-update | mTLS check failed")
+                        return
+                    append_ui_log("peer-update | checking token")
+                    if not self._verify_peer_token():
+                        append_ui_log("peer-update | token verification failed")
+                        self._reply_json({"error": "unauthorized"}, 401)
+                        return
+                    helper = get_update_helper_path()
+                    append_ui_log(f"peer-update | helper path: {helper} exists={helper.exists()}")
+                    if not helper.exists():
+                        append_ui_log("peer-update | update helper not found")
+                        self._reply_peer_json({"error": "Update helper not found"}, 400)
+                        return
+                    append_ui_log("peer-update | starting background update")
+                    session_id = _run_agent_update_background()
+                    append_ui_log(f"peer-update | started session {session_id}")
+                    self._reply_peer_json({"status": "started", "session_id": session_id}, 202)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    err_msg = f"{type(e).__name__}: {e}"
+                    append_ui_log(f"peer-update | error: {err_msg}")
+                    append_ui_log(f"peer-update | traceback: {tb}")
+                    self._reply_peer_json({"error": err_msg, "traceback": tb[:2000]}, 500)
                 return
             if self.path == "/api/peer/clear-logs":
                 if not self._require_peer_mtls(allow_token_only=True):
@@ -10261,21 +11702,32 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 raw_len = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                 form = parse_qs(body, keep_blank_values=True)
-                test_url_raw = (form.get("peer_url", [""])[0] or "").strip()
-                test_token = (form.get("peer_token", [""])[0] or "").strip()
-                test_url = _resolve_peer_url_from_stored(test_url_raw, test_token, timeout=8) if test_url_raw and test_token else test_url_raw
-                result = _peer_test_connection(test_url, test_token) if test_url else "Missing host or token."
+                cfg = load_config()
+                test_url_raw, test_token = _peer_agent_test_inputs(form, cfg)
+                resolved_url = ""
+                if not test_url_raw or not test_token:
+                    result = "Missing master host/port or peering token. Enter master host, master port, and token."
+                    test_url = ""
+                else:
+                    resolved_url = _resolve_peer_url_from_stored(test_url_raw, test_token, timeout=4, cfg=cfg)
+                    _, target_port = _parse_peer_host_port(test_url_raw, _peer_master_port(cfg))
+                    test_url = resolved_url or _peer_direct_base_url(test_url_raw, target_port)
+                    result = _peer_test_connection(test_url, test_token) if test_url else "Missing master host/port."
                 ok = str(result).strip().lower().startswith("ok")
+                if ok and test_url:
+                    cfg["peer_master_base_url"] = test_url
+                    save_config(cfg, reapply_cron=False)
                 diag_lines = [
                     "Action: Test connection to master",
                     f"Result: {'OK' if ok else 'FAILED'}",
-                    "Role: agent (form action)",
+                    f"Role: agent (form action)",
                     f"Master target (input): {test_url_raw or '(empty)'}",
-                    f"Resolved target URL: {test_url or '(none)'}",
+                    f"Resolved target URL: {resolved_url or '(probe failed — used direct URL)'}",
+                    f"Direct/final URL: {test_url or '(none)'}",
                     f"Token provided: {'yes' if bool(test_token) else 'no'}",
                     f"Result detail: {result}",
                     ("Next action: Run 'Sync now' to push an agent snapshot."
-                     if ok else "Next action: Verify host/port/token and retry test.")
+                     if ok else "Next action: Save settings, verify master is reachable from this host (port/firewall), then retry.")
                 ]
                 ssl_warning = self._ssl_warning_text()
                 ui_view = self._view_from_referer()
@@ -10294,10 +11746,15 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                 form = parse_qs(body, keep_blank_values=True)
                 cfg = load_config()
-                prev_role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
-                role = (form.get("peer_role", [prev_role])[0] or prev_role).strip().lower()
-                if role not in PEER_ROLES:
-                    role = prev_role
+                prev_role = _cfg_peer_role(cfg)
+                prev_master_host = str(cfg.get("peer_master_url", "") or "").strip()
+                prev_master_port = int(cfg.get("peer_master_port", cfg.get("peer_port", PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)
+                if _rollout_agent_mode():
+                    role = "agent"
+                else:
+                    role = (form.get("peer_role", [prev_role])[0] or prev_role).strip().lower()
+                    if role not in _peer_roles():
+                        role = prev_role
                 if role != prev_role:
                     if prev_role == "agent" and role != "standalone" and _peer_agent_bound_to_master(cfg):
                         ssl_warning = self._ssl_warning_text()
@@ -10322,24 +11779,38 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         ))
                         return
                 cfg["peer_role"] = role
-                _m_raw = (form.get("peer_master_url", [""])[0] or "").strip()
-                _cb_raw = (form.get("agent_callback_url", [""])[0] or "").strip()
-                _port_val = (form.get("peer_port", [""])[0] or "").strip()
-                _port = int(_port_val) if _port_val and _port_val.isdigit() else PEER_DEFAULT_PORT
-                cfg["peer_master_url"] = _parse_peer_host_port(_m_raw, _port)[0]
-                cfg["agent_callback_url"] = _parse_peer_host_port(_cb_raw, _port)[0]
-                cfg["peer_port"] = _port if 1 <= _port <= 65535 else PEER_DEFAULT_PORT
+                _legacy_port_val = (form.get("peer_port", [""])[0] or "").strip()
+                if "peer_master_port" in form or "peer_port" in form:
+                    _master_port_val = (form.get("peer_master_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
+                    _master_port = int(_master_port_val) if _master_port_val and _master_port_val.isdigit() else PEER_DEFAULT_PORT
+                    cfg["peer_master_port"] = _master_port if 1 <= _master_port <= 65535 else PEER_DEFAULT_PORT
+                if "peer_agent_port" in form or "peer_port" in form:
+                    _agent_port_val = (form.get("peer_agent_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
+                    _agent_port = int(_agent_port_val) if _agent_port_val and _agent_port_val.isdigit() else PEER_DEFAULT_PORT
+                    cfg["peer_agent_port"] = _agent_port if 1 <= _agent_port <= 65535 else PEER_DEFAULT_PORT
+                    cfg["peer_port"] = cfg["peer_agent_port"]
+                if "peer_master_url" in form:
+                    _m_raw = (form.get("peer_master_url", [""])[0] or "").strip()
+                    cfg["peer_master_url"] = _parse_peer_host_port(_m_raw, _peer_master_port(cfg))[0]
+                if "agent_callback_url" in form:
+                    _cb_raw = (form.get("agent_callback_url", [""])[0] or "").strip()
+                    cfg["agent_callback_url"] = _parse_peer_host_port(_cb_raw, _peer_agent_port(cfg))[0]
+                new_master_host = str(cfg.get("peer_master_url", "") or "").strip()
+                new_master_port = int(cfg.get("peer_master_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
+                if new_master_host != prev_master_host or new_master_port != prev_master_port:
+                    cfg.pop("peer_master_base_url", None)
                 token_val = (form.get("peering_token", [""])[0] or "").strip()
                 token_auto_generated = False
-                if token_val:
-                    cfg["peering_token"] = token_val
-                elif role == "master":
-                    # Auto-generate token when switching to master so it's ready to share
-                    existing = str(cfg.get("peering_token", "") or "").strip()
-                    switching_to_master = prev_role != "master"
-                    if switching_to_master or not existing:
-                        cfg["peering_token"] = secrets.token_hex(32)
-                        token_auto_generated = True
+                if "peering_token" in form:
+                    if token_val:
+                        cfg["peering_token"] = token_val
+                    elif role == "master":
+                        # Auto-generate token when switching to master so it's ready to share
+                        existing = str(cfg.get("peering_token", "") or "").strip()
+                        switching_to_master = prev_role != "master"
+                        if switching_to_master or not existing:
+                            cfg["peering_token"] = secrets.token_hex(32)
+                            token_auto_generated = True
                 inst_id = _get_instance_id(cfg)
                 if role == "standalone":
                     _peer_clear_standalone_peering(cfg, prev_role=prev_role)
@@ -10359,18 +11830,38 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 elif role == "agent" and cfg.get("peer_master_url") and cfg.get("peering_token"):
                     sec_st = _get_mtls_security_status(cfg)
                     if not sec_st["instance_cert_ok"] and _openssl_available():
-                        cr = _agent_request_cert(cfg)
-                        _extra_msg = f" Cert request: {cr}"
+                        _extra_msg += " Agent certificate will be requested automatically after master approval."
                 append_ui_log(f"peer-settings | saved | role={role} | name={cfg.get('instance_name', '')}")
                 diag_lines = [
                     "Action: Save peering settings",
                     "Result: OK",
                     f"Role: {role}",
                     f"Master host: {str(cfg.get('peer_master_url', '') or '(empty)')}",
-                    f"Peer port: {int(cfg.get('peer_port', PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)}",
+                    f"Master port: {int(cfg.get('peer_master_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
+                    f"Agent callback port: {int(cfg.get('peer_agent_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
                     f"Token configured: {'yes' if bool(str(cfg.get('peering_token', '') or '').strip()) else 'no'}",
                     f"Agent callback host: {str(cfg.get('agent_callback_url', '') or '(empty)')}",
                 ]
+                token_for_probe = str(cfg.get("peering_token", "") or "").strip()
+                if role == "agent" and cfg.get("peer_master_url") and token_for_probe:
+                    master_probe = _peer_test_connection(
+                        _resolve_peer_url_from_stored(
+                            str(cfg.get("peer_master_url", "") or ""),
+                            token_for_probe,
+                            timeout=8,
+                        )
+                        or str(cfg.get("peer_master_url", "") or ""),
+                        token_for_probe,
+                    )
+                    diag_lines.append(f"Master connectivity: {master_probe.splitlines()[0]}")
+                callback_host = str(cfg.get("agent_callback_url", "") or "").strip()
+                if callback_host and token_for_probe:
+                    callback_probe = _probe_agent_callback_health(
+                        callback_host,
+                        token_for_probe,
+                        default_port=int(cfg.get("peer_agent_port", cfg.get("peer_port", PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT),
+                    )
+                    diag_lines.append(f"Agent callback connectivity: {callback_probe}")
                 if role == "agent":
                     diag_lines.append("Next action: Run 'Test connection to master' and then 'Sync now'.")
                 elif role == "master":
@@ -10544,34 +12035,55 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 if not self._is_authenticated():
                     self._reply_json({"error": "unauthorized"}, 401)
                     return
-                cfg = load_config()
-                role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
-                if role == "agent":
-                    result = _peer_push_to_master(cfg)
-                    cfg["last_peer_sync"] = int(time.time())
-                    cfg["last_peer_sync_result"] = result
-                    save_config(cfg, reapply_cron=False)
-                    append_ui_log(f"peer-sync | manual agent push: {result}")
-                elif role == "master":
-                    result = _peer_sync_from_master(cfg)
+                ssl_warning = self._ssl_warning_text()
+                try:
                     cfg = load_config()
-                    cfg["last_peer_sync_result"] = result
-                    save_config(cfg, reapply_cron=False)
-                    append_ui_log(f"peer-sync | manual master sync: {result}")
-                else:
-                    result = "Standalone mode - no sync needed."
-                diag_lines = [
-                    "Action: Sync now",
-                    f"Result: {'OK' if 'failed' not in str(result).lower() and 'error' not in str(result).lower() else 'FAILED'}",
-                    f"Role: {role}",
-                    f"Master host: {str(cfg.get('peer_master_url', '') or '(empty)')}",
-                    f"Peer port: {int(cfg.get('peer_port', PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)}",
-                    f"Token configured: {'yes' if bool(str(cfg.get('peering_token', '') or '').strip()) else 'no'}",
-                    f"Agent callback host: {str(cfg.get('agent_callback_url', '') or '(empty)')}",
-                    f"Result detail: {result}",
-                    ("Next action: Open master overview and verify this agent snapshot appears."
-                     if role == "agent" else "Next action: Verify role and use the matching peering action.")
-                ]
+                    role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
+                    master_url = ""
+                    if role == "agent":
+                        result = _peer_push_to_master(cfg)
+                        master_url, _ = _peer_master_base_url(cfg, timeout=4)
+                        cfg["last_peer_sync"] = int(time.time())
+                        cfg["last_peer_sync_result"] = result
+                        save_config(cfg, reapply_cron=False)
+                        append_ui_log(f"peer-sync | manual agent push: {result}")
+                    elif role == "master":
+                        result = _peer_sync_from_master(cfg)
+                        cfg = load_config()
+                        cfg["last_peer_sync_result"] = result
+                        save_config(cfg, reapply_cron=False)
+                        append_ui_log(f"peer-sync | manual master sync: {result}")
+                    else:
+                        result = "Standalone mode - no sync needed."
+                    diag_lines = [
+                        "Action: Sync now",
+                        f"Result: {'OK' if 'failed' not in str(result).lower() and 'error' not in str(result).lower() else 'FAILED'}",
+                        f"Role: {role}",
+                        f"Master host: {str(cfg.get('peer_master_url', '') or '(empty)')}",
+                        f"Master port: {int(cfg.get('peer_master_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
+                        f"Master base URL: {master_url or '(not resolved)'}",
+                    f"Agent callback port: {int(cfg.get('peer_agent_port', cfg.get('peer_port', PEER_DEFAULT_PORT)) or PEER_DEFAULT_PORT)}",
+                        f"Token configured: {'yes' if bool(str(cfg.get('peering_token', '') or '').strip()) else 'no'}",
+                        f"Agent callback host: {str(cfg.get('agent_callback_url', '') or '(empty)')}",
+                        f"Result detail: {result}",
+                        ("Next action: Open master overview and verify this agent snapshot appears."
+                         if role == "agent" else "Next action: Verify role and use the matching peering action.")
+                    ]
+                except Exception as e:
+                    append_ui_log(f"peer-sync | manual error: {type(e).__name__}: {e}")
+                    self._reply_html(_render_setup_html(
+                        peering_message=f"Sync failed: {type(e).__name__}: {e}",
+                        peering_diagnostics=(
+                            "Action: Sync now\n"
+                            "Result: FAILED\n"
+                            f"Role: {str(load_config().get('peer_role', 'standalone') or 'standalone').lower()}\n"
+                            f"Result detail: {type(e).__name__}: {e}\n"
+                            "Next action: Run 'Test connection to master' and verify token/host/port."
+                        ),
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
                     peering_message=f"Sync result: {result}",
@@ -10657,7 +12169,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 m_mode = (form.get("check_mode", ["smart"])[0] or "smart").strip().lower()
                 m_url = (form.get("kuma_url", [""])[0] or "").strip()
                 mon_cfg: Dict[str, Any] = {"name": m_name, "check_mode": m_mode, "kuma_url": m_url}
-                for extra in ("probe_host", "probe_port", "dns_name", "dns_server"):
+                for extra in ("probe_host", "probe_port", "dns_name", "dns_server", "service_names", "service_description_filter"):
                     v = (form.get(extra, [""])[0] or "").strip()
                     if v:
                         mon_cfg[extra] = v
@@ -10727,7 +12239,13 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         break
                 cfg["peers"] = peers
                 save_config(cfg, reapply_cron=False)
-                msg = f"Peer URL updated." if updated else f"Peer not found."
+                token = str(cfg.get("peering_token", "") or "").strip()
+                probe_msg = ""
+                if updated and upd_url and token:
+                    probe_msg = _probe_agent_callback_health(upd_url, token)
+                msg = "Peer URL updated." if updated else "Peer not found."
+                if probe_msg:
+                    msg = f"{msg} {probe_msg}"
                 append_ui_log(f"peer-update-url | {upd_id} -> {upd_url}")
                 ssl_warning = self._ssl_warning_text()
                 self._reply_html(_render_setup_html(
@@ -10765,6 +12283,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     "monitor_count": 0,
                     "status": "offline",
                     "role": "agent",
+                    "enrollment": "legacy-peer",
                 }
                 if a_url:
                     _ah, _ap = _parse_peer_host_port(a_url)
@@ -10822,11 +12341,27 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     self._reply_json({"error": "unauthorized"}, 401)
                     return
                 cfg = load_config()
+                master_url, _ = _peer_master_base_url(cfg, timeout=4)
                 result = _agent_request_cert(cfg)
                 append_ui_log(f"mtls | agent cert request: {result}")
                 ssl_warning = self._ssl_warning_text()
+                cert_ok = str(result).strip().lower().startswith("certificate signed")
+                token_only_ok = "token-only peering still works" in str(result).lower()
+                diag_lines = [
+                    "Action: Request certificate from master",
+                    f"Result: {'OK' if cert_ok else ('OPTIONAL' if token_only_ok else 'FAILED')}",
+                    f"Master base URL: {str(cfg.get('peer_master_base_url', '') or master_url or '(not resolved)')}",
+                    f"Detail: {result}",
+                    ("Next action: Run 'Sync now' to push telemetry with mTLS."
+                     if cert_ok else (
+                         "Next action: Hosted master — skip cert; run Test connection then Sync now."
+                         if token_only_ok else
+                         "Next action: Run Test connection. If timeout, set HOSTED_BIND_IP=0.0.0.0 on master and redeploy."
+                     ))
+                ]
                 self._reply_html(_render_setup_html(
                     peering_message=result,
+                    peering_diagnostics="\n".join(diag_lines),
                     ui_view="settings",
                     ssl_warning=ssl_warning,
                 ))
@@ -10863,11 +12398,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
             )
             auth = _load_auth_state()
             ssl_warning = self._ssl_warning_text()
-            ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context()
+            ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context()
             if self.path in auth_routes:
                 content_type = (self.headers.get("Content-Type", "") or "").lower()
                 import_file_json = ""
-                if self.path == "/auth/import" and "multipart/form-data" in content_type:
+                if self.path == "/auth/import" and "multipart/form-data" in content_type and cgi is not None:
                     fs = cgi.FieldStorage(
                         fp=self.rfile,
                         headers=self.headers,
@@ -10881,7 +12416,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     if isinstance(bk, bytes):
                         bk = bk.decode("utf-8", errors="ignore")
                     form = {"import_payload": [str(raw_payload or "")], "backup_key": [str(bk or "")]}
-                    for _ctx in ("ui_view", "diag_view", "log_filter", "log_date", "log_time_scope", "log_time_from", "log_time_to", "source", "log_source", "server_panel"):
+                    for _ctx in ("ui_view", "diag_view", "log_filter", "log_date", "log_time_scope", "log_time_from", "log_time_to", "source", "log_source"):
                         if _ctx in fs:
                             try:
                                 _v = fs.getvalue(_ctx)
@@ -10903,8 +12438,18 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
+                ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                 if self.path == "/auth/logout":
+                    flag_path = _get_autoupdate_on_logout_flag_path()
+                    if flag_path.exists():
+                        try:
+                            flag_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        threading.Thread(
+                            target=lambda: _maybe_run_autoupdate(defer_if_user_logged_in=False),
+                            daemon=True,
+                        ).start()
                     self._redirect(
                         "/auth/login",
                         extra_headers=[
@@ -10963,6 +12508,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     pwd = (form.get("password", [""])[0] or "").strip()
                     if not check_password_hash(str(auth.get("password_hash", "")), pwd):
                         _register_auth_failure(auth)
+                        _append_login_event(auth, self._client_source_ip(), "failed-password")
+                        _save_auth_state(auth)
                         self._reply_html(_render_auth_login_page(error=_invalid_password_message(auth), ssl_warning=ssl_warning))
                         return
                     _register_auth_success(auth)
@@ -10982,15 +12529,15 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     token = (form.get("token", [""])[0] or "").strip()
                     if not _verify_totp_token(str(auth.get("totp_secret", "")), token):
                         _register_auth_failure(auth)
+                        _append_login_event(auth, self._client_source_ip(), "failed-2fa")
+                        _save_auth_state(auth)
                         self._reply_html(_render_auth_verify_page(error="Invalid authenticator code.", ssl_warning=ssl_warning))
                         return
                     _register_auth_success(auth)
-                    client_ip = self._client_source_ip()
-                    auth["last_login_ip"] = client_ip
+                    auth["last_login_ip"] = self._client_source_ip()
                     auth["last_login_at"] = int(time.time())
-                    _append_login_event(auth, client_ip, "2fa")
+                    _append_login_event(auth, auth["last_login_ip"], "success-2fa")
                     _save_auth_state(auth)
-                    _ensure_fresh_update_check_async(cfg=load_config(), force=False, ttl_sec=UPDATE_CHECK_INTERVAL_SEC)
                     sess = _sign_payload(
                         {"auth": True, "exp": int(time.time()) + AUTH_SESSION_TTL_SEC},
                         str(auth.get("session_secret", "")),
@@ -11010,15 +12557,15 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     code = (form.get("recovery_code", [""])[0] or "").strip()
                     if not _consume_recovery_code(auth, code):
                         _register_auth_failure(auth)
+                        _append_login_event(auth, self._client_source_ip(), "failed-recovery")
+                        _save_auth_state(auth)
                         self._reply_html(_render_auth_recovery_page(error="Invalid or already used recovery code.", ssl_warning=ssl_warning))
                         return
                     _register_auth_success(auth)
-                    client_ip = self._client_source_ip()
-                    auth["last_login_ip"] = client_ip
+                    auth["last_login_ip"] = self._client_source_ip()
                     auth["last_login_at"] = int(time.time())
-                    _append_login_event(auth, client_ip, "recovery")
+                    _append_login_event(auth, auth["last_login_ip"], "success-recovery")
                     _save_auth_state(auth)
-                    _ensure_fresh_update_check_async(cfg=load_config(), force=False, ttl_sec=UPDATE_CHECK_INTERVAL_SEC)
                     sess = _sign_payload(
                         {"auth": True, "exp": int(time.time()) + AUTH_SESSION_TTL_SEC},
                         str(auth.get("session_secret", "")),
@@ -11137,7 +12684,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     append_ui_log("auth-security | full encrypted backup exported")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Disposition", 'attachment; filename="synology-monitor-backup.enc.json"')
+                    self.send_header("Content-Disposition", 'attachment; filename="unix-monitor-backup.enc.json"')
                     self.send_header("Content-Length", str(len(result.encode("utf-8"))))
                     self.end_headers()
                     self.wfile.write(result.encode("utf-8"))
@@ -11213,7 +12760,9 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 "/settings/save-instance-name",
                 "/settings/save-ui-bind",
                 "/settings/save-internet-check",
+                "/settings/save-autoupdate",
                 "/settings/save-update-from-main",
+                "/settings/request-autoupdate-on-logout",
                 "/settings/recheck-updates",
                 "/save",
                 "/run-check",
@@ -11237,11 +12786,143 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 "/auto-create-task",
                 "/danger-restart",
                 "/danger-reset",
+                "/self-update",
+                "/self-rollback",
                 "/agent-update",
             ):
                 self._reply_html(_render_setup_html(error="Unsupported endpoint"), 404)
                 return
             try:
+                if self.path == "/settings/save-instance-name":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    instance_name = (form.get("instance_name", [""])[0] or "").strip()
+                    cfg = load_config()
+                    cfg["instance_name"] = instance_name
+                    save_config(cfg, reapply_cron=False)
+                    append_ui_log(f"settings | instance name saved: {instance_name or '-'}")
+                    self._reply_html(_render_setup_html(
+                        security_message="Instance name saved.",
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
+                if self.path == "/settings/save-ui-bind":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    cfg = load_config()
+                    selected_host = _normalize_ui_bind_host(form.get("ui_bind_host", [cfg.get("ui_bind_host", "0.0.0.0")])[0], _list_system_ips())
+                    selected_port = _normalize_ui_bind_port(form.get("ui_bind_port", [cfg.get("ui_bind_port", 8787)])[0])
+                    cfg["ui_bind_host"] = selected_host
+                    cfg["ui_bind_port"] = selected_port
+                    save_config(cfg, reapply_cron=False)
+                    bind_desc = (
+                        "all interfaces (0.0.0.0)"
+                        if selected_host == "0.0.0.0"
+                        else ("localhost only (127.0.0.1)" if selected_host == "127.0.0.1" else selected_host)
+                    )
+                    append_ui_log(f"settings | web ui bind saved host={selected_host} port={selected_port}")
+                    self._reply_html(_render_setup_html(
+                        security_message=f"Web UI binding saved: {bind_desc}:{selected_port}. Restart UI/service to apply.",
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
+                if self.path == "/settings/save-internet-check":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    cfg = load_config()
+                    mode = _normalize_internet_check_mode(form.get("internet_check_mode", [cfg.get("internet_check_mode", "tcp-connect")])[0])
+                    port_profile = _normalize_internet_check_port_profile(form.get("internet_check_port_profile", [cfg.get("internet_check_port_profile", "dns")])[0])
+                    custom_port = _normalize_internet_check_custom_port(form.get("internet_check_custom_port", [cfg.get("internet_check_custom_port", 53)])[0])
+                    timeout_ms = _normalize_internet_check_timeout_ms(form.get("internet_check_timeout_ms", [cfg.get("internet_check_timeout_ms", 1500)])[0])
+                    targets = _internet_check_targets_display(
+                        _parse_internet_check_targets(
+                            form.get("internet_check_targets", [cfg.get("internet_check_targets", "")])[0],
+                            port_profile=port_profile,
+                            custom_port=custom_port,
+                        )
+                    )
+                    dns_servers = _internet_check_targets_display(
+                        _parse_internet_check_targets(
+                            form.get("internet_check_dns_servers", [cfg.get("internet_check_dns_servers", "")])[0],
+                            port_profile="dns",
+                            custom_port=53,
+                        )
+                    )
+                    cfg["internet_check_mode"] = mode
+                    cfg["internet_check_port_profile"] = port_profile
+                    cfg["internet_check_custom_port"] = custom_port
+                    cfg["internet_check_timeout_ms"] = timeout_ms
+                    cfg["internet_check_targets"] = targets
+                    cfg["internet_check_dns_servers"] = dns_servers
+                    save_config(cfg, reapply_cron=False)
+                    append_ui_log(
+                        f"settings | internet check saved mode={mode} port_profile={port_profile} "
+                        f"custom_port={custom_port} timeout_ms={timeout_ms} targets={targets} dns_servers={dns_servers}"
+                    )
+                    self._reply_html(_render_setup_html(
+                        security_message=(
+                            f"Internet check settings saved: mode={mode}, port_profile={port_profile}, "
+                            f"custom_port={custom_port}, timeout={timeout_ms}ms, targets={targets}, dns_servers={dns_servers}."
+                        ),
+                        ui_view="settings",
+                        ssl_warning=ssl_warning,
+                    ))
+                    return
+                if self.path == "/settings/save-autoupdate":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
+                    vals = form.get("autoupdate_enabled", []) or []
+                    enabled = "1" in vals
+                    cfg = load_config()
+                    cfg["autoupdate_enabled"] = enabled
+                    save_config(cfg, reapply_cron=False)
+                    append_ui_log(f"settings | autoupdate {'enabled' if enabled else 'disabled'}")
+                    self._reply_html(_render_setup_html(
+                        security_message="Autoupdate " + ("enabled" if enabled else "disabled") + ".",
+                        ui_view=ui_view,
+                        diag_view=diag_view,
+                        log_filter=log_filter,
+                        log_date=log_date,
+                        log_time_scope=log_time_scope,
+                        log_source=log_source,
+                        ssl_warning=ssl_warning,
+                        open_server_panel="package",
+                    ))
+                    return
+                if self.path == "/settings/save-update-from-main":
+                    raw_len = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
+                    form = parse_qs(body, keep_blank_values=True)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
+                    vals = form.get("update_from_main", []) or []
+                    enabled = "1" in vals
+                    cfg = load_config()
+                    cfg["update_from_main"] = enabled
+                    save_config(cfg, reapply_cron=False)
+                    check_result = _run_update_check(cfg)
+                    _save_update_check_result(check_result)
+                    selected = "main" if enabled else "latest release"
+                    public_version = str(check_result.get("public_version", "") or check_result.get("latest_version", "") or "")
+                    append_ui_log(f"settings | update source set to {selected}")
+                    self._reply_html(_render_setup_html(
+                        security_message="Update source set to " + selected + (f". Public version: {public_version}." if public_version else "."),
+                        ui_view=ui_view,
+                        diag_view=diag_view,
+                        log_filter=log_filter,
+                        log_date=log_date,
+                        log_time_scope=log_time_scope,
+                        log_source=log_source,
+                        ssl_warning=ssl_warning,
+                        open_server_panel="package",
+                    ))
+                    return
                 if self.path == "/agent-update":
                     if not self._is_authenticated():
                         self._reply_json({"error": "unauthorized"}, 401)
@@ -11280,175 +12961,74 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     append_ui_log(f"agent-update | triggered for {peer_id}, session {session_id}")
                     self._reply_json({"status": "started", "session_id": session_id, "peer_id": peer_id}, 202)
                     return
-                if self.path == "/settings/save-instance-name":
-                    raw_len = int(self.headers.get("Content-Length", "0"))
-                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
-                    form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
-                    instance_name = (form.get("instance_name", [""])[0] or "").strip()
-                    cfg = load_config()
-                    cfg["instance_name"] = instance_name
-                    save_config(cfg, reapply_cron=False)
-                    append_ui_log(f"settings | instance name saved: {instance_name or '-'}")
-                    self._reply_html(_render_setup_html(
-                        security_message="Instance name saved.",
-                        ui_view=ui_view,
-                        diag_view=diag_view,
-                        log_filter=log_filter,
-                        log_source=log_source,
-                        server_panel=server_panel,
-                        ssl_warning=ssl_warning,
-                    ))
-                    return
-                if self.path == "/settings/save-ui-bind":
-                    raw_len = int(self.headers.get("Content-Length", "0"))
-                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
-                    form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
-                    cfg = load_config()
-                    selected_host = _normalize_ui_bind_host(form.get("ui_bind_host", [cfg.get("ui_bind_host", "0.0.0.0")])[0], _list_system_ips())
-                    selected_port = _normalize_ui_bind_port(form.get("ui_bind_port", [cfg.get("ui_bind_port", 8787)])[0])
-                    cfg["ui_bind_host"] = selected_host
-                    cfg["ui_bind_port"] = selected_port
-                    save_config(cfg, reapply_cron=False)
-                    bind_desc = (
-                        "all interfaces (0.0.0.0)"
-                        if selected_host == "0.0.0.0"
-                        else ("localhost only (127.0.0.1)" if selected_host == "127.0.0.1" else selected_host)
-                    )
-                    append_ui_log(f"settings | web ui bind saved host={selected_host} port={selected_port}")
-                    self._reply_html(_render_setup_html(
-                        security_message=f"Web UI binding saved: {bind_desc}:{selected_port}. Restart UI/service to apply.",
-                        ui_view="settings",
-                        diag_view=diag_view,
-                        log_filter=log_filter,
-                        log_source=log_source,
-                        log_date=log_date,
-                        log_time_scope=log_time_scope,
-                        log_time_from=log_time_from,
-                        log_time_to=log_time_to,
-                        server_panel=server_panel,
-                    ))
-                    return
-                if self.path == "/settings/save-internet-check":
-                    raw_len = int(self.headers.get("Content-Length", "0"))
-                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
-                    form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
-                    cfg = load_config()
-                    mode = _normalize_internet_check_mode(form.get("internet_check_mode", [cfg.get("internet_check_mode", "tcp-connect")])[0])
-                    port_profile = _normalize_internet_check_port_profile(form.get("internet_check_port_profile", [cfg.get("internet_check_port_profile", "dns")])[0])
-                    custom_port = _normalize_internet_check_custom_port(form.get("internet_check_custom_port", [cfg.get("internet_check_custom_port", 53)])[0])
-                    timeout_ms = _normalize_internet_check_timeout_ms(form.get("internet_check_timeout_ms", [cfg.get("internet_check_timeout_ms", 1500)])[0])
-                    targets = _internet_check_targets_display(
-                        _parse_internet_check_targets(
-                            form.get("internet_check_targets", [cfg.get("internet_check_targets", "")])[0],
-                            port_profile=port_profile,
-                            custom_port=custom_port,
-                        )
-                    )
-                    dns_servers = _internet_check_targets_display(
-                        _parse_internet_check_targets(
-                            form.get("internet_check_dns_servers", [cfg.get("internet_check_dns_servers", "")])[0],
-                            port_profile="dns",
-                            custom_port=53,
-                        )
-                    )
-                    cfg["internet_check_mode"] = mode
-                    cfg["internet_check_port_profile"] = port_profile
-                    cfg["internet_check_custom_port"] = custom_port
-                    cfg["internet_check_timeout_ms"] = timeout_ms
-                    cfg["internet_check_targets"] = targets
-                    cfg["internet_check_dns_servers"] = dns_servers
-                    save_config(cfg, reapply_cron=False)
-                    append_ui_log(
-                        f"settings | internet check saved mode={mode} port_profile={port_profile} "
-                        f"custom_port={custom_port} timeout_ms={timeout_ms} targets={targets} dns_servers={dns_servers}"
-                    )
-                    self._reply_html(_render_setup_html(
-                        security_message=(
-                            f"Internet check settings saved: mode={mode}, port_profile={port_profile}, "
-                            f"custom_port={custom_port}, timeout={timeout_ms}ms, targets={targets}, dns_servers={dns_servers}."
-                        ),
-                        ui_view="settings",
-                        diag_view=diag_view,
-                        log_filter=log_filter,
-                        log_source=log_source,
-                        log_date=log_date,
-                        log_time_scope=log_time_scope,
-                        log_time_from=log_time_from,
-                        log_time_to=log_time_to,
-                        server_panel=server_panel,
-                    ))
-                    return
-                if self.path == "/settings/save-update-from-main":
-                    raw_len = int(self.headers.get("Content-Length", "0"))
-                    body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
-                    form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
-                    vals = form.get("update_from_main", []) or []
-                    enabled = "1" in vals
-                    cfg = load_config()
-                    cfg["update_from_main"] = enabled
-                    save_config(cfg, reapply_cron=False)
-                    _run_update_check(cfg)
-                    check = _load_update_check_result()
-                    public_version = str(check.get("public_version", "") or check.get("latest_version", "") or "")
-                    selected = "main branch" if enabled else "latest release"
-                    append_ui_log(f"settings | update source set to {selected}")
-                    self._reply_html(_render_setup_html(
-                        security_message="Update source set to " + selected + (f". Public SPK version: {public_version}." if public_version else "."),
-                        ui_view=ui_view,
-                        diag_view=diag_view,
-                        log_filter=log_filter,
-                        log_source=log_source,
-                        server_panel=server_panel,
-                        ssl_warning=ssl_warning,
-                    ))
-                    return
                 if self.path == "/settings/recheck-updates":
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                     cfg = load_config()
-                    report = _build_synology_update_sync_report(cfg=cfg, force=True)
-                    selected_channel = str(report.get("selected_channel", "") or ("main" if bool(cfg.get("update_from_main", False)) else "latest"))
+                    report = _build_unix_update_sync_report(cfg=cfg, force=True)
+                    selected_channel = str(report.get("selected_channel", "") or "latest")
                     public_version = str(report.get("public_version", "") or "")
                     installed_version = str(report.get("installed_version", "") or VERSION)
-                    err = str(report.get("error", "") or "").strip()
-                    if err:
-                        append_ui_log(f"settings | recheck updates failed ({selected_channel}): {err}")
+                    if report.get("error"):
+                        append_ui_log(f"settings | recheck updates failed ({selected_channel}): {report.get('error')}")
                         self._reply_html(_render_setup_html(
-                            error=f"Recheck failed ({selected_channel}): {err}",
+                            error=f"Recheck failed ({selected_channel}): {report.get('error')}",
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
-                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
+                            open_server_panel="package",
                         ))
                         return
-                    status_note = "Update available." if str(report.get("status", "")) == "update_available" else "Installed is up to date."
+                    status_note = "Update available." if str(report.get("status", "")) == "update_available" else "Local is up to date."
                     append_ui_log(
                         f"settings | recheck updates ok ({selected_channel}) "
-                        f"public={public_version or '?'} installed={installed_version} runtime={VERSION}"
+                        f"public={public_version or '?'} local_installed={installed_version} runtime={VERSION}"
                     )
                     self._reply_html(_render_setup_html(
                         security_message=(
-                            f"Rechecked updates ({selected_channel}). Installed SPK: {installed_version}. "
-                            f"Runtime: {VERSION}. Public SPK: {public_version or 'unknown'}. {status_note}"
+                            f"Rechecked updates ({selected_channel}). Installed: {installed_version}. "
+                            f"Runtime: {VERSION}. Public: {public_version or 'unknown'}. {status_note}"
                         ),
                         ui_view=ui_view,
                         diag_view=diag_view,
                         log_filter=log_filter,
+                        log_date=log_date,
+                        log_time_scope=log_time_scope,
                         log_source=log_source,
-                        server_panel=server_panel,
                         ssl_warning=ssl_warning,
+                        open_server_panel="package",
+                    ))
+                    return
+                if self.path == "/settings/request-autoupdate-on-logout":
+                    flag_path = _get_autoupdate_on_logout_flag_path()
+                    try:
+                        flag_path.parent.mkdir(parents=True, exist_ok=True)
+                        flag_path.write_text("1", encoding="utf-8")
+                    except OSError:
+                        pass
+                    append_ui_log("settings | autoupdate will run on next logout")
+                    self._reply_html(_render_setup_html(
+                        security_message="Update will run when you log out. You can keep working until then.",
+                        ui_view=ui_view,
+                        diag_view=diag_view,
+                        log_filter=log_filter,
+                        log_date=log_date,
+                        log_time_scope=log_time_scope,
+                        log_source=log_source,
+                        ssl_warning=ssl_warning,
+                        open_server_panel="package",
                     ))
                     return
                 if self.path == "/danger-restart":
-                    service_script = "/var/packages/synology-monitor/scripts/start-stop-status"
+                    service_script = "/usr/local/bin/unix-monitor-service"
                     cmd = f'(sleep 1; "{service_script}" stop; sleep 1; "{service_script}" start) >/dev/null 2>&1'
                     try:
                         subprocess.Popen(["sh", "-c", cmd])
@@ -11459,6 +13039,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                                 ui_view=ui_view,
                                 diag_view=diag_view,
                                 log_filter=log_filter,
+                                log_date=log_date,
+                                log_time_scope=log_time_scope,
                                 log_source=log_source,
                                 ssl_warning=ssl_warning,
                             )
@@ -11470,6 +13052,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                                 ui_view=ui_view,
                                 diag_view=diag_view,
                                 log_filter=log_filter,
+                                log_date=log_date,
+                                log_time_scope=log_time_scope,
                                 log_source=log_source,
                                 ssl_warning=ssl_warning,
                             )
@@ -11490,6 +13074,109 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         )
                     )
                     return
+                if self.path == "/self-update":
+                    helper = get_update_helper_path()
+                    script_dir = str(get_script_path().parent)
+                    if not helper.exists():
+                        self._reply_html(_render_setup_html(
+                            error="Update helper not found. Reinstall to add self-update.",
+                            ui_view=ui_view,
+                            ssl_warning=ssl_warning,
+                        ))
+                        return
+                    try:
+                        cfg = load_config()
+                        pre = _build_unix_update_sync_report(cfg=cfg, force=True)
+                        if pre.get("error"):
+                            msg = f"Update pre-check failed ({pre.get('selected_channel', 'latest')}): {pre.get('error')}"
+                            append_ui_log(f"self-update | blocked | {msg}")
+                            self._reply_html(_render_setup_html(
+                                error=msg,
+                                ui_view=ui_view,
+                                ssl_warning=ssl_warning,
+                            ))
+                            return
+                        rc, out = _run_cmd([str(helper), script_dir, "update", "no-restart"], timeout_sec=30, env=_update_helper_env(cfg))
+                        if rc != 0:
+                            self._reply_html(_render_setup_html(
+                                error=f"Update failed: {out.strip() or 'exit ' + str(rc)}",
+                                action_output=out,
+                                ui_view=ui_view,
+                                ssl_warning=ssl_warning,
+                            ))
+                            return
+                        _cleanup_update_runtime_cache()
+                        append_ui_log("self-update | completed successfully")
+                        post = _build_unix_update_sync_report(cfg=load_config(), force=True)
+                        post_status = str(post.get("status", "") or "unknown")
+                        post_note = (
+                            "Sync check: update available still detected."
+                            if post_status == "update_available"
+                            else ("Sync check: local is up to date." if post_status == "up_to_date" else "Sync check: status unknown.")
+                        )
+                        self._reply_html(_render_setup_html(
+                            security_message=(
+                                "Update complete. Config and data preserved. Restarting services… "
+                                + post_note
+                            ),
+                            action_output=out,
+                            ui_view=ui_view,
+                            ssl_warning=ssl_warning,
+                        ))
+                        def _delayed_restart() -> None:
+                            time.sleep(2)
+                            for u in ("unix-monitor-ui.service", "unix-monitor-scheduler.timer", "unix-monitor-smart-helper.timer", "unix-monitor-backup-helper.timer", "unix-monitor-system-log-helper.timer"):
+                                _run_cmd(["systemctl", "restart", u], timeout_sec=10)
+                        threading.Thread(target=_delayed_restart, daemon=True).start()
+                    except Exception as e:
+                        self._reply_html(_render_setup_html(
+                            error=f"Update failed: {type(e).__name__}: {e}",
+                            ui_view=ui_view,
+                            ssl_warning=ssl_warning,
+                        ))
+                    return
+                if self.path == "/self-rollback":
+                    helper = get_update_helper_path()
+                    script_dir = str(get_script_path().parent)
+                    backup_path = Path(script_dir) / "unix-monitor.py.prev"
+                    if not helper.exists():
+                        self._reply_html(_render_setup_html(
+                            error="Update helper not found.",
+                            ui_view=ui_view,
+                            ssl_warning=ssl_warning,
+                        ))
+                        return
+                    if not backup_path.exists():
+                        self._reply_html(_render_setup_html(
+                            error="No backup found. Run an update first to create one.",
+                            ui_view=ui_view,
+                            ssl_warning=ssl_warning,
+                        ))
+                        return
+                    try:
+                        rc, out = _run_cmd([str(helper), script_dir, "rollback"], timeout_sec=30)
+                        if rc != 0:
+                            self._reply_html(_render_setup_html(
+                                error=f"Rollback failed: {out.strip() or 'exit ' + str(rc)}",
+                                action_output=out,
+                                ui_view=ui_view,
+                                ssl_warning=ssl_warning,
+                            ))
+                            return
+                        append_ui_log("self-rollback | restored from backup")
+                        self._reply_html(_render_setup_html(
+                            security_message="Rollback complete. Restored previous version. Restarting services…",
+                            action_output=out,
+                            ui_view=ui_view,
+                            ssl_warning=ssl_warning,
+                        ))
+                    except Exception as e:
+                        self._reply_html(_render_setup_html(
+                            error=f"Rollback failed: {type(e).__name__}: {e}",
+                            ui_view=ui_view,
+                            ssl_warning=ssl_warning,
+                        ))
+                    return
                 if self.path == "/run-check":
                     cfg = load_config()
                     role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
@@ -11507,6 +13194,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11516,7 +13207,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
                     cfg = load_config()
                     role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
@@ -11539,8 +13230,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
-                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
@@ -11562,6 +13256,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11571,7 +13269,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
                     cfg = load_config()
                     role = str(cfg.get("peer_role", "standalone") or "standalone").lower()
@@ -11594,8 +13292,11 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
-                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
@@ -11609,6 +13310,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11623,6 +13328,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11635,6 +13344,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11660,7 +13373,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     raw_len = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                     form = parse_qs(body, keep_blank_values=True)
-                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
+                    ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
                     monitor_name = (form.get("monitor_name", [""])[0] or "").strip()
                     output = _ui_delete_monitor(monitor_name)
                     self._reply_html(
@@ -11669,8 +13382,9 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
                             log_source=log_source,
-                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
@@ -11684,6 +13398,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view="overview",
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11708,7 +13424,6 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             log_date=log_date,
                             log_time_scope=log_time_scope,
                             log_source=log_source,
-                            server_panel=server_panel,
                             ssl_warning=ssl_warning,
                         )
                     )
@@ -11722,6 +13437,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view="overview",
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11738,6 +13455,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view="overview",
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11752,6 +13471,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view="overview",
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11766,6 +13487,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view="overview",
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                         )
@@ -11807,7 +13530,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 raw_len = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(raw_len).decode("utf-8", errors="ignore")
                 form = parse_qs(body, keep_blank_values=True)
-                ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to, server_panel = self._resolve_ui_context(form)
+                ui_view, diag_view, log_filter, log_source, log_date, log_time_scope, log_time_from, log_time_to = self._resolve_ui_context(form)
 
                 name = (form.get("name", [""])[0] or "").strip()
                 mode = (form.get("check_mode", ["smart"])[0] or "smart").strip().lower()
@@ -11817,6 +13540,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 probe_port_raw = (form.get("probe_port", [""])[0] or "").strip()
                 dns_name = (form.get("dns_name", [""])[0] or "").strip()
                 dns_server = (form.get("dns_server", [""])[0] or "").strip()
+                service_names = (form.get("service_names", [""])[0] or "").strip()
+                service_description_filter = (form.get("service_description_filter", [""])[0] or "").strip()
                 cron_enabled = "cron_enabled" in form
                 edit_original_name = (form.get("edit_original_name", [""])[0] or "").strip()
 
@@ -11828,6 +13553,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                             create_mode=not edit_original_name,
@@ -11836,7 +13565,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     )
                     return
                 if not name:
-                    name = f"{mode}-synology-check"
+                    name = f"{mode}-unix-check"
                 if len(name) < 2:
                     self._reply_html(
                         _render_setup_html(
@@ -11844,6 +13573,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                             create_mode=not edit_original_name,
@@ -11858,6 +13591,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                             create_mode=not edit_original_name,
@@ -11877,6 +13614,10 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             ui_view=ui_view,
                             diag_view=diag_view,
                             log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
                             log_source=log_source,
                             ssl_warning=ssl_warning,
                             create_mode=not edit_original_name,
@@ -11893,14 +13634,77 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 except ValueError:
                     probe_port = 0
                 if mode == "ping" and not probe_host:
-                    self._reply_html(_render_setup_html(error="Ping mode requires a probe host.", ui_view="setup", ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error="Ping mode requires a probe host.",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
                 if mode == "port":
                     if not probe_host or probe_port < 1 or probe_port > 65535:
-                        self._reply_html(_render_setup_html(error="Port mode requires valid probe host and TCP port (1-65535).", ui_view="setup", ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                        self._reply_html(
+                            _render_setup_html(
+                                error="Port mode requires valid probe host and TCP port (1-65535).",
+                                ui_view=ui_view,
+                                diag_view=diag_view,
+                                log_filter=log_filter,
+                                log_date=log_date,
+                                log_time_scope=log_time_scope,
+                                log_time_from=log_time_from,
+                                log_time_to=log_time_to,
+                                log_source=log_source,
+                                ssl_warning=ssl_warning,
+                                create_mode=not edit_original_name,
+                                edit_original_name=edit_original_name or None,
+                            )
+                        )
                         return
                 if mode == "dns" and not dns_name:
-                    self._reply_html(_render_setup_html(error="DNS mode requires a DNS name/domain.", ui_view="setup", ssl_warning=ssl_warning, create_mode=not edit_original_name, edit_original_name=edit_original_name or None))
+                    self._reply_html(
+                        _render_setup_html(
+                            error="DNS mode requires a DNS name/domain.",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
+                    return
+                if mode == "service" and not service_names and not service_description_filter:
+                    self._reply_html(
+                        _render_setup_html(
+                            error="Service mode requires service names and/or a description filter.",
+                            ui_view=ui_view,
+                            diag_view=diag_view,
+                            log_filter=log_filter,
+                            log_date=log_date,
+                            log_time_scope=log_time_scope,
+                            log_time_from=log_time_from,
+                            log_time_to=log_time_to,
+                            log_source=log_source,
+                            ssl_warning=ssl_warning,
+                            create_mode=not edit_original_name,
+                            edit_original_name=edit_original_name or None,
+                        )
+                    )
                     return
 
                 cfg = load_config()
@@ -11918,12 +13722,41 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     if not _allowed_tp:
                         target_peer = "local"
                 if target_peer and target_peer != "local" and not edit_original_name:
+                    peer_entry = _peer_entry_for_instance_id(cfg, target_peer) or {}
+                    if _is_legacy_peer(peer_entry):
+                        ack_val = (form.get("acknowledge_legacy", [""])[0] or "").strip().lower()
+                        if ack_val not in ("1", "on", "yes", "true"):
+                            self._reply_html(
+                                _render_setup_html(
+                                    error="Confirm the legacy agent warning before creating a monitor for this peer.",
+                                    ui_view=ui_view,
+                                    diag_view=diag_view,
+                                    log_filter=log_filter,
+                                    log_date=log_date,
+                                    log_time_scope=log_time_scope,
+                                    log_time_from=log_time_from,
+                                    log_time_to=log_time_to,
+                                    log_source=log_source,
+                                    ssl_warning=ssl_warning,
+                                    create_mode=True,
+                                )
+                            )
+                            return
+                    source_platform = _infer_peer_source_platform(cfg, target_peer)
                     agent_monitor_cfg: Dict[str, Any] = {
                         "name": name,
                         "check_mode": mode,
                         "kuma_url": kuma_url,
+                        "source_platform": source_platform,
                     }
-                    for ek, ev in (("probe_host", probe_host), ("probe_port", probe_port), ("dns_name", dns_name), ("dns_server", dns_server)):
+                    for ek, ev in (
+                        ("probe_host", probe_host),
+                        ("probe_port", probe_port),
+                        ("dns_name", dns_name),
+                        ("dns_server", dns_server),
+                        ("service_names", service_names),
+                        ("service_description_filter", service_description_filter),
+                    ):
                         if ev:
                             agent_monitor_cfg[ek] = ev
                     result = _peer_create_remote_monitor(cfg, target_peer, agent_monitor_cfg)
@@ -11936,9 +13769,12 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         "probe_port": probe_port,
                         "dns_name": dns_name,
                         "dns_server": dns_server,
+                        "service_names": service_names,
+                        "service_description_filter": service_description_filter,
                         "interval": interval,
                         "cron_enabled": cron_enabled,
                         "_remote_peer": target_peer,
+                        "source_platform": source_platform,
                     }
                     cfg.setdefault("monitors", []).append(master_monitor)
                     cfg["cron_enabled"] = any(m.get("cron_enabled", False) for m in cfg.get("monitors", []))
@@ -11961,6 +13797,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                     "probe_port": probe_port,
                     "dns_name": dns_name,
                     "dns_server": dns_server,
+                    "service_names": service_names,
+                    "service_description_filter": service_description_filter,
                     "interval": interval,
                     "cron_enabled": cron_enabled,
                 }
@@ -11972,6 +13810,8 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                             new_monitor["devices"] = keep_devices
                             if m.get("_remote_peer"):
                                 new_monitor["_remote_peer"] = m["_remote_peer"]
+                            if m.get("source_platform"):
+                                new_monitor["source_platform"] = m["source_platform"]
                             cfg["monitors"][i] = new_monitor
                             updated = True
                             break
@@ -11997,17 +13837,7 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                 self._reply_html(_render_setup_html(message="Saved successfully", ui_view="setup", ssl_warning=ssl_warning))
             except Exception as e:
                 append_ui_log(f"ui-error | {type(e).__name__}: {e}")
-                self._reply_html(
-                    _render_setup_html(
-                        error=f"Failed to save: {type(e).__name__}: {e}",
-                        ui_view=ui_view,
-                        diag_view=diag_view,
-                        log_filter=log_filter,
-                        log_source=log_source,
-                        ssl_warning=ssl_warning,
-                    ),
-                    code=500,
-                )
+                self._reply_html(_render_setup_html(error=f"Failed to save: {type(e).__name__}: {e}", ui_view=ui_view, ssl_warning=ssl_warning), code=500)
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -12045,15 +13875,28 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
 
 def run_scheduled() -> int:
     cfg = load_config()
-    monitors = cfg.get("monitors", [])
+    monitors = [m for m in cfg.get("monitors", []) if isinstance(m, dict)]
+    cfg_path = str(get_config_path())
+    runtime_dir = str(get_runtime_data_dir())
     if not monitors:
         if _agent_peer_push_if_due(cfg, force=True):
-            append_ui_log("scheduled-run | no monitors | agent peer push")
+            append_ui_log(
+                f"scheduled-run | no monitors | agent peer push | cfg={cfg_path} | data_dir={runtime_dir}"
+            )
+        else:
+            append_ui_log(f"scheduled-run | skipped | no monitors | cfg={cfg_path} | data_dir={runtime_dir}")
         return 0
     global_cron = bool(cfg.get("cron_enabled", False))
     global_interval = int(cfg.get("cron_interval_minutes", 60) or 60)
     dbg = bool(cfg.get("debug", False))
+    due_count = 0
+    attempted_count = 0
     ran_any = False
+    append_ui_log(
+        "scheduled-run | start | "
+        f"monitors={len(monitors)} | global_cron={'on' if global_cron else 'off'} | "
+        f"global_interval={global_interval} | cfg={cfg_path} | data_dir={runtime_dir}"
+    )
     for m in monitors:
         name = str(m.get("name", "")).strip()
         if not name:
@@ -12061,34 +13904,56 @@ def run_scheduled() -> int:
         mon_cron = bool(m.get("cron_enabled", global_cron))
         if not mon_cron:
             continue
-        mon_interval = int(m.get("interval", global_interval) or global_interval)
-        if not _is_scheduled_due(mon_interval, monitor_name=name):
+        try:
+            mon_interval = int(m.get("interval", global_interval) or global_interval)
+        except (TypeError, ValueError):
+            mon_interval = global_interval
+        mon_interval = max(1, mon_interval)
+        due = _is_scheduled_due(mon_interval, monitor_name=name)
+        if not due:
             continue
+        due_count += 1
         mode = str(m.get("check_mode", "smart")).lower()
         if mode not in CHECK_MODES:
             mode = "smart"
-        url = m.get("kuma_url", "")
-        if not url:
-            continue
-        devices = [str(x) for x in m.get("devices", [])]
-        status, msg, lat = check_host_with_monitor(mode, devices, monitor=m, debug=dbg)
-        ok = push_to_kuma(url, status, msg, lat, debug=dbg)
-        recorded_status = status if ok else "warning"
-        _record_history(name, mode, recorded_status, lat)
-        line = f"{'ok' if ok else 'x'} {name}: {status} (ping={lat:.2f}ms) push {'OK' if ok else 'FAILED'}"
-        _set_monitor_state(
-            name,
-            "Automatic monitor check completed" if ok else "Automatic monitor check completed with errors",
-            line,
-            level="ok" if ok else "err",
-        )
-        append_ui_log(
-            f"scheduled-check | {name} | mode={mode} | status={status} | ping_ms={lat:.2f} | push={'OK' if ok else 'FAILED'}"
-        )
-        _touch_scheduled_run(monitor_name=name)
+        attempted_count += 1
         ran_any = True
+        try:
+            url = m.get("kuma_url", "")
+            if not url:
+                line = f"x {name}: no Kuma URL"
+                _set_monitor_state(name, "Automatic monitor check skipped", line, level="err")
+                append_ui_log(f"scheduled-check | {name} | mode={mode} | skipped | no Kuma URL")
+                continue
+            devices = [str(x) for x in m.get("devices", [])]
+            status, msg, lat = check_host_with_monitor(mode, devices, monitor=m, debug=dbg)
+            ok = push_to_kuma(url, status, msg, lat, debug=dbg)
+            recorded_status = status if ok else "warning"
+            _record_history(name, mode, recorded_status, lat)
+            line = f"{'ok' if ok else 'x'} {name}: {status} (ping={lat:.2f}ms) push {'OK' if ok else 'FAILED'}"
+            _set_monitor_state(
+                name,
+                "Automatic monitor check completed" if ok else "Automatic monitor check completed with errors",
+                line,
+                level="ok" if ok else "err",
+            )
+            append_ui_log(
+                f"scheduled-check | {name} | mode={mode} | status={status} | ping_ms={lat:.2f} | push={'OK' if ok else 'FAILED'}"
+            )
+        except Exception as e:
+            err_line = f"x {name}: scheduler error {type(e).__name__}: {e}"
+            _set_monitor_state(name, "Automatic monitor check failed", err_line, level="err")
+            append_ui_log(f"scheduled-check | {name} | mode={mode} | error={type(e).__name__}: {e}")
+        finally:
+            _touch_scheduled_run(monitor_name=name)
+    if ran_any:
+        _touch_scheduled_run()
     if _agent_peer_push_if_due(cfg):
         append_ui_log("scheduled-run | agent peer push triggered")
+    append_ui_log(
+        "scheduled-run | done | "
+        f"due={due_count} | attempted={attempted_count} | ran_any={'yes' if ran_any else 'no'}"
+    )
     return 0
 
 
@@ -12115,14 +13980,16 @@ def main_menu() -> str:
     print(CHANGES_NOTICE)
     print(f"  Debug: {'ON' if cfg.get('debug', False) else 'OFF'}")
     print()
-    print("  1) Add monitor (SMART / Storage / Both)")
+    print("  1) Add monitor (Mount / SMART / Storage / Ping / Port / DNS / Backup)")
     print("  2) Run check (all configured monitors)")
     print("  3) List configured monitors")
     print("  4) Remove monitor")
     print("  5) Schedule automatic checks (cron)")
     print("  6) Test push (send test message to Kuma)")
     print("  7) Toggle debug mode")
-    print("  8) Exit")
+    from_main = cfg.get("update_from_main", False)
+    print(f"  8) Toggle update from main (testing) — {('ON' if from_main else 'OFF')}")
+    print("  9) Exit")
     print("=" * 50)
     return prompt("Choice", "1").strip() or "1"
 
@@ -12145,13 +14012,43 @@ def main() -> int:
         elif choice == "7":
             toggle_debug()
         elif choice == "8":
+            toggle_update_from_main()
+        elif choice == "9":
             print("Bye.")
             return 0
         else:
             print("Invalid choice.")
 
 
+def _agent_only_gate() -> Tuple[bool, str]:
+    cfg = load_config()
+    if bool(cfg.get("web_enabled", True)):
+        return True, ""
+    role = _cfg_peer_role(cfg)
+    if role != "agent":
+        return False, "Webserver is disabled. This installation is agent-only and requires peer_role=agent."
+    if not str(cfg.get("peer_master_url", "") or "").strip() or not str(cfg.get("peering_token", "") or "").strip():
+        return False, "Webserver is disabled. Agent mode requires peer_master_url and peering_token."
+    return True, ""
+
+
+def _print_usage() -> None:
+    print("Usage:")
+    print("  python3 unix-monitor.py")
+    print("  python3 unix-monitor.py --run|-r [--debug|-d]")
+    print("  python3 unix-monitor.py --run-scheduled")
+    print("  python3 unix-monitor.py --run-scheduled-loop")
+    print("  python3 unix-monitor.py --run-smart-helper")
+    print("  python3 unix-monitor.py --run-backup-helper")
+    print("  python3 unix-monitor.py --run-system-log-helper")
+    print("  python3 unix-monitor.py --ui [--host 0.0.0.0] [--port 8787]")
+    print("  python3 unix-monitor.py --agent-menu")
+
+
 if __name__ == "__main__":
+    if "--help" in sys.argv or "-h" in sys.argv:
+        _print_usage()
+        sys.exit(0)
     if "--run-smart-helper" in sys.argv:
         sys.exit(run_smart_helper())
     if "--run-backup-helper" in sys.argv:
@@ -12162,8 +14059,17 @@ if __name__ == "__main__":
         sys.exit(run_scheduled())
     if "--run-scheduled-loop" in sys.argv:
         sys.exit(run_scheduled_loop())
+    if "--agent-menu" in sys.argv:
+        ok, reason = _agent_only_gate()
+        if not ok:
+            print(reason)
+            sys.exit(2)
+        sys.exit(main())
     if "--ui" in sys.argv:
         cfg = load_config()
+        if not bool(cfg.get("web_enabled", True)):
+            print("Webserver is disabled in config (agent-only installation).")
+            sys.exit(2)
         ui_host = _normalize_ui_bind_host(cfg.get("ui_bind_host", "0.0.0.0"))
         ui_port = _normalize_ui_bind_port(cfg.get("ui_bind_port", 8787))
         if "--host" in sys.argv:
@@ -12183,4 +14089,9 @@ if __name__ == "__main__":
         dbg = "--debug" in sys.argv or "-d" in sys.argv
         run_check(debug=dbg, interactive=False)
         sys.exit(0)
+    ok, reason = _agent_only_gate()
+    if not ok:
+        print(reason)
+        print("Use --agent-menu after configuring master URL and peering token.")
+        sys.exit(2)
     sys.exit(main())

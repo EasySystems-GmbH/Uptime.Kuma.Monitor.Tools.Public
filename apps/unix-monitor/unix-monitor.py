@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0012"
+VERSION = "1.12.0-0001"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -1811,6 +1811,171 @@ def _agent_maybe_request_cert_bg(cfg: Dict[str, Any]) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _agent_decode_peer_json(body: str, token: str) -> Dict[str, Any]:
+    try:
+        wrapped = json.loads(body)
+        if isinstance(wrapped, dict) and isinstance(wrapped.get("enc"), str):
+            dec = _decrypt_payload(str(wrapped.get("enc", "")), token)
+            if dec:
+                parsed = json.loads(dec)
+                return parsed if isinstance(parsed, dict) else {}
+        return wrapped if isinstance(wrapped, dict) else {}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+
+
+def _agent_apply_hosted_monitors(cfg: Dict[str, Any], fleet_config: Dict[str, Any]) -> int:
+    """Apply monitor list from hosted fleet config (safe scalar fields only)."""
+    raw_monitors = fleet_config.get("monitors")
+    if not isinstance(raw_monitors, list) or not raw_monitors:
+        return 0
+    applied: List[Dict[str, Any]] = []
+    for item in raw_monitors:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
+        interval = schedule.get("intervalMinutes", schedule.get("interval_minutes", 15))
+        try:
+            interval_minutes = max(1, int(interval))
+        except (TypeError, ValueError):
+            interval_minutes = 15
+        entry: Dict[str, Any] = {
+            "name": name,
+            "check_mode": str(item.get("checkMode") or item.get("check_mode") or "smart").lower(),
+            "enabled": bool(item.get("enabled", True)),
+            "interval_minutes": interval_minutes,
+        }
+        field_map = (
+            ("probeHost", "probe_host"),
+            ("probePort", "probe_port"),
+            ("dnsName", "dns_name"),
+            ("dnsServer", "dns_server"),
+            ("serviceNames", "service_names"),
+            ("serviceDescriptionFilter", "service_description_filter"),
+            ("storagePaths", "storage_paths"),
+            ("mountPaths", "mount_paths"),
+            ("backupTaskNames", "backup_task_names"),
+        )
+        for camel, snake in field_map:
+            val = item.get(camel, item.get(snake))
+            if val not in (None, "", []):
+                entry[snake] = val
+        applied.append(entry)
+    if not applied:
+        return 0
+    cfg["monitors"] = applied
+    return len(applied)
+
+
+def _agent_pull_hosted_config(cfg: Dict[str, Any], *, apply_monitors: bool = False) -> str:
+    if str(cfg.get("peer_role", "") or "").lower() != "agent":
+        return "hosted config pull skipped (not agent role)"
+    token = str(cfg.get("peering_token", "") or "").strip()
+    if not token:
+        return "hosted config pull skipped (no peering token)"
+    master_url, resolve_err = _peer_master_base_url(cfg, timeout=4)
+    if not master_url:
+        return f"hosted config pull skipped: {resolve_err}"
+    instance_id = _get_instance_id(cfg)
+    try:
+        status, body = _peer_http_request(master_url, token, "GET", "/api/peer/config", timeout=12)
+        if status >= 300:
+            return f"hosted config pull failed: HTTP {status}"
+        data = _agent_decode_peer_json(body, token)
+        version_id = str(data.get("version") or "").strip()
+        fleet_config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        if version_id:
+            cfg["pinned_config_version_id"] = version_id
+        note = f"pinned config version {version_id or '?'}"
+        if apply_monitors and fleet_config:
+            count = _agent_apply_hosted_monitors(cfg, fleet_config)
+            if count:
+                save_config(cfg, reapply_cron=True)
+                return f"{note}; applied {count} monitor(s)"
+        save_config(cfg, reapply_cron=False)
+        append_ui_log(f"peer-hosted | config pull: {note}")
+        return note
+    except Exception as exc:
+        return f"hosted config pull error: {type(exc).__name__}: {exc}"
+
+
+def _agent_ack_hosted_action(master_url: str, token: str, instance_id: str, action_id: str) -> bool:
+    if not action_id:
+        return False
+    try:
+        status, _ = _peer_http_request(
+            master_url,
+            token,
+            "POST",
+            f"/api/peer/actions/{quote(action_id, safe='')}/ack",
+            payload={"instance_id": instance_id},
+            timeout=12,
+        )
+        return status < 300
+    except Exception:
+        return False
+
+
+def _agent_process_hosted_actions(cfg: Dict[str, Any]) -> str:
+    if str(cfg.get("peer_role", "") or "").lower() != "agent":
+        return "hosted actions skipped (not agent role)"
+    token = str(cfg.get("peering_token", "") or "").strip()
+    if not token:
+        return "hosted actions skipped (no peering token)"
+    master_url, resolve_err = _peer_master_base_url(cfg, timeout=4)
+    if not master_url:
+        return f"hosted actions skipped: {resolve_err}"
+    instance_id = _get_instance_id(cfg)
+    try:
+        status, body = _peer_http_request(
+            master_url,
+            token,
+            "GET",
+            f"/api/peer/actions?instance_id={quote(instance_id, safe='')}",
+            timeout=12,
+        )
+        if status >= 300:
+            return f"hosted actions pull failed: HTTP {status}"
+        data = _agent_decode_peer_json(body, token)
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        if not items:
+            return "no pending hosted actions"
+        notes: List[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            action_id = str(item.get("actionId") or item.get("action_id") or "").strip()
+            action = str(item.get("action") or "").strip()
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            if action == "sync-config":
+                notes.append(_agent_pull_hosted_config(cfg, apply_monitors=True))
+            elif action == "update-peering-token":
+                new_token = str(
+                    payload.get("peeringToken") or payload.get("peering_token") or ""
+                ).strip()
+                if new_token:
+                    cfg["peering_token"] = new_token
+                    save_config(cfg, reapply_cron=False)
+                    notes.append("updated peering token from master")
+                else:
+                    notes.append("update-peering-token missing token in payload")
+            else:
+                notes.append(f"ignored action {action or '?'}")
+            if action_id:
+                if _agent_ack_hosted_action(master_url, token, instance_id, action_id):
+                    notes.append(f"acked {action_id}")
+                else:
+                    notes.append(f"ack failed for {action_id}")
+        summary = "; ".join(n for n in notes if n)
+        append_ui_log(f"peer-hosted | actions: {summary}")
+        return summary or "processed hosted actions"
+    except Exception as exc:
+        return f"hosted actions error: {type(exc).__name__}: {exc}"
+
+
 def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
     master_host, master_port = _parse_peer_host_port(
         cfg.get("peer_master_url", ""), _peer_master_port(cfg)
@@ -1856,6 +2021,8 @@ def _peer_push_to_master(cfg: Dict[str, Any]) -> str:
             cfg.pop("peer_master_approval_status", None)
             save_config(cfg, reapply_cron=False)
             _agent_maybe_request_cert_bg(cfg)
+            _agent_pull_hosted_config(cfg)
+            _agent_process_hosted_actions(cfg)
             return f"Pushed to master ({master_url}): {status} ({latency_ms} ms)"
         block = _peer_set_master_approval_status(cfg, status, body)
         cfg["last_peer_sync_result"] = f"HTTP {status}"
