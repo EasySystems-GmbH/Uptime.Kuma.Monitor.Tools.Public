@@ -77,15 +77,15 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0006"
+VERSION = "1.11.0-0007"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# synology-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
 INTERVAL_MAX = 1440
 CHECK_MODES = ("smart", "storage", "ping", "port", "dns", "backup")
 PEER_ROLES = ("standalone", "agent", "master")
-PEER_HEALTH_TIMEOUT_SEC = 180
-PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC = 120
+PEER_HEALTH_TIMEOUT_SEC = 75
+PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC = 60
 BACK_KEYS = ("0", "b", "back", "q", "quit")
 CHANGES_NOTICE = "  Changes are not saved until you confirm (Save/Apply)."
 ALLOWED_SCHEMES = ("https", "http")
@@ -2263,6 +2263,27 @@ def _agent_peer_should_push(cfg: Dict[str, Any]) -> bool:
     )
 
 
+def _agent_peer_push_interval_sec(cfg: Dict[str, Any]) -> int:
+    try:
+        raw = int(cfg.get("peer_agent_push_interval_sec", PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC) or PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC)
+    except (TypeError, ValueError):
+        raw = PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC
+    return max(60, min(raw, 3600))
+
+
+def _agent_peer_push_if_due(cfg: Dict[str, Any], *, force: bool = False) -> bool:
+    """Push agent snapshot to master when peer_agent_push_interval_sec has elapsed."""
+    if not _agent_peer_should_push(cfg):
+        return False
+    interval = _agent_peer_push_interval_sec(cfg)
+    last = int(cfg.get("last_peer_sync", 0) or 0)
+    now = int(time.time())
+    if force or last <= 0 or (now - last) >= interval:
+        _trigger_peer_sync_bg(cfg)
+        return True
+    return False
+
+
 def _agent_peer_heartbeat_loop() -> None:
     """Background loop while the setup UI runs: push to master on an interval so the master stays 'online' after reboot."""
     time.sleep(5)
@@ -2272,10 +2293,8 @@ def _agent_peer_heartbeat_loop() -> None:
             if not _agent_peer_should_push(cfg):
                 time.sleep(30)
                 continue
-            interval = int(cfg.get("peer_agent_push_interval_sec", PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC) or PEER_AGENT_PUSH_DEFAULT_INTERVAL_SEC)
-            interval = max(30, min(interval, 3600))
-            _trigger_peer_sync_bg(cfg)
-            time.sleep(interval)
+            _agent_peer_push_if_due(cfg, force=True)
+            time.sleep(_agent_peer_push_interval_sec(cfg))
         except Exception:
             time.sleep(60)
 
@@ -11805,8 +11824,8 @@ def run_scheduled() -> int:
     cfg = load_config()
     monitors = cfg.get("monitors", [])
     if not monitors:
-        if _agent_peer_should_push(cfg):
-            _trigger_peer_sync_bg(cfg)
+        if _agent_peer_push_if_due(cfg, force=True):
+            append_ui_log("scheduled-run | no monitors | agent peer push")
         return 0
     global_cron = bool(cfg.get("cron_enabled", False))
     global_interval = int(cfg.get("cron_interval_minutes", 60) or 60)
@@ -11845,8 +11864,8 @@ def run_scheduled() -> int:
         )
         _touch_scheduled_run(monitor_name=name)
         ran_any = True
-    if ran_any or _agent_peer_should_push(cfg):
-        _trigger_peer_sync_bg(cfg)
+    if _agent_peer_push_if_due(cfg):
+        append_ui_log("scheduled-run | agent peer push triggered")
     return 0
 
 
