@@ -85,7 +85,7 @@ except Exception:
             return False
 
 
-VERSION = "1.11.0-0005"
+VERSION = "1.11.0-0006"
 CONFIG_FILE_MODE = 0o600
 CRON_MARKER = "# unix-monitor.py - do not edit this line manually"
 INTERVAL_MIN = 1
@@ -6552,12 +6552,12 @@ def _render_peering_card(cfg: Dict[str, Any], peering_message: str = "", peering
         {_peer_approval_banner_html(str(cfg.get("peer_master_approval_status", "") or ""))}
         {"<div class='ok' style='margin-top:8px;white-space:pre-wrap;'>" + html.escape(peering_message) + "</div>" if peering_message else ""}
         {security_panel}
+        {agent_disconnect_html}
         <form id="peering-save-form" method="post" action="/peer/save-settings">
           <div>
             <label>Role</label>
             {role_select_block}
             {role_lock_note}
-            {agent_disconnect_html}
           </div>
           {master_peer_actions_html}
           {token_section}
@@ -11148,33 +11148,38 @@ def run_setup_ui(host: str = "0.0.0.0", port: int = 8787) -> int:
                         ))
                         return
                 cfg["peer_role"] = role
-                _m_raw = (form.get("peer_master_url", [""])[0] or "").strip()
-                _cb_raw = (form.get("agent_callback_url", [""])[0] or "").strip()
                 _legacy_port_val = (form.get("peer_port", [""])[0] or "").strip()
-                _master_port_val = (form.get("peer_master_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
-                _agent_port_val = (form.get("peer_agent_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
-                _master_port = int(_master_port_val) if _master_port_val and _master_port_val.isdigit() else PEER_DEFAULT_PORT
-                _agent_port = int(_agent_port_val) if _agent_port_val and _agent_port_val.isdigit() else PEER_DEFAULT_PORT
-                cfg["peer_master_port"] = _master_port if 1 <= _master_port <= 65535 else PEER_DEFAULT_PORT
-                cfg["peer_agent_port"] = _agent_port if 1 <= _agent_port <= 65535 else PEER_DEFAULT_PORT
-                cfg["peer_port"] = cfg["peer_agent_port"]
-                cfg["peer_master_url"] = _parse_peer_host_port(_m_raw, cfg["peer_master_port"])[0]
-                cfg["agent_callback_url"] = _parse_peer_host_port(_cb_raw, cfg["peer_agent_port"])[0]
+                if "peer_master_port" in form or "peer_port" in form:
+                    _master_port_val = (form.get("peer_master_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
+                    _master_port = int(_master_port_val) if _master_port_val and _master_port_val.isdigit() else PEER_DEFAULT_PORT
+                    cfg["peer_master_port"] = _master_port if 1 <= _master_port <= 65535 else PEER_DEFAULT_PORT
+                if "peer_agent_port" in form or "peer_port" in form:
+                    _agent_port_val = (form.get("peer_agent_port", [_legacy_port_val])[0] or _legacy_port_val or "").strip()
+                    _agent_port = int(_agent_port_val) if _agent_port_val and _agent_port_val.isdigit() else PEER_DEFAULT_PORT
+                    cfg["peer_agent_port"] = _agent_port if 1 <= _agent_port <= 65535 else PEER_DEFAULT_PORT
+                    cfg["peer_port"] = cfg["peer_agent_port"]
+                if "peer_master_url" in form:
+                    _m_raw = (form.get("peer_master_url", [""])[0] or "").strip()
+                    cfg["peer_master_url"] = _parse_peer_host_port(_m_raw, _peer_master_port(cfg))[0]
+                if "agent_callback_url" in form:
+                    _cb_raw = (form.get("agent_callback_url", [""])[0] or "").strip()
+                    cfg["agent_callback_url"] = _parse_peer_host_port(_cb_raw, _peer_agent_port(cfg))[0]
                 new_master_host = str(cfg.get("peer_master_url", "") or "").strip()
                 new_master_port = int(cfg.get("peer_master_port", PEER_DEFAULT_PORT) or PEER_DEFAULT_PORT)
                 if new_master_host != prev_master_host or new_master_port != prev_master_port:
                     cfg.pop("peer_master_base_url", None)
                 token_val = (form.get("peering_token", [""])[0] or "").strip()
                 token_auto_generated = False
-                if token_val:
-                    cfg["peering_token"] = token_val
-                elif role == "master":
-                    # Auto-generate token when switching to master so it's ready to share
-                    existing = str(cfg.get("peering_token", "") or "").strip()
-                    switching_to_master = prev_role != "master"
-                    if switching_to_master or not existing:
-                        cfg["peering_token"] = secrets.token_hex(32)
-                        token_auto_generated = True
+                if "peering_token" in form:
+                    if token_val:
+                        cfg["peering_token"] = token_val
+                    elif role == "master":
+                        # Auto-generate token when switching to master so it's ready to share
+                        existing = str(cfg.get("peering_token", "") or "").strip()
+                        switching_to_master = prev_role != "master"
+                        if switching_to_master or not existing:
+                            cfg["peering_token"] = secrets.token_hex(32)
+                            token_auto_generated = True
                 inst_id = _get_instance_id(cfg)
                 save_config(cfg, reapply_cron=False)
                 _extra_msg = " Peering token auto-generated." if token_auto_generated else ""
