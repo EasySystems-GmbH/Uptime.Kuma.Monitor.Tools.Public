@@ -1,10 +1,7 @@
-# Example: unix rollout agent container (agent-only edition).
+# Unix rollout agent (agent-only edition). Pull from GHCR or build locally.
 services:
   rollout-agent:
-    image: easysystems/unix-rollout-agent:1.12.0-rollout.1
-    build:
-      context: ./docker
-      dockerfile: Dockerfile
+    image: ${ROLLOUT_AGENT_IMAGE:-ghcr.io/easystems-gmbh/unix-rollout-agent:latest}
     ports:
       - "8787:8787"
     environment:

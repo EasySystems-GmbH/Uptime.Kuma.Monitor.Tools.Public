@@ -9,7 +9,7 @@ Agent-only monitor builds for fleet rollout to a **hosted master**. These editio
 | Unix/Linux | `dist/unix-monitor-agent.py` or Docker image | `ROLLOUT_AGENT_BUILD = True` (baked) or `ESYS_ROLLOUT_AGENT=1` |
 | Synology DSM | `dist/synology-monitor-agent.spk` | baked in SPK |
 | Windows | `dist/windows-rollout-agent/` | `-p:RolloutAgent=true` or `ESYS_ROLLOUT_AGENT=1` |
-| Docker | `easysystems/unix-rollout-agent:<version>` | `ESYS_ROLLOUT_AGENT=1` in image |
+| Docker | `ghcr.io/easystems-gmbh/unix-rollout-agent:<version>` | `ESYS_ROLLOUT_AGENT=1` in image |
 
 ## Build everything
 
@@ -42,11 +42,20 @@ Optional env:
 ## Docker only
 
 ```bash
+# CI publishes to GHCR on merge; local build:
+chmod +x scripts/docker-publish.sh
+./scripts/docker-publish.sh
+
+# Or full local pipeline:
 ./build-all.sh   # creates dist/unix-monitor-agent.py first
-# or patch only:
-python3 scripts/patch-source.py
-./docker/build-image.sh 1.12.0-rollout.1
-docker compose up -d
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+Pull from registry:
+
+```bash
+docker login ghcr.io
+docker compose pull && docker compose up -d
 ```
 
 Open `http://localhost:8787`, complete auth setup, then configure master host + peering token under Settings.
